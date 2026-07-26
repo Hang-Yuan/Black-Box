@@ -5,63 +5,82 @@ import { settingsEvents } from '../lib/settingsEvents';
 // --- Types ---
 
 export type Theme = 'light' | 'dark' | 'system';
-/** @deprecated Color theme switching was removed in favor of a single fixed accent color. Field kept for old persisted state compatibility only — no longer read by the UI. */
 export type ColorTheme = 'black' | 'blue' | 'purple' | 'green';
-export type SecondaryPanelTab = 'files' | 'skills';
-export type ModelId =
-  | 'claude-fable-5'
-  | 'claude-fable-5-1m'
-  | 'claude-opus-4-8'
-  | 'claude-opus-4-8-1m'
-  | 'claude-opus-4-6'
-  | 'claude-opus-4-6-1m'
-  | 'claude-sonnet-4-6'
-  | 'claude-haiku-4-5-20251001';
-export type SessionMode = 'code' | 'ask' | 'plan' | 'bypass';
+export type SurfaceTheme = 'graphite' | 'midnight' | 'paper' | 'forest';
+export type SecondaryPanelTab = 'activity' | 'files';
+export type MainView = 'chat' | 'extensions' | 'automations' | 'taskCenter';
+export type SettingsTab = 'general' | 'provider' | 'cli' | 'desktopPet';
+export type ModelTier = 'fable' | 'opus' | 'sonnet' | 'haiku';
+/** @deprecated Prefer ModelTier. Kept as a source-compatible alias. */
+export type ModelId = ModelTier;
+/**
+ * Stable frontend ids for the five interactive Claude Code permission modes.
+ * `ask` is retained as the persisted id for backwards compatibility, but is
+ * presented to users as Manual and maps to the CLI's `manual` mode.
+ * `dontAsk` is intentionally reserved for background automation and is not an
+ * interactive session option.
+ */
+export type SessionMode = 'code' | 'ask' | 'plan' | 'auto' | 'bypass';
 /** CLI permission mode for the SDK control protocol */
-export type CliPermissionMode = 'acceptEdits' | 'default' | 'plan' | 'bypassPermissions';
+export type CliPermissionMode = 'acceptEdits' | 'manual' | 'plan' | 'auto' | 'bypassPermissions';
 export type Locale = 'zh' | 'en';
 
 /** Map frontend session mode to CLI permission mode */
 export function mapSessionModeToPermissionMode(mode: SessionMode): CliPermissionMode {
   switch (mode) {
     case 'code': return 'acceptEdits';
-    case 'ask': return 'default';
+    case 'ask': return 'manual';
     case 'plan': return 'plan';
+    case 'auto': return 'auto';
     case 'bypass': return 'bypassPermissions';
   }
 }
 export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'max';
 
-// --- Model options (display mapping) ---
+// --- Logical model tiers ---
 
-// UI display rule: each Opus generation exposes a standard (200K) and a 1M
-// variant so users can pick the larger context window explicitly. The 1M id is
-// translated to the CLI's `[1m]` model name in api-provider.ts (CLI_MODEL_MAP).
-export const MODEL_OPTIONS: { id: ModelId; label: string; short: string }[] = [
-  { id: 'claude-fable-5', label: 'Fable 5', short: 'Fable 5' },
-  { id: 'claude-fable-5-1m', label: 'Fable 5 (1M)', short: 'Fable 5 (1M)' },
-  { id: 'claude-opus-4-8', label: 'Opus 4.8', short: 'Opus 4.8' },
-  { id: 'claude-opus-4-8-1m', label: 'Opus 4.8 (1M)', short: 'Opus 4.8 (1M)' },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6', short: 'Opus 4.6' },
-  { id: 'claude-opus-4-6-1m', label: 'Opus 4.6 (1M)', short: 'Opus 4.6 (1M)' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', short: 'Sonnet 4.6' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', short: 'Haiku 4.5' },
+// These ids remain a backwards-compatible storage ABI. User-facing selectors
+// render the active provider's concrete model names, so users never need to
+// understand the Claude-shaped slot names used by older provider files.
+export const MODEL_OPTIONS: { id: ModelTier; label: string; short: string }[] = [
+  { id: 'fable', label: 'Fable', short: 'Fable' },
+  { id: 'opus', label: 'Opus', short: 'Opus' },
+  { id: 'sonnet', label: 'Sonnet', short: 'Sonnet' },
+  { id: 'haiku', label: 'Haiku', short: 'Haiku' },
 ];
+
+export function isModelTier(value: unknown): value is ModelTier {
+  return value === 'fable' || value === 'opus' || value === 'sonnet' || value === 'haiku';
+}
+
+/** Normalize every legacy/exact model id into one of the four stable tiers. */
+export function normalizeModelTier(value: unknown): ModelTier {
+  const model = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (isModelTier(model)) return model;
+  if (model.includes('fable')) return 'fable';
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('sonnet')) return 'sonnet';
+  if (model.includes('haiku')) return 'haiku';
+  return 'sonnet';
+}
 
 // --- Store State & Actions ---
 
 interface SettingsState {
   theme: Theme;
-  /** @deprecated No longer read by the UI — kept for old persisted state compatibility. */
   colorTheme: ColorTheme;
+  surfaceTheme: SurfaceTheme;
   sidebarOpen: boolean;
   secondaryPanelOpen: boolean;
   secondaryPanelTab: SecondaryPanelTab;
   secondaryPanelWidth: number;
   settingsOpen: boolean;
+  settingsTab: SettingsTab;
+  mainView: MainView;
   workingDirectory: string;
-  selectedModel: string;
+  selectedModel: ModelTier;
+  /** Lightweight model slot used by every subagent and Black Box web retrieval. */
+  auxiliaryModel: ModelTier;
   sessionMode: SessionMode;
   locale: Locale;
   /** Global UI font size in px (default 18) */
@@ -92,10 +111,17 @@ interface SettingsState {
   userDisplayName: string;
   /** Whether to show dotfiles (hidden files) in the file tree */
   showHiddenFiles: boolean;
+  /** Explicit opt-in for Claude Code's experimental, higher-cost Agent Teams runtime. */
+  agentTeamsEnabled: boolean;
+  /** Keep macOS awake while Black Box is running, while still allowing display sleep. */
+  keepSystemAwake: boolean;
+  /** Optionally keep the display awake too. Requires keepSystemAwake. */
+  keepDisplayAwake: boolean;
 
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
   setColorTheme: (colorTheme: ColorTheme) => void;
+  setSurfaceTheme: (surfaceTheme: SurfaceTheme) => void;
   /** Whether the floating agent panel is open */
   agentPanelOpen: boolean;
 
@@ -105,8 +131,12 @@ interface SettingsState {
   setSecondaryTab: (tab: SecondaryPanelTab) => void;
   setSecondaryPanelWidth: (width: number) => void;
   toggleSettings: () => void;
+  openSettings: (tab?: SettingsTab) => void;
+  setSettingsTab: (tab: SettingsTab) => void;
+  setMainView: (view: MainView) => void;
   setWorkingDirectory: (dir: string) => void;
   setSelectedModel: (model: string) => void;
+  setAuxiliaryModel: (model: string) => void;
   setSessionMode: (mode: SessionMode) => void;
   setLocale: (locale: Locale) => void;
   toggleLocale: () => void;
@@ -123,6 +153,9 @@ interface SettingsState {
   setUserAvatarUrl: (url: string) => void;
   setUserDisplayName: (name: string) => void;
   toggleHiddenFiles: () => void;
+  setAgentTeamsEnabled: (enabled: boolean) => void;
+  setKeepSystemAwake: (enabled: boolean) => void;
+  setKeepDisplayAwake: (enabled: boolean) => void;
 }
 
 // --- Theme cycle order ---
@@ -141,14 +174,18 @@ export const useSettingsStore = create<SettingsState>()(
     (set, get) => ({
       theme: 'system',
       colorTheme: 'black',
+      surfaceTheme: 'graphite',
       sidebarOpen: true,
       secondaryPanelOpen: false,
       secondaryPanelTab: 'files',
       secondaryPanelWidth: 300,
       settingsOpen: false,
+      settingsTab: 'general',
+      mainView: 'chat',
       agentPanelOpen: false,
       workingDirectory: '',
-      selectedModel: 'claude-sonnet-4-6',
+      selectedModel: 'sonnet',
+      auxiliaryModel: 'sonnet',
       sessionMode: 'bypass',
       locale: 'zh',
       fontSize: 18,
@@ -165,6 +202,9 @@ export const useSettingsStore = create<SettingsState>()(
       userAvatarUrl: '',
       userDisplayName: '',
       showHiddenFiles: false,
+      agentTeamsEnabled: false,
+      keepSystemAwake: true,
+      keepDisplayAwake: false,
 
       toggleTheme: () =>
         set((state) => ({ theme: nextTheme(state.theme) })),
@@ -172,6 +212,8 @@ export const useSettingsStore = create<SettingsState>()(
       setTheme: (theme) => set(() => ({ theme })),
 
       setColorTheme: (colorTheme) => set(() => ({ colorTheme })),
+
+      setSurfaceTheme: (surfaceTheme) => set(() => ({ surfaceTheme })),
 
       toggleSidebar: () =>
         set((state) => ({ sidebarOpen: !state.sidebarOpen })),
@@ -200,13 +242,32 @@ export const useSettingsStore = create<SettingsState>()(
           ...(!state.settingsOpen && state.updateAvailable ? { updateAvailable: false } : {}),
         })),
 
+      openSettings: (tab = 'general') =>
+        set((state) => ({
+          settingsOpen: true,
+          settingsTab: tab,
+          ...(state.updateAvailable ? { updateAvailable: false } : {}),
+        })),
+
+      setSettingsTab: (tab) => set(() => ({ settingsTab: tab })),
+
+      setMainView: (view) => set(() => ({ mainView: view })),
+
       setWorkingDirectory: (dir) =>
         set(() => ({ workingDirectory: dir })),
 
       setSelectedModel: (model) => {
         const old = get().selectedModel;
-        set(() => ({ selectedModel: model }));
-        if (old !== model) settingsEvents.emit('model-changed', { old, next: model });
+        const next = normalizeModelTier(model);
+        set(() => ({ selectedModel: next }));
+        if (old !== next) settingsEvents.emit('model-changed', { old, next });
+      },
+
+      setAuxiliaryModel: (model) => {
+        const old = get().auxiliaryModel;
+        const next = normalizeModelTier(model);
+        set(() => ({ auxiliaryModel: next }));
+        if (old !== next) settingsEvents.emit('model-changed', { old, next });
       },
 
       setSessionMode: (mode) => {
@@ -265,15 +326,24 @@ export const useSettingsStore = create<SettingsState>()(
         set(() => ({ userDisplayName: name.slice(0, 20) })),
       toggleHiddenFiles: () =>
         set((state) => ({ showHiddenFiles: !state.showHiddenFiles })),
+      setAgentTeamsEnabled: (enabled) =>
+        set(() => ({ agentTeamsEnabled: enabled })),
+      setKeepSystemAwake: (enabled) =>
+        set(() => ({
+          keepSystemAwake: enabled,
+          ...(!enabled ? { keepDisplayAwake: false } : {}),
+        })),
+      setKeepDisplayAwake: (enabled) =>
+        set((state) => ({ keepDisplayAwake: state.keepSystemAwake && enabled })),
     }),
     {
       name: 'blackbox-settings',
-      version: 8,
+      version: 13,
       migrate: (persistedState: unknown, version: number) => {
         const persisted = persistedState as Record<string, unknown>;
         if (version === 0) {
           // Migrate legacy model IDs to current ones
-          const legacyMap: Record<string, ModelId> = {
+          const legacyMap: Record<string, string> = {
             'claude-opus-4-0': 'claude-opus-4-8',
             'claude-sonnet-4-0': 'claude-sonnet-4-6',
             'claude-haiku-3-5': 'claude-haiku-4-5-20251001',
@@ -319,7 +389,7 @@ export const useSettingsStore = create<SettingsState>()(
           // selections to their 4.8 equivalents — never force-rewrite any other
           // model (4.8 is a CLI-supported model, so this is a same-tier upgrade,
           // not the v7-style unconditional rewrite that broke old-CLI users).
-          const opusUpgradeMap: Record<string, ModelId> = {
+          const opusUpgradeMap: Record<string, string> = {
             'claude-opus-4-7': 'claude-opus-4-8',
             'claude-opus-4-7-1m': 'claude-opus-4-8-1m',
           };
@@ -328,15 +398,50 @@ export const useSettingsStore = create<SettingsState>()(
             persisted.selectedModel = opusUpgradeMap[current];
           }
         }
+        if (version < 9) {
+          // UI model selection is now a stable logical tier. Exact ids remain
+          // private to the active provider mapping and are resolved at runtime.
+          persisted.selectedModel = normalizeModelTier(persisted.selectedModel);
+        }
+        if (version < 10) {
+          const accentThemes = new Set(['black', 'blue', 'purple', 'green']);
+          const surfaceThemes = new Set(['graphite', 'midnight', 'paper', 'forest']);
+          if (!accentThemes.has(String(persisted.colorTheme || ''))) {
+            persisted.colorTheme = 'black';
+          }
+          if (!surfaceThemes.has(String(persisted.surfaceTheme || ''))) {
+            persisted.surfaceTheme = 'graphite';
+          }
+        }
+        if (version < 11) {
+          // Agent Teams are experimental and materially increase token use.
+          // Never opt an existing installation in during migration.
+          persisted.agentTeamsEnabled = false;
+        }
+        if (version < 12) {
+          // Black Box is expected to keep long-running CLI/API/automation work
+          // alive after the display sleeps. Display wake remains opt-in to
+          // avoid unnecessary battery and panel use.
+          persisted.keepSystemAwake = true;
+          persisted.keepDisplayAwake = false;
+        }
+        if (version < 13) {
+          // The first auxiliary routing profile uses the balanced slot. For
+          // the built-in catalog this resolves to Sonnet on Claude and Terra
+          // on OpenAI; users can change it directly from the model selector.
+          persisted.auxiliaryModel = 'sonnet';
+        }
         return persisted;
       },
       partialize: (state) => ({
         theme: state.theme,
         colorTheme: state.colorTheme,
+        surfaceTheme: state.surfaceTheme,
         sidebarOpen: state.sidebarOpen,
         secondaryPanelWidth: state.secondaryPanelWidth,
         // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen
         selectedModel: state.selectedModel,
+        auxiliaryModel: state.auxiliaryModel,
         sessionMode: state.sessionMode,
         locale: state.locale,
         fontSize: state.fontSize,
@@ -350,6 +455,9 @@ export const useSettingsStore = create<SettingsState>()(
         userAvatarUrl: state.userAvatarUrl,
         userDisplayName: state.userDisplayName,
         showHiddenFiles: state.showHiddenFiles,
+        agentTeamsEnabled: state.agentTeamsEnabled,
+        keepSystemAwake: state.keepSystemAwake,
+        keepDisplayAwake: state.keepDisplayAwake,
       }),
     },
   ),
@@ -404,9 +512,6 @@ useSettingsStore.subscribe((state, prevState) => {
 
   const cliMode = mapSessionModeToPermissionMode(state.sessionMode);
 
-  // bypass uses --dangerously-skip-permissions at startup; can't switch TO bypass at runtime
-  if (cliMode === 'bypassPermissions') return;
-
   // Dynamically import to avoid circular deps
   Promise.all([
     import('../lib/tauri-bridge'),
@@ -418,5 +523,9 @@ useSettingsStore.subscribe((state, prevState) => {
     bridge.setPermissionMode(stdinId, cliMode).catch((err: unknown) => {
       console.error('[BLACKBOX] Failed to set permission mode:', err);
     });
+  }).catch((err: unknown) => {
+    // Dynamic imports can fail during WebView/test teardown. The mode remains
+    // persisted and will still be applied to the next CLI spawn.
+    console.error('[BLACKBOX] Failed to load runtime mode bridge:', err);
   });
 });

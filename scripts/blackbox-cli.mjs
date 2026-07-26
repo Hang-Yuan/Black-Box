@@ -118,6 +118,39 @@ async function callHelper(client, method, argsStr = '') {
   return JSON.parse(raw);
 }
 
+/** Call an async window.__blackbox_test method and poll a request-scoped slot. */
+async function callAsyncHelper(client, method, argsStr = '', timeout = 60_000) {
+  const reqId = randomUUID().slice(0, 12);
+  const startCode = `(function(){
+    if(!window.__blackbox_async_calls) window.__blackbox_async_calls = {};
+    window.__blackbox_async_calls[${JSON.stringify(reqId)}] = {done:false, result:null};
+    Promise.resolve(window.__blackbox_test[${JSON.stringify(method)}](${argsStr}))
+      .then(function(result){ window.__blackbox_async_calls[${JSON.stringify(reqId)}] = {done:true, result:result}; })
+      .catch(function(error){ window.__blackbox_async_calls[${JSON.stringify(reqId)}] = {done:true, error:error && error.message ? error.message : String(error)}; });
+    return 'started';
+  })()`;
+  await execJs(client, startCode);
+
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    await sleep(250);
+    const raw = await execJs(
+      client,
+      `JSON.stringify(window.__blackbox_async_calls && window.__blackbox_async_calls[${JSON.stringify(reqId)}])`,
+      Math.min(3000, Math.max(500, deadline - Date.now())),
+    );
+    if (!raw) continue;
+    const slot = JSON.parse(raw);
+    if (!slot?.done) continue;
+    await execJs(client, `delete window.__blackbox_async_calls[${JSON.stringify(reqId)}]`).catch(() => {});
+    if (slot.error) throw new Error(slot.error);
+    return slot.result;
+  }
+
+  await execJs(client, `delete window.__blackbox_async_calls[${JSON.stringify(reqId)}]`).catch(() => {});
+  throw new Error(`Async helper '${method}' timed out after ${timeout}ms`);
+}
+
 function parseArgs(argv) {
   const flags = {};
   const positional = [];
@@ -179,7 +212,7 @@ const commands = {
   },
 
   async 'delete-session'(client) {
-    return await callHelper(client, 'deleteCurrentSession');
+    return await callAsyncHelper(client, 'deleteCurrentSession', '', 30_000);
   },
 
   // ── Chat: Read ──
@@ -205,9 +238,79 @@ const commands = {
     return { sessions, count: Array.isArray(sessions) ? sessions.length : 0 };
   },
 
+  async 'get-task-location'(client) {
+    return await callAsyncHelper(client, 'getTaskLocation');
+  },
+
+  async 'handoff-task'(client, { positional, flags }) {
+    const destination = positional[0];
+    if (destination !== 'local' && destination !== 'worktree') {
+      throw new Error('Usage: handoff-task local|worktree [--timeout MS]');
+    }
+    const timeout = parseInt(flags.timeout) || 90_000;
+    const deadline = Date.now() + timeout;
+    const interactionId = randomUUID().slice(0, 12);
+    while (Date.now() < deadline) {
+      const stateRaw = await execJs(client, `(function(){
+        if (!window.__blackbox_handoff_clicks) window.__blackbox_handoff_clicks = {};
+        var slot = window.__blackbox_handoff_clicks[${JSON.stringify(interactionId)}]
+          || (window.__blackbox_handoff_clicks[${JSON.stringify(interactionId)}] = {panelRequested:false, actionClicked:false});
+        var control = document.querySelector('[data-testid="task-location-control"]');
+        if (!control) return JSON.stringify({ready:false});
+        var current = control.getAttribute('data-location');
+        if (current === ${JSON.stringify(destination)}) return JSON.stringify({ready:true, current:current, done:true});
+        if (!slot.panelRequested) {
+          slot.panelRequested = true;
+          control.click();
+          return JSON.stringify({ready:true, current:current, panelRequested:true});
+        }
+        var action = document.querySelector('[data-testid="task-location-handoff"][data-destination="${destination}"]');
+        if (action && !action.disabled && !slot.actionClicked) {
+          slot.actionClicked = true;
+          action.click();
+          return JSON.stringify({ready:true, current:current, clicked:true});
+        }
+        return JSON.stringify({ready:true, current:current, clicked:slot.actionClicked});
+      })()`);
+      const state = JSON.parse(stateRaw || '{}');
+      if (state.done) {
+        await execJs(client, `delete window.__blackbox_handoff_clicks[${JSON.stringify(interactionId)}]`).catch(() => {});
+        return await callAsyncHelper(client, 'getTaskLocation');
+      }
+
+      const currentRaw = await execJs(client, `(function(){
+        var control = document.querySelector('[data-testid="task-location-control"]');
+        return control ? String(control.getAttribute('data-location') || '') : '';
+      })()`);
+      if (currentRaw === destination) {
+        await execJs(client, `delete window.__blackbox_handoff_clicks[${JSON.stringify(interactionId)}]`).catch(() => {});
+        return await callAsyncHelper(client, 'getTaskLocation');
+      }
+
+      const toastRaw = await execJs(client, `(function(){
+        var toast = document.querySelector('[data-testid="toast"]');
+        return toast ? String(toast.innerText || toast.textContent || '') : '';
+      })()`);
+      if (toastRaw && /failed|失败/i.test(toastRaw)) throw new Error(toastRaw);
+      await sleep(250);
+    }
+    await execJs(client, `delete window.__blackbox_handoff_clicks[${JSON.stringify(interactionId)}]`).catch(() => {});
+    throw new Error(`handoff-task timed out after ${timeout}ms`);
+  },
+
   async 'get-current-model'(client) {
     const model = await callHelper(client, 'getCurrentModel');
     return { model };
+  },
+
+  async 'get-current-auxiliary-model'(client) {
+    const model = await callHelper(client, 'getCurrentAuxiliaryModel');
+    return { model };
+  },
+
+  async 'get-current-mode'(client) {
+    const mode = await callHelper(client, 'getCurrentMode');
+    return { mode };
   },
 
   async 'get-current-provider'(client) {
@@ -215,10 +318,138 @@ const commands = {
     return { provider };
   },
 
+  async 'get-current-plan'(client) {
+    const plan = await callHelper(client, 'getCurrentPlan');
+    return { plan };
+  },
+
+  async 'get-current-goal'(client) {
+    const goal = await callHelper(client, 'getCurrentGoal');
+    return { goal };
+  },
+
+  async 'goal-create'(client, { positional, flags }) {
+    const objective = positional.join(' ').trim();
+    if (!objective) throw new Error('Usage: goal-create OBJECTIVE [--budget N]');
+    const tokenBudget = flags.budget == null ? undefined : Number(flags.budget);
+    if (tokenBudget !== undefined && (!Number.isSafeInteger(tokenBudget) || tokenBudget < 1_000)) {
+      throw new Error('Goal budget must be an integer of at least 1,000 tokens');
+    }
+    const args = tokenBudget === undefined
+      ? JSON.stringify(objective)
+      : `${JSON.stringify(objective)},${tokenBudget}`;
+    return await callHelper(client, 'createGoal', args);
+  },
+
+  async 'goal-pause'(client, { flags }) {
+    const before = await callHelper(client, 'getCurrentGoal');
+    if (!before) throw new Error('No Goal exists for the active task');
+    if (before.status === 'paused') return { goal: before, alreadyPaused: true };
+    if (before.status !== 'active') throw new Error(`Goal cannot pause from status ${before.status}`);
+    const timeout = parseInt(flags.timeout) || 10_000;
+    const target = 'goal-pause';
+    let state = await execJs(client, `(function(){
+      var action=document.querySelector('[data-testid="${target}"]');
+      if(action){action.click();return 'clicked';}
+      var toggle=document.querySelector('[data-testid="goal-button"]');
+      if(!toggle)return 'missing-toggle';
+      toggle.click();return 'opened';
+    })()`);
+    if (state === 'missing-toggle') throw new Error('Goal control is unavailable');
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const goal = await callHelper(client, 'getCurrentGoal');
+      if (goal?.status === 'paused') return { goal };
+      if (state !== 'clicked') {
+        state = await execJs(client, `(function(){var action=document.querySelector('[data-testid="${target}"]');if(!action)return 'waiting';action.click();return 'clicked';})()`);
+      }
+      await sleep(100);
+    }
+    throw new Error(`Goal did not pause within ${timeout}ms`);
+  },
+
+  async 'goal-resume'(client, { flags }) {
+    const before = await callHelper(client, 'getCurrentGoal');
+    if (!before) throw new Error('No Goal exists for the active task');
+    const waitingActive = before.status === 'active' && Boolean(before.waitReason);
+    if (!['paused', 'blocked'].includes(before.status) && !waitingActive) {
+      throw new Error(`Goal cannot resume from status ${before.status}`);
+    }
+    const timeout = parseInt(flags.timeout) || 10_000;
+    const target = 'goal-resume';
+    let state = await execJs(client, `(function(){
+      var action=document.querySelector('[data-testid="${target}"]');
+      if(action){action.click();return 'clicked';}
+      var toggle=document.querySelector('[data-testid="goal-button"]');
+      if(!toggle)return 'missing-toggle';
+      toggle.click();return 'opened';
+    })()`);
+    if (state === 'missing-toggle') throw new Error('Goal control is unavailable');
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const goal = await callHelper(client, 'getCurrentGoal');
+      if (goal
+        && !['paused', 'blocked'].includes(goal.status)
+        && !(goal.status === 'active' && goal.waitReason)) return { goal };
+      if (state !== 'clicked') {
+        state = await execJs(client, `(function(){var action=document.querySelector('[data-testid="${target}"]');if(!action)return 'waiting';action.click();return 'clicked';})()`);
+      }
+      await sleep(100);
+    }
+    throw new Error(`Goal did not resume within ${timeout}ms`);
+  },
+
+  async 'get-current-fork'(client) {
+    const fork = await callHelper(client, 'getCurrentFork');
+    return { fork };
+  },
+
   async 'is-streaming'(client, { flags }) {
     const tabId = flags.tab;
     const streaming = await callHelper(client, 'isStreaming', tabId ? JSON.stringify(tabId) : '');
     return { streaming };
+  },
+
+  async 'fork-session'(client, { flags }) {
+    const sourceId = flags.session || await callHelper(client, 'getActiveSessionId');
+    if (!sourceId) throw new Error('fork-session requires an active or --session thread');
+    const opened = await execJs(client, `(function(){
+      var item = document.querySelector('[data-testid="session-item-${sourceId}"]');
+      if (!item) return JSON.stringify({error:'source session item not found'});
+      item.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,clientX:180,clientY:180}));
+      return JSON.stringify({opened:true});
+    })()`);
+    const openedState = JSON.parse(opened || '{}');
+    if (openedState.error) throw new Error(openedState.error);
+
+    const deadline = Date.now() + (parseInt(flags.timeout) || 30_000);
+    let clicked = false;
+    while (Date.now() < deadline) {
+      const stateRaw = await execJs(client, `(function(){
+        var button = document.querySelector('[data-testid="fork-session-${sourceId}"]');
+        if (!button) return JSON.stringify({ready:false});
+        if (button.disabled) return JSON.stringify({error:'fork action is disabled'});
+        if (!window.__blackbox_fork_clicks) window.__blackbox_fork_clicks = {};
+        if (!window.__blackbox_fork_clicks[${JSON.stringify(sourceId)}]) {
+          window.__blackbox_fork_clicks[${JSON.stringify(sourceId)}] = true;
+          button.click();
+          return JSON.stringify({ready:true,clicked:true});
+        }
+        return JSON.stringify({ready:true,clicked:false});
+      })()`);
+      const state = JSON.parse(stateRaw || '{}');
+      if (state.error) throw new Error(state.error);
+      clicked ||= Boolean(state.clicked);
+      const activeId = await callHelper(client, 'getActiveSessionId');
+      if (clicked && activeId && activeId !== sourceId && activeId.startsWith('draft_')) {
+        const fork = await callHelper(client, 'getCurrentFork');
+        await execJs(client, `delete window.__blackbox_fork_clicks[${JSON.stringify(sourceId)}]`).catch(() => {});
+        return { source: sourceId, draft: activeId, fork };
+      }
+      await sleep(250);
+    }
+    await execJs(client, `delete window.__blackbox_fork_clicks[${JSON.stringify(sourceId)}]`).catch(() => {});
+    throw new Error('fork-session timed out before a fork draft became active');
   },
 
   // ── Session Management ──
@@ -266,6 +497,114 @@ const commands = {
     return await callHelper(client, 'newSession');
   },
 
+  async 'rewind-conversation'(client, { positional, flags }) {
+    const requestedTurn = flags.turn ?? positional[0] ?? 'latest';
+    const timeout = parseInt(flags.timeout) || 30_000;
+    const action = flags.action || 'restore_conversation';
+    const allowedActions = new Set(['restore_conversation', 'restore_all']);
+    if (!allowedActions.has(action)) {
+      throw new Error('rewind-conversation supports --action restore_conversation|restore_all');
+    }
+    const interactionId = randomUUID().slice(0, 12);
+
+    const openedRaw = await execJs(client, `(function(){
+      if (!window.__blackbox_rewind_clicks) window.__blackbox_rewind_clicks = {};
+      var slot = window.__blackbox_rewind_clicks[${JSON.stringify(interactionId)}]
+        || (window.__blackbox_rewind_clicks[${JSON.stringify(interactionId)}] = {opened:false, selected:false, actionClicked:false});
+      var button = document.querySelector('[data-testid="rewind-button"]');
+      if (!button) return JSON.stringify({error:'rewind button not found'});
+      if (button.disabled) return JSON.stringify({error:'rewind button is disabled'});
+      if (!slot.opened) {
+        slot.opened = true;
+        button.click();
+      }
+      return JSON.stringify({opened:true, duplicateIgnored:slot.opened});
+    })()`);
+    const opened = JSON.parse(openedRaw || '{}');
+    if (opened.error) throw new Error(opened.error);
+
+    const panelDeadline = Date.now() + Math.min(timeout, 10_000);
+    let turnCount = 0;
+    while (Date.now() < panelDeadline) {
+      const countRaw = await execJs(client, `String(document.querySelectorAll('[data-testid^="rewind-turn-"]').length)`);
+      turnCount = Number(countRaw || 0);
+      if (turnCount > 0) break;
+      await sleep(100);
+    }
+    if (turnCount < 1) throw new Error('rewind turn list did not open');
+
+    let turnIndex;
+    if (requestedTurn === 'latest') turnIndex = turnCount - 1;
+    else if (requestedTurn === 'oldest') turnIndex = 0;
+    else turnIndex = Number(requestedTurn);
+    if (!Number.isInteger(turnIndex) || turnIndex < 0 || turnIndex >= turnCount) {
+      throw new Error(`Invalid rewind turn ${requestedTurn}; available zero-based range is 0..${turnCount - 1}`);
+    }
+
+    const selectedRaw = await execJs(client, `(function(){
+      var slot = window.__blackbox_rewind_clicks && window.__blackbox_rewind_clicks[${JSON.stringify(interactionId)}];
+      if (!slot) return JSON.stringify({error:'rewind interaction state missing'});
+      var item = document.querySelector('[data-testid="rewind-turn-${turnIndex}"]');
+      if (!item) return JSON.stringify({error:'rewind turn not found'});
+      if (!slot.selected) {
+        slot.selected = true;
+        item.click();
+      }
+      return JSON.stringify({selected:${turnIndex}});
+    })()`);
+    const selected = JSON.parse(selectedRaw || '{}');
+    if (selected.error) throw new Error(selected.error);
+
+    const actionDeadline = Date.now() + Math.min(timeout, 10_000);
+    while (Date.now() < actionDeadline) {
+      const existsRaw = await execJs(client, `String(!!document.querySelector('[data-testid="rewind-action-${action}"]'))`);
+      if (existsRaw === 'true') break;
+      await sleep(100);
+    }
+    const startedAt = Date.now();
+    const actionRaw = await execJs(client, `(function(){
+      var slot = window.__blackbox_rewind_clicks && window.__blackbox_rewind_clicks[${JSON.stringify(interactionId)}];
+      if (!slot) return JSON.stringify({error:'rewind interaction state missing'});
+      var button = document.querySelector('[data-testid="rewind-action-${action}"]');
+      if (!button) return JSON.stringify({error:'rewind action not found'});
+      if (button.disabled) return JSON.stringify({error:'rewind action is disabled'});
+      if (!slot.actionClicked) {
+        slot.actionClicked = true;
+        button.click();
+      }
+      return JSON.stringify({clicked:true});
+    })()`);
+    const actionResult = JSON.parse(actionRaw || '{}');
+    if (actionResult.error) throw new Error(actionResult.error);
+
+    const deadline = startedAt + timeout;
+    while (Date.now() < deadline) {
+      const payload = await callHelper(client, 'getMessages', JSON.stringify({ last: 20, summary: false }));
+      const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+      const completed = messages.find((message) =>
+        message?.commandData?.action === 'rewind'
+        && Number(message.timestamp || 0) >= startedAt - 1000
+      );
+      if (completed) {
+        await execJs(client, `delete window.__blackbox_rewind_clicks[${JSON.stringify(interactionId)}]`).catch(() => {});
+        return {
+          action,
+          selectedTurn: turnIndex,
+          turnCount,
+          completedAt: Number(completed.timestamp || Date.now()),
+        };
+      }
+      const failed = messages.find((message) =>
+        message?.commandType === 'error'
+        && String(message.content || '').toLowerCase().includes('rewind')
+      );
+      if (failed) throw new Error(String(failed.content));
+      await sleep(200);
+    }
+    await execJs(client, `delete window.__blackbox_rewind_clicks[${JSON.stringify(interactionId)}]`).catch(() => {});
+    throw new Error(`rewind-conversation timed out after ${timeout}ms`);
+  },
+
   async 'check-editor'(client) {
     const deadline = Date.now() + 3000;
     let last = null;
@@ -297,6 +636,20 @@ const commands = {
     return await callHelper(client, 'switchModel', JSON.stringify(id));
   },
 
+  async 'switch-auxiliary-model'(client, { positional }) {
+    const id = positional[0];
+    if (!id) throw new Error('Usage: switch-auxiliary-model MODEL_ID');
+    return await callHelper(client, 'switchAuxiliaryModel', JSON.stringify(id));
+  },
+
+  async 'switch-mode'(client, { positional }) {
+    const mode = positional[0];
+    if (!['ask', 'code', 'plan', 'auto', 'bypass'].includes(mode)) {
+      throw new Error('Usage: switch-mode ask|code|plan|auto|bypass');
+    }
+    return await callHelper(client, 'switchMode', JSON.stringify(mode));
+  },
+
   async 'switch-provider'(client, { positional }) {
     const raw = positional[0];
     if (raw === undefined) throw new Error('Usage: switch-provider PROVIDER_ID  (or "null" to reset)');
@@ -316,7 +669,7 @@ const commands = {
 
   async 'switch-settings-tab'(client, { positional }) {
     const id = positional[0];
-    if (!id) throw new Error('Usage: switch-settings-tab TAB_ID  (general|provider|cli|mcp)');
+    if (!id) throw new Error('Usage: switch-settings-tab TAB_ID  (general|provider|cli|desktopPet)');
     return await callHelper(client, 'switchSettingsTab', JSON.stringify(id));
   },
 
@@ -332,16 +685,20 @@ const commands = {
 
   // ── Visual & Text ──
 
-  async screenshot(client) {
+  async screenshot(client, { flags }) {
+    const windowLabel = flags.window || 'main';
+    if (!/^[a-zA-Z0-9_-]+$/.test(windowLabel)) {
+      throw new Error('Invalid --window label');
+    }
     const resp = await client.send('take_screenshot', {
-      window_label: 'main',
+      window_label: windowLabel,
       save_to_disk: true,
       thumbnail: false,
     }, SCREENSHOT_TIMEOUT);
     if (!resp.success) throw new Error(resp.error || 'Screenshot failed');
     const path = resp.data?.filePath || resp.data?.file_path;
     if (!path) throw new Error('Screenshot saved but no file path returned');
-    return { path };
+    return { path, window: windowLabel };
   },
 
   async 'get-visible-text'(client, { flags }) {
@@ -428,6 +785,7 @@ const commands = {
 
   async 'wait-until-done'(client, { flags }) {
     const timeout = parseInt(flags.timeout) || 60_000;
+    const minMessages = Math.max(0, parseInt(flags['min-messages']) || 0);
     const start = Date.now();
 
     // Brief delay to let CLI process start
@@ -439,7 +797,7 @@ const commands = {
       if (status.pendingPermission) {
         return { status: 'permission_pending', elapsed: Date.now() - start, ...status };
       }
-      if (!status.active) {
+      if (!status.active && status.messageCount >= minMessages) {
         return { status: 'completed', elapsed: Date.now() - start, ...status };
       }
 
@@ -660,13 +1018,16 @@ const commands = {
       usage: 'node scripts/blackbox-cli.mjs <command> [args] [--flags]',
       commands: {
         health: ['ping', 'status', 'restart [--timeout MS]', 'relaunch [--timeout MS]'],
-        chat: ['type TEXT', 'send', 'stop', 'delete-session', 'get-messages [--last N] [--all] [--tab ID] [--full]', 'check-editor'],
-        session: ['get-active-session', 'get-all-sessions', 'switch-session ID', 'new-session [--cwd PATH]'],
-        model: ['get-current-model', 'get-current-provider', 'switch-model ID', 'switch-provider ID'],
+        chat: ['type TEXT', 'send', 'stop', 'delete-session', 'get-messages [--last N] [--all] [--tab ID] [--full]', 'check-editor', 'rewind-conversation [latest|oldest|INDEX] [--action restore_conversation|restore_all]'],
+        session: ['get-active-session', 'get-all-sessions', 'switch-session ID', 'new-session [--cwd PATH]', 'get-task-location', 'handoff-task local|worktree'],
+        model: ['get-current-model', 'get-current-auxiliary-model', 'get-current-provider', 'get-current-plan', 'get-current-fork', 'switch-model ID', 'switch-auxiliary-model ID', 'switch-provider ID'],
+        mode: ['get-current-mode', 'switch-mode ask|code|plan|auto|bypass'],
+        goal: ['get-current-goal', 'goal-create OBJECTIVE [--budget N]', 'goal-pause [--timeout MS]', 'goal-resume [--timeout MS]'],
+        thread: ['fork-session [--session ID] [--timeout MS]'],
         settings: ['open-settings', 'close-settings', 'switch-settings-tab ID'],
         permission: ['allow-permission', 'deny-permission'],
-        visual: ['screenshot', 'get-visible-text [--selector CSS]', 'query-page [--mode map|state|info]', 'get-dom'],
-        waiting: ['wait-for --text TEXT|--selector SEL [--timeout MS]', 'wait-until-done [--timeout MS]', 'wait-for-phase PHASE [--timeout MS]', 'delay MS'],
+        visual: ['screenshot [--window LABEL]', 'get-visible-text [--selector CSS]', 'query-page [--mode map|state|info]', 'get-dom'],
+        waiting: ['wait-for --text TEXT|--selector SEL [--timeout MS]', 'wait-until-done [--timeout MS] [--min-messages N]', 'wait-for-phase PHASE [--timeout MS]', 'delay MS'],
         raw: ['exec JS_CODE [--timeout MS]'],
       },
       env: { BLACKBOX_SOCKET: `Override socket path (default: ${SOCKET_PATH})` },
@@ -740,4 +1101,9 @@ async function main() {
   }
 }
 
-main();
+// This is a one-shot test driver. Some native screenshot responses leave the
+// socket handle observable to Node for another event-loop turn even after
+// `client.close()`, which previously made a successful command hang until the
+// parent smoke-test timeout killed it. Once `main` has flushed its JSON result
+// and closed the client, terminate deterministically.
+main().then(() => process.exit(0));

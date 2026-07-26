@@ -1,10 +1,14 @@
 import { useEffect, useState, useCallback } from 'react';
-import { bridge, type CliCandidate } from '../../lib/tauri-bridge';
+import { bridge, type CliCandidate, type CliLifecycleInfo, type CliStatus } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { APP_NAME } from '../../lib/edition';
 import { stripAnsi } from '../../lib/strip-ansi';
-import { isPermissionError, isNetworkError } from './settingsUtils';
+import { classifyCliMaintenanceError } from './settingsUtils';
 import { useSettingsStore } from '../../stores/settingsStore';
+import {
+  planCliUpdateSessions,
+  settleBackendProcessesForCliUpdate,
+} from '../../lib/sessionLifecycle';
 
 type CliCheckStatus = 'idle' | 'checking' | 'found' | 'not_found' | 'installing' | 'installed' | 'install_failed' | 'updating' | 'updated' | 'update_failed';
 
@@ -24,6 +28,50 @@ const SOURCE_COLORS: Record<string, string> = {
   dynamic: 'text-text-tertiary',
 };
 
+const INSTALL_METHOD_LABELS: Record<CliLifecycleInfo['installMethod'], string> = {
+  native: 'Native · Official',
+  appLocalNative: 'Native · Black Box',
+  appLocalNpm: 'npm · Black Box',
+  homebrewStable: 'Homebrew · Stable',
+  homebrewLatest: 'Homebrew · Latest',
+  winget: 'WinGet',
+  apt: 'apt',
+  dnf: 'dnf',
+  apk: 'apk',
+  npm: 'npm · Global',
+  versionManager: 'Node version manager',
+  desktopBundled: 'Claude Desktop',
+  unknown: 'Unknown',
+};
+
+function CliFailureNotice({ details }: { details: string }) {
+  const t = useT();
+  const error = classifyCliMaintenanceError(details);
+
+  return (
+    <div
+      className="space-y-2 rounded-md border border-red-500/20 bg-red-500/10 px-3 py-2.5"
+      data-error-kind={error.kind}
+      data-testid="cli-error-notice"
+    >
+      <p className="text-[13px] font-medium leading-5 text-red-500">
+        {t(`cli.error.${error.kind}.title`)}
+      </p>
+      <p className="text-[11px] leading-5 text-text-muted">
+        {t(`cli.error.${error.kind}.action`)}
+      </p>
+      <details className="text-[11px] text-text-tertiary" data-testid="cli-error-technical-details">
+        <summary className="cursor-pointer select-none hover:text-text-muted">
+          {t('cli.error.technicalDetails')}
+        </summary>
+        <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-bg-tertiary px-2.5 py-2 font-mono text-[10px] leading-4 text-text-muted">
+          {error.detail}
+        </pre>
+      </details>
+    </div>
+  );
+}
+
 export function CliTab() {
   const t = useT();
   const [status, setStatus] = useState<CliCheckStatus>('idle');
@@ -31,18 +79,30 @@ export function CliTab() {
   const [cliPath, setCliPath] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [gitBashMissing, setGitBashMissing] = useState(false);
+  const [sdkCapabilities, setSdkCapabilities] = useState<CliStatus['sdk_capabilities']>(null);
+  const [sdkError, setSdkError] = useState('');
   const [downloadPercent, setDownloadPercent] = useState(0);
   const [phase, setPhase] = useState<'idle' | 'downloading' | 'configuring' | 'npm_fallback' | 'node_downloading' | 'node_extracting' | 'git_downloading' | 'git_extracting' | 'native_version' | 'native_manifest' | 'native_download' | 'native_verify' | 'native_install'>('idle');
+  const [installIntent, setInstallIntent] = useState<'install' | 'reinstall'>('install');
+  const [lifecycle, setLifecycle] = useState<CliLifecycleInfo | null>(null);
+  const [commandCopied, setCommandCopied] = useState(false);
+  const cliUpdateAvailable = useSettingsStore((state) => state.cliUpdateAvailable);
+  const cliLatestVersion = useSettingsStore((state) => state.cliLatestVersion);
 
   // Auto-check on mount
   useEffect(() => {
-    bridge.checkClaudeCli().then((result) => {
+    Promise.all([bridge.checkClaudeCli(), bridge.getCliLifecycle()]).then(([result, nextLifecycle]) => {
+      setLifecycle(nextLifecycle);
       if (result.installed) {
         setCliVersion(result.version ?? null);
         setCliPath(result.path ?? null);
         setGitBashMissing(result.git_bash_missing ?? false);
+        setSdkCapabilities(result.sdk_capabilities ?? null);
+        setSdkError('');
         setStatus('found');
       } else {
+        setSdkCapabilities(null);
+        setSdkError(result.sdk_error || '');
         setStatus('not_found');
       }
     }).catch(() => setStatus('not_found'));
@@ -52,13 +112,27 @@ export function CliTab() {
     setStatus('checking');
     setErrorMsg('');
     try {
-      const result = await bridge.checkClaudeCli();
+      const [result, nextLifecycle] = await Promise.all([
+        bridge.checkClaudeCli(),
+        bridge.getCliLifecycle(),
+      ]);
+      setLifecycle(nextLifecycle);
+      void bridge.checkCliUpdate().then((updateInfo) => {
+        useSettingsStore.setState({
+          cliUpdateAvailable: updateInfo.update_available,
+          cliLatestVersion: updateInfo.latest || '',
+        });
+      }).catch(() => undefined);
       if (result.installed) {
         setCliVersion(result.version ?? null);
         setCliPath(result.path ?? null);
         setGitBashMissing(result.git_bash_missing ?? false);
+        setSdkCapabilities(result.sdk_capabilities ?? null);
+        setSdkError('');
         setStatus('found');
       } else {
+        setSdkCapabilities(null);
+        setSdkError(result.sdk_error || '');
         setStatus('not_found');
       }
     } catch (e) {
@@ -68,6 +142,7 @@ export function CliTab() {
   }, []);
 
   const handleInstall = useCallback(async () => {
+    setInstallIntent('install');
     setStatus('installing');
     setErrorMsg('');
     setDownloadPercent(0);
@@ -102,9 +177,14 @@ export function CliTab() {
       if (result.installed) {
         setCliVersion(result.version ?? null);
         setCliPath(result.path ?? null);
+        setSdkCapabilities(result.sdk_capabilities ?? null);
+        setSdkError('');
+        setLifecycle(await bridge.getCliLifecycle());
         setStatus('installed');
       } else {
-        setErrorMsg('CLI not found after installation');
+        setSdkCapabilities(null);
+        setSdkError(result.sdk_error || '');
+        setErrorMsg(result.sdk_error || 'CLI not found after installation');
         setStatus('install_failed');
       }
     } catch (e) {
@@ -114,11 +194,55 @@ export function CliTab() {
     }
   }, []);
 
+  const prepareCliMaintenance = useCallback(async (): Promise<boolean> => {
+    const blockers = await bridge.getCliUpdateBlockers();
+    if (blockers.runningAutomation) {
+      throw new Error(`CLI_UPDATE_BLOCKED_AUTOMATION: ${t('cli.updateBlockedAutomation')}`);
+    }
+    if (blockers.activeSessionIds.length === 0) return true;
+
+    const sessionPlan = planCliUpdateSessions(blockers.activeSessionIds);
+    if (sessionPlan.busyIds.length > 0) {
+      throw new Error(
+        `CLI_UPDATE_BLOCKED_SESSIONS: ${t('cli.updateBusySessions').replace(
+          '{count}',
+          String(sessionPlan.busyIds.length),
+        )}`,
+      );
+    }
+    if (sessionPlan.unknownIds.length > 0) {
+      throw new Error(`CLI_UPDATE_BLOCKED_SESSIONS: ${t('cli.updateUnknownSessions')}`);
+    }
+
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    const confirmed = await ask(
+      t('cli.confirmStopSessionsForUpdate').replace(
+        '{count}',
+        String(sessionPlan.warmIds.length),
+      ),
+      { title: APP_NAME, kind: 'warning' },
+    );
+    if (!confirmed) return false;
+    await settleBackendProcessesForCliUpdate(blockers.activeSessionIds);
+    return true;
+  }, [t]);
+
   const handleUpdate = useCallback(async () => {
-    setStatus('updating');
     setErrorMsg('');
     setDownloadPercent(0);
     setPhase('idle');
+
+    try {
+      if (!await prepareCliMaintenance()) return;
+    } catch (e) {
+      setErrorMsg(
+        `${t('cli.stopSessionsFailed')} ${stripAnsi(String(e))}`.trim(),
+      );
+      setStatus('update_failed');
+      return;
+    }
+
+    setStatus('updating');
 
     const { onDownloadProgress } = await import('../../lib/tauri-bridge');
     const unlisten = await onDownloadProgress((event) => {
@@ -134,17 +258,63 @@ export function CliTab() {
     });
 
     try {
-      const newVersion = await bridge.updateClaudeCli();
+      const newVersion = await bridge.updateClaudeCli(cliLatestVersion || null);
       unlisten();
-      setCliVersion(newVersion);
+      const checked = await bridge.checkClaudeCli();
+      setCliVersion(checked.version || newVersion);
+      setCliPath(checked.path ?? null);
+      setSdkCapabilities(checked.sdk_capabilities ?? null);
+      setSdkError(checked.sdk_error || '');
+      setLifecycle(await bridge.getCliLifecycle());
       setStatus('updated');
       useSettingsStore.setState({ cliUpdateAvailable: false, cliLatestVersion: '' });
     } catch (e) {
       unlisten();
-      setErrorMsg(stripAnsi(String(e)));
+      const message = stripAnsi(String(e));
+      setErrorMsg(message);
       setStatus('update_failed');
     }
-  }, []);
+  }, [cliLatestVersion, prepareCliMaintenance, t]);
+
+  const handleReinstall = useCallback(async () => {
+    setInstallIntent('reinstall');
+    setErrorMsg('');
+    setDownloadPercent(0);
+    setPhase('configuring');
+    try {
+      if (!await prepareCliMaintenance()) return;
+    } catch (e) {
+      setErrorMsg(
+        `${t('cli.stopSessionsFailed')} ${stripAnsi(String(e))}`.trim(),
+      );
+      setStatus('update_failed');
+      return;
+    }
+
+    setStatus('installing');
+    const { onDownloadProgress } = await import('../../lib/tauri-bridge');
+    const unlisten = await onDownloadProgress((event) => {
+      setDownloadPercent(event.percent);
+      setPhase(event.percent >= 100 ? 'configuring' : 'downloading');
+    });
+
+    try {
+      const version = await bridge.reinstallClaudeCli();
+      unlisten();
+      const checked = await bridge.checkClaudeCli();
+      setCliVersion(checked.version || version);
+      setCliPath(checked.path ?? null);
+      setSdkCapabilities(checked.sdk_capabilities ?? null);
+      setSdkError(checked.sdk_error || '');
+      setLifecycle(await bridge.getCliLifecycle());
+      setStatus('installed');
+    } catch (e) {
+      unlisten();
+      const message = stripAnsi(String(e));
+      setErrorMsg(message);
+      setStatus('install_failed');
+    }
+  }, [prepareCliMaintenance, t]);
 
   const handleRestart = useCallback(async () => {
     const { relaunch } = await import('@tauri-apps/plugin-process');
@@ -169,14 +339,56 @@ export function CliTab() {
           <p className="text-xs text-text-tertiary truncate" title={cliPath}>
             {cliPath}
           </p>
+          {sdkCapabilities?.streamJson && sdkCapabilities.permissionPromptStdio && (
+            <p className="text-[11px] text-accent">
+              {t('cli.sdkReady')}
+            </p>
+          )}
         </div>
       )}
 
-      {/* CLI update available — hidden for now */}
-      {false && useSettingsStore.getState().cliUpdateAvailable && (status === 'found' || status === 'idle') && (
+      {lifecycle?.path && status !== 'not_found' && (
+        <div className="rounded-md border border-border-subtle bg-bg-secondary/60 px-3 py-2.5 space-y-1.5">
+          <div className="grid grid-cols-3 gap-3 text-[11px]">
+            <div>
+              <div className="text-text-tertiary">{t('cli.installMethod')}</div>
+              <div className="mt-0.5 text-text-primary font-medium">{INSTALL_METHOD_LABELS[lifecycle.installMethod]}</div>
+            </div>
+            <div>
+              <div className="text-text-tertiary">{t('cli.releaseChannel')}</div>
+              <div className="mt-0.5 text-text-primary font-medium">{lifecycle.releaseChannel || '—'}</div>
+            </div>
+            <div>
+              <div className="text-text-tertiary">{t('cli.autoUpdates')}</div>
+              <div className="mt-0.5 text-text-primary font-medium">{lifecycle.autoUpdates ? t('cli.autoUpdatesOn') : t('cli.autoUpdatesOff')}</div>
+            </div>
+          </div>
+          {!lifecycle.canUpdateInApp && lifecycle.updateCommand && (
+            <div className="pt-1.5 border-t border-border-subtle">
+              <div className="text-[10px] text-text-tertiary">{t('cli.manualUpdate')}</div>
+              <div className="mt-1 flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded bg-bg-tertiary px-2 py-1 text-[10px] text-text-muted" title={lifecycle.updateCommand}>{lifecycle.updateCommand}</code>
+                <button onClick={async () => {
+                  await navigator.clipboard.writeText(lifecycle.updateCommand || '');
+                  setCommandCopied(true);
+                  window.setTimeout(() => setCommandCopied(false), 1500);
+                }} className="shrink-0 text-[10px] text-accent hover:opacity-80">
+                  {commandCopied ? t('cli.commandCopied') : t('cli.copyCommand')}
+                </button>
+              </div>
+            </div>
+          )}
+          {!lifecycle.canUpdateInApp && !lifecycle.updateCommand && (
+            <p className="pt-1.5 border-t border-border-subtle text-[10px] leading-4 text-text-tertiary">{lifecycle.note}</p>
+          )}
+        </div>
+      )}
+
+      {/* CLI update available for this installation's own release channel */}
+      {cliUpdateAvailable && (status === 'found' || status === 'idle') && (
         <div className="py-2 px-3 rounded-md bg-accent/10">
           <p className="text-[13px] text-accent font-medium">
-            {t('cli.update')} — v{useSettingsStore.getState().cliLatestVersion} {t('update.available') || 'available'}
+            {t('cli.update')} — v{cliLatestVersion} {t('update.available') || 'available'}
           </p>
         </div>
       )}
@@ -191,13 +403,18 @@ export function CliTab() {
       )}
 
       {status === 'not_found' && (
-        <p className="text-[13px] text-amber-500">{t('cli.notFound')}</p>
+        <div className="space-y-1">
+          <p className="text-[13px] text-amber-500">{t('cli.notFound')}</p>
+          {sdkError && (
+            <CliFailureNotice details={sdkError} />
+          )}
+        </div>
       )}
 
       {/* Action buttons */}
       {(status === 'idle' || status === 'found' || status === 'not_found' || status === 'update_failed') && (
         <div className="flex gap-3">
-          {status !== 'not_found' && (
+          {status !== 'not_found' && lifecycle?.canUpdateInApp && (
             <button
               onClick={handleUpdate}
               className="flex-1 py-2 text-[13px] font-medium rounded-md
@@ -215,14 +432,18 @@ export function CliTab() {
           >
             {t('cli.check')}
           </button>
-          <button
+          {(status === 'not_found' || gitBashMissing || lifecycle?.canUpdateInApp) && <button
             onClick={async () => {
               if (status !== 'not_found') {
                 const { ask } = await import('@tauri-apps/plugin-dialog');
                 const confirmed = await ask(t('cli.confirmReinstall'), { title: APP_NAME, kind: 'warning' });
                 if (!confirmed) return;
               }
-              handleInstall();
+              if (status === 'not_found' || gitBashMissing) {
+                await handleInstall();
+              } else {
+                await handleReinstall();
+              }
             }}
             className={`flex-1 py-2 text-[13px] font-medium rounded-md transition-smooth
               ${(status === 'not_found' || gitBashMissing)
@@ -231,7 +452,7 @@ export function CliTab() {
               }`}
           >
             {status === 'not_found' ? t('cli.install') : t('cli.reinstall')}
-          </button>
+          </button>}
         </div>
       )}
 
@@ -277,9 +498,7 @@ export function CliTab() {
       )}
 
       {status === 'update_failed' && errorMsg && (
-        <div className="py-2 px-3 rounded-md bg-red-500/10">
-          <p className="text-[13px] text-red-500 truncate" title={errorMsg}>{errorMsg}</p>
-        </div>
+        <CliFailureNotice details={errorMsg} />
       )}
 
       {status === 'checking' && (
@@ -346,24 +565,11 @@ export function CliTab() {
 
       {status === 'install_failed' && (
         <div className="space-y-2">
-          <p className="text-[13px] text-red-500 text-center">{t('cli.installFail')}</p>
-          {errorMsg && (
-            <p className="text-xs text-text-tertiary text-center truncate" title={errorMsg}>
-              {errorMsg}
-            </p>
-          )}
-          {isPermissionError(errorMsg) && (
-            <p className="text-xs text-amber-500 text-center">
-              {t('error.permissionHint')}
-            </p>
-          )}
-          {isNetworkError(errorMsg) && (
-            <p className="text-xs text-amber-500 text-center">
-              {t('network.firewallHint')}
-            </p>
-          )}
+          {errorMsg
+            ? <CliFailureNotice details={errorMsg} />
+            : <p className="text-center text-[13px] text-red-500">{t('cli.installFail')}</p>}
           <button
-            onClick={handleInstall}
+            onClick={installIntent === 'reinstall' ? handleReinstall : handleInstall}
             className="w-full py-2 text-[13px] font-medium rounded-md
               border border-border-subtle text-text-muted
               hover:bg-bg-secondary transition-smooth"
@@ -374,14 +580,26 @@ export function CliTab() {
       )}
 
       {/* CLI Environment Diagnostics */}
-      <CliDiagnostics />
+      <CliDiagnostics
+        refreshToken={`${cliPath || ''}:${cliVersion || ''}`}
+        activePath={cliPath}
+        onActiveCliChanged={handleCheck}
+      />
     </div>
   );
 }
 
 // ─── CLI Diagnostics Panel ─────────────────────────────────
 
-function CliDiagnostics() {
+function CliDiagnostics({
+  refreshToken,
+  activePath,
+  onActiveCliChanged,
+}: {
+  refreshToken: string;
+  activePath: string | null;
+  onActiveCliChanged: () => Promise<void>;
+}) {
   const t = useT();
   const [candidates, setCandidates] = useState<CliCandidate[]>([]);
   const [pinnedPath, setPinnedPath] = useState<string | null>(null);
@@ -406,36 +624,44 @@ function CliDiagnostics() {
     }
   }, []);
 
-  useEffect(() => { handleScan(); }, [handleScan]);
+  useEffect(() => { void handleScan(); }, [handleScan, refreshToken]);
 
   const handlePin = useCallback(async (path: string) => {
     try {
       await bridge.pinCli(path);
       setPinnedPath(path);
+      await onActiveCliChanged();
       setActionMsg(t('cli.pinned'));
     } catch (e) {
       setActionMsg(String(e));
     }
-  }, [t]);
+  }, [onActiveCliChanged, t]);
 
   const handleUnpin = useCallback(async () => {
     try {
       await bridge.unpinCli();
       setPinnedPath(null);
+      await onActiveCliChanged();
       setActionMsg(t('cli.unpinned'));
     } catch (e) {
       setActionMsg(String(e));
     }
-  }, [t]);
+  }, [onActiveCliChanged, t]);
 
   const handleInjectPath = useCallback(async (path: string) => {
+    const { ask } = await import('@tauri-apps/plugin-dialog');
+    const confirmed = await ask(
+      t('cli.confirmInjectPath').replace('{path}', path),
+      { title: APP_NAME, kind: 'warning' },
+    );
+    if (!confirmed) return;
     try {
       const result = await bridge.injectCliPath(path);
       setActionMsg(result);
     } catch (e) {
       setActionMsg(String(e));
     }
-  }, []);
+  }, [t]);
 
   const handleDelete = useCallback(async (path: string) => {
     const { ask } = await import('@tauri-apps/plugin-dialog');
@@ -447,12 +673,11 @@ function CliDiagnostics() {
     try {
       const result = await bridge.deleteCli(path);
       setActionMsg(result);
-      const updated = await bridge.diagnoseCli();
-      setCandidates(updated);
+      await handleScan();
     } catch (e) {
       setActionMsg(String(e));
     }
-  }, [t]);
+  }, [handleScan, t]);
 
   const handleRepair = useCallback(async () => {
     setScanning(true);
@@ -475,7 +700,16 @@ function CliDiagnostics() {
     }
   }, [t]);
 
-  const isActive = (path: string) => pinnedPath ? path === pinnedPath : candidates[0]?.path === path;
+  const validPinnedPath = pinnedPath && candidates.some(
+    (candidate) => candidate.path === pinnedPath && candidate.issues.length === 0,
+  )
+    ? pinnedPath
+    : null;
+  const isActive = (path: string) => activePath
+    ? path === activePath
+    : validPinnedPath
+      ? path === validPinnedPath
+      : candidates[0]?.path === path;
 
   return (
     <div className="space-y-3">
@@ -499,6 +733,9 @@ function CliDiagnostics() {
           </button>
         </div>
       </div>
+      <p className="text-[11px] leading-5 text-text-tertiary">
+        {t('cli.sdkRuntimeHint')}
+      </p>
 
       {scanning && candidates.length === 0 && (
         <div className="flex items-center justify-center gap-2 py-3">
@@ -515,7 +752,8 @@ function CliDiagnostics() {
       <div className="space-y-2">
         {candidates.map((c) => {
           const active = isActive(c.path);
-          const canDelete = c.source !== 'official';
+          const healthyCount = candidates.filter((candidate) => candidate.issues.length === 0).length;
+          const canDelete = c.canDelete && !active && healthyCount > 1;
           return (
             <div
               key={c.path}
@@ -539,7 +777,7 @@ function CliDiagnostics() {
                   {c.isNative && (
                     <span className="text-[11px] text-text-tertiary">native</span>
                   )}
-                  {active && pinnedPath && (
+                  {active && validPinnedPath && (
                     <span className="text-[11px] text-accent font-medium">★</span>
                   )}
                 </div>
@@ -565,7 +803,7 @@ function CliDiagnostics() {
                     {t('cli.use')}
                   </button>
                 )}
-                {active && pinnedPath && (
+                {active && validPinnedPath && (
                   <button
                     onClick={handleUnpin}
                     className="py-1 px-2.5 text-xs font-medium rounded-md

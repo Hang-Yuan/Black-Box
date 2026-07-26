@@ -2,7 +2,7 @@ import { memo, useState, useCallback, type ReactNode } from 'react';
 import { type ChatMessage } from '../../stores/chatStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
-import { classifyPathToken, resolvePathToken } from '../../stores/fileReveal';
+import { parseFileReference, type ParsedFileReference } from '../../stores/fileReveal';
 import { useLightboxStore } from '../shared/ImageLightbox';
 import { useT } from '../../lib/i18n';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
@@ -12,6 +12,10 @@ import { PermissionCard } from './PermissionCard';
 import { QuestionCard } from './QuestionCard';
 import { AiAvatar } from '../shared/AiAvatar';
 import { UserAvatar } from '../shared/UserAvatar';
+import {
+  sanitizeAssistantTextForDisplay,
+  sanitizeToolResultForDisplay,
+} from '../../lib/presentation-sanitizer';
 
 interface Props {
   message: ChatMessage;
@@ -59,34 +63,54 @@ function getFileExt(name: string): string {
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
 }
 
+function openFileReference(reference: ParsedFileReference) {
+  useSettingsStore.getState().setSecondaryTab('files');
+  const rootHint = useSettingsStore.getState().workingDirectory
+    || useFileStore.getState().rootPath;
+  void useFileStore.getState().openFileReference(reference, rootHint);
+}
+
+function openFilePath(path: string, line?: number) {
+  const basePath = useSettingsStore.getState().workingDirectory || '';
+  const reference = parseFileReference(path, { basePath, explicit: true });
+  if (!reference) return;
+  openFileReference(line && line > 0 ? { ...reference, line } : reference);
+}
+
+function renderUserFileReference(
+  reference: ParsedFileReference,
+  label: ReactNode,
+  key: number,
+): ReactNode {
+  return (
+    <button
+      key={key}
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        openFileReference(reference);
+      }}
+      className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
+        bg-white/15 border border-white/40 rounded-full
+        text-xs font-medium cursor-pointer
+        hover:bg-white/25 hover:border-white/60
+        transition-all duration-150 select-none
+        align-baseline leading-normal whitespace-nowrap inline-block"
+      title={reference.path}
+    >
+      <span className="text-[10px] leading-none">
+        {reference.kind === 'folder' ? '📁' : '📄'}
+      </span>
+      <span className="max-w-[240px] truncate">{label}</span>
+    </button>
+  );
+}
+
 /** Render a single backtick-inner segment: file path → clickable chip, else → inline code */
 function renderCodeSegment(inner: string, key: number): ReactNode {
-  const kind = classifyPathToken(inner);
-  if (kind) {
-    const wd = useSettingsStore.getState().workingDirectory || '';
-    const resolved = resolvePathToken(inner, wd);
-    return (
-      <button
-        key={key}
-        onClick={(e) => {
-          e.stopPropagation();
-          // 纯定位：右侧文件区展开到该路径并高亮（不读内容、不预览）
-          useSettingsStore.getState().setSecondaryTab('files');
-          useFileStore.getState().revealPath(resolved);
-        }}
-        className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
-          bg-white/15 border border-white/40 rounded-full
-          text-xs font-medium cursor-pointer
-          hover:bg-white/25 hover:border-white/60
-          transition-all duration-150 select-none
-          align-baseline leading-normal whitespace-nowrap inline-block"
-        title={resolved}
-      >
-        <span className="text-[10px] leading-none">{kind === 'folder' ? '📁' : '📄'}</span>
-        <span className="max-w-[240px] truncate">{inner}</span>
-      </button>
-    );
-  }
+  const basePath = useSettingsStore.getState().workingDirectory || '';
+  const reference = parseFileReference(inner, { basePath });
+  if (reference) return renderUserFileReference(reference, inner, key);
   return (
     <code key={key} className="px-1.5 py-0.5 mx-0.5 rounded-md text-[13px]
       bg-white/15 border border-white/20 font-mono">
@@ -95,15 +119,21 @@ function renderCodeSegment(inner: string, key: number): ReactNode {
   );
 }
 
-/** Parse backtick-wrapped segments in user text into styled inline code elements.
+/** Parse local Markdown links and backtick-wrapped segments in user text.
  *  Handles both single ` and triple ``` (renders as single-line code).
  *  File paths inside backticks become clickable chips. */
 function renderUserContent(text: string): ReactNode {
-  // Split on backtick patterns: ```...``` or `...`
-  const parts = text.split(/(```[^`]*```|`[^`\n]+`)/g);
-  if (parts.length === 1) return text; // no backticks found, return plain string
+  const parts = text.split(/(\[[^\]\n]+\]\((?:<[^>\n]+>|[^)\n]+)\)|```[^`]*```|`[^`\n]+`)/g);
+  if (parts.length === 1) return text;
 
   return parts.map((part, i) => {
+    const markdownLink = part.match(/^\[([^\]\n]+)\]\((<[^>\n]+>|[^)\n]+)\)$/);
+    if (markdownLink) {
+      const basePath = useSettingsStore.getState().workingDirectory || '';
+      const reference = parseFileReference(markdownLink[2], { basePath, explicit: true });
+      if (reference) return renderUserFileReference(reference, markdownLink[1], i);
+      return part;
+    }
     if (part.startsWith('```') && part.endsWith('```')) {
       const inner = part.slice(3, -3).trim();
       if (!inner) return part;
@@ -155,12 +185,12 @@ function UserMsg({ message }: Props) {
         text-sm leading-relaxed shadow-md whitespace-pre-wrap">
         {renderUserContent(displayContent)}
         {!expanded && isLong && (
-          <span className="text-white/60">…</span>
+          <span className="text-text-inverse/60">…</span>
         )}
         {isLong && (
           <button
             onClick={() => setExpanded(!expanded)}
-            className="block mt-1.5 text-xs text-white/60 hover:text-white/90
+            className="block mt-1.5 text-xs text-text-inverse/60 hover:text-text-inverse/90
               transition-smooth"
           >
             {expanded ? '▲ 收起' : '▼ 展开全部'}
@@ -175,7 +205,7 @@ function UserMsg({ message }: Props) {
                   if (att.isImage) {
                     useLightboxStore.getState().openFile(att.path, att.name);
                   } else {
-                    useFileStore.getState().selectFile(att.path);
+                    openFilePath(att.path);
                   }
                 }}
                 className="inline-flex items-center gap-2 px-2.5 py-1.5
@@ -199,6 +229,12 @@ function UserMsg({ message }: Props) {
                 <span className="text-xs truncate max-w-[180px]">{att.name}</span>
               </button>
             ))}
+          </div>
+        )}
+        {message.isSteer && (
+          <div className="mt-1.5 text-[10px] text-text-inverse/70 flex items-center justify-end gap-1">
+            <span aria-hidden="true">↳</span>
+            {message.steerState === 'sending' ? t('chat.steerSending') : t('chat.steerSent')}
           </div>
         )}
       </div>
@@ -413,7 +449,7 @@ function AssistantMsg({ message, isFirstInGroup = true }: Props) {
         <div className="w-8 flex-shrink-0" />
       )}
       <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
-        <MarkdownRenderer content={safeContent(message.content)} />
+        <MarkdownRenderer content={sanitizeAssistantTextForDisplay(message.content)} />
       </div>
       {/* Right gutter mirrors the avatar so assistant text aligns with the user bubble's right edge */}
       <div className="w-8 flex-shrink-0" />
@@ -539,14 +575,18 @@ function ToolIcon({ name }: { name: string }) {
   }
 }
 
-function getToolLabel(name: string, t: (key: string) => string): string {
+function getToolLabel(name: string, t: (key: string) => string, input?: any): string {
   switch (name) {
     case 'Bash': return t('msg.terminal');
     case 'Read': return t('msg.readFile');
     case 'Write': return t('msg.writeFile');
     case 'Edit': return t('msg.editFile');
     case 'Glob': case 'Grep': return t('msg.search');
-    case 'Task': case 'Agent': return t('msg.subAgent');
+    case 'Task':
+    case 'Agent':
+      return typeof input?.name === 'string' && input.name.trim()
+        ? `${t('agents.teammate')} · ${input.name.trim()}`
+        : t('msg.subAgent');
     case 'TodoWrite': return t('msg.todo');
     case 'WebFetch': case 'WebSearch': return t('msg.webFetch');
     case 'ExitPlanMode': case 'EnterPlanMode': return t('msg.planLabel');
@@ -558,8 +598,8 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const t = useT();
   const [expanded, setExpanded] = useState(false);
   const toolName = message.toolName || 'Tool';
-  const label = getToolLabel(toolName, t);
   const input = message.toolInput;
+  const label = getToolLabel(toolName, t, input);
 
   // Compute diff stats for Edit tool
   const editDiff = toolName === 'Edit' ? computeEditDiff(input) : null;
@@ -583,7 +623,12 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              useFileStore.getState().selectFile(input.file_path);
+              openFilePath(
+                input.file_path,
+                toolName === 'Read' && Number.isFinite(Number(input.offset))
+                  ? Number(input.offset)
+                  : undefined,
+              );
             }}
             className="text-[11px] text-accent/70 hover:text-accent font-mono
               truncate max-w-[280px] hover:underline cursor-pointer transition-smooth"
@@ -667,9 +712,10 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     : !!input;
 
   // Whether there's a result to show
-  const resultContent = typeof message.toolResultContent === 'string'
+  const rawResultContent = typeof message.toolResultContent === 'string'
     ? message.toolResultContent
     : message.toolResultContent ? JSON.stringify(message.toolResultContent) : '';
+  const resultContent = sanitizeToolResultForDisplay(toolName, rawResultContent);
   const hasResult = resultContent.length > 0;
   const isCompleted = message.toolCompleted || hasResult;
 

@@ -5,28 +5,45 @@ import { ChatPanel } from './components/chat/ChatPanel';
 import { SecondaryPanel } from './components/layout/SecondaryPanel';
 import { CommandPalette } from './components/commands/CommandPalette';
 import { SettingsPanel } from './components/settings/SettingsPanel';
+import { ExtensionCenter } from './components/extensions/ExtensionCenter';
+import { AutomationCenter } from './components/automations/AutomationCenter';
+import { TaskCenterView } from './components/activity/TaskCenterView';
 import { ImageLightbox } from './components/shared/ImageLightbox';
 import { ChangelogModal } from './components/shared/ChangelogModal';
 import { Toast } from './components/shared/Toast';
 import { useSettingsStore } from './stores/settingsStore';
-import { useProviderStore } from './stores/providerStore';
+import { useProviderStore, type ApiProvider } from './stores/providerStore';
 import { useFileStore } from './stores/fileStore';
 import { useChatStore } from './stores/chatStore';
 import { useSessionStore } from './stores/sessionStore';
-import { APP_NAME } from './lib/edition';
 import { useAgentStore } from './stores/agentStore';
+import { usePlanStore } from './stores/planStore';
+import { useForkStore } from './stores/forkStore';
+import { useReviewStore } from './stores/reviewStore';
+import { useWorkflowStore } from './stores/workflowStore';
 import { bridge, onFileChange } from './lib/tauri-bridge';
+import { buildNativeWorkflowCommand } from './lib/native-workflow';
 import { parseSessionMessages } from './lib/session-loader';
-import { hasRecoverableFrontendSession } from './lib/sessionLifecycle';
-import { useAutoUpdateCheck } from './hooks/useAutoUpdateCheck';
+import {
+  settleOrphanedBackendProcesses,
+  teardownSession,
+  waitForStdinCleared,
+} from './lib/sessionLifecycle';
 import { useT } from './lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { applyAppearanceClasses } from './lib/appearance';
 import './App.css';
 
 function App() {
   const theme = useSettingsStore((s) => s.theme);
+  const colorTheme = useSettingsStore((s) => s.colorTheme);
+  const surfaceTheme = useSettingsStore((s) => s.surfaceTheme);
   const fontSize = useSettingsStore((s) => s.fontSize);
+  const keepSystemAwake = useSettingsStore((s) => s.keepSystemAwake);
+  const keepDisplayAwake = useSettingsStore((s) => s.keepDisplayAwake);
   const settingsOpen = useSettingsStore((s) => s.settingsOpen);
+  const mainView = useSettingsStore((s) => s.mainView);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const lastSeenVersion = useSettingsStore((s) => s.lastSeenVersion);
   const setLastSeenVersion = useSettingsStore((s) => s.setLastSeenVersion);
@@ -38,8 +55,33 @@ function App() {
 
   const t = useT();
 
-  // Auto-check for app updates on startup
-  useAutoUpdateCheck();
+  // Rust acquires the default system-wake assertion during native setup so
+  // there is no launch gap. Once persisted settings hydrate, this effect
+  // reconciles both assertions with the user's actual choices.
+  useEffect(() => {
+    let cancelled = false;
+    const publish = (detail: Record<string, unknown>) => {
+      if (!cancelled) {
+        window.dispatchEvent(new CustomEvent('blackbox:power-assertion-status', { detail }));
+      }
+    };
+    bridge.setPowerAssertion(keepSystemAwake, keepDisplayAwake)
+      .then((status) => publish(status as unknown as Record<string, unknown>))
+      .catch(async (error) => {
+        console.warn('[BLACKBOX] Failed to update macOS power assertion:', error);
+        try {
+          const status = await bridge.getPowerAssertionStatus();
+          publish({ ...status, error: String(error) });
+        } catch (statusError) {
+          publish({ error: `${String(error)}; ${String(statusError)}` });
+        }
+      });
+    return () => { cancelled = true; };
+  }, [keepDisplayAwake, keepSystemAwake]);
+
+  useEffect(() => {
+    void useWorkflowStore.getState().loadRuns();
+  }, []);
 
   // CLI update detection: check on startup + poll every 30 minutes
   useEffect(() => {
@@ -62,11 +104,19 @@ function App() {
   useEffect(() => {
     if (!import.meta.env.DEV) return;
 
-    import('tauri-plugin-mcp').then(({ setupPluginListeners }) => {
-      setupPluginListeners();
-    }).catch((error) => {
-      console.warn('[BLACKBOX] Failed to init MCP plugin listeners:', error);
-    });
+    // React StrictMode mounts effects twice in development. The MCP listener
+    // registration is process-global and has no matching unsubscribe, so a
+    // second registration answers one socket request twice and panics Tauri's
+    // one-shot response handler.
+    if (!(window as any).__blackbox_mcp_listeners_started) {
+      (window as any).__blackbox_mcp_listeners_started = true;
+      import('tauri-plugin-mcp').then(({ setupPluginListeners }) => {
+        setupPluginListeners();
+      }).catch((error) => {
+        (window as any).__blackbox_mcp_listeners_started = false;
+        console.warn('[BLACKBOX] Failed to init MCP plugin listeners:', error);
+      });
+    }
 
     (window as any).__blackbox_test = {
       getMessages(optsOrTabId?: string | { tabId?: string; last?: number; summary?: boolean }) {
@@ -110,8 +160,155 @@ function App() {
       getCurrentModel() {
         return useSettingsStore.getState().selectedModel;
       },
+      getCurrentAuxiliaryModel() {
+        return useSettingsStore.getState().auxiliaryModel;
+      },
+      getCurrentMode() {
+        return useSettingsStore.getState().sessionMode;
+      },
       getCurrentProvider() {
         return useProviderStore.getState().activeProviderId;
+      },
+      getProviderState() {
+        const state = useProviderStore.getState();
+        return {
+          loaded: state.loaded,
+          activeProviderId: state.activeProviderId,
+          providers: state.providers.map((provider) => ({
+            id: provider.id,
+            name: provider.name,
+            baseUrl: provider.baseUrl,
+            apiFormat: provider.apiFormat,
+            authScheme: provider.authScheme || null,
+            preset: provider.preset || null,
+            extraEnv: provider.extraEnv || {},
+            credentialRef: provider.credentialRef || null,
+            credentialHint: provider.credentialHint || null,
+            credentialState: provider.credentialState || null,
+            revision: provider.revision || 0,
+            modelMappings: provider.modelMappings,
+            createdAt: provider.createdAt,
+            updatedAt: provider.updatedAt,
+          })),
+        };
+      },
+      updateProvider(providerId: string, patch: Partial<ApiProvider>) {
+        const store = useProviderStore.getState();
+        if (!store.providers.some((provider) => provider.id === providerId)) {
+          return { error: `Provider ${providerId} not found` };
+        }
+        store.updateProvider(providerId, patch);
+        const provider = useProviderStore.getState().providers.find((entry) => entry.id === providerId);
+        return {
+          providerId,
+          revision: provider?.revision || 0,
+          updatedAt: provider?.updatedAt || 0,
+          dirtyCredentialSupplied: typeof patch.apiKey === 'string' && patch.apiKey.length > 0,
+        };
+      },
+      /** Dev-only native lifecycle probes. These deliberately bypass chat UI
+       *  state so smoke tests can verify Claude's own fork persistence before
+       *  Black Box adds lineage or hydration behavior around it. */
+      startRawSession(params: Parameters<typeof bridge.startSession>[0]) {
+        return bridge.startSession(params);
+      },
+      sendRawSessionInput(stdinId: string, message: string) {
+        return bridge.sendStdin(stdinId, message);
+      },
+      gracefulStopRawSession(stdinId: string) {
+        return bridge.gracefulStopSession(stdinId);
+      },
+      rewindRawConversation(sessionId: string, checkpointUuid: string) {
+        return bridge.rewindSessionConversation(sessionId, checkpointUuid);
+      },
+      refreshSessionIndex() {
+        return useSessionStore.getState().fetchSessions();
+      },
+      getCurrentPlan() {
+        const tabId = useSessionStore.getState().selectedSessionId;
+        return tabId ? usePlanStore.getState().plans[tabId] || null : null;
+      },
+      getCurrentFork() {
+        const tabId = useSessionStore.getState().selectedSessionId;
+        return tabId ? useForkStore.getState().forks[tabId] || null : null;
+      },
+      listWorkflows() {
+        const cwd = useSettingsStore.getState().workingDirectory;
+        return bridge.listWorkflows(cwd || undefined);
+      },
+      saveWorkflow(request: Parameters<typeof bridge.saveWorkflow>[0]) {
+        return useWorkflowStore.getState().saveWorkflow(request);
+      },
+      getWorkflowRuns(tabId?: string) {
+        const id = tabId || useSessionStore.getState().selectedSessionId;
+        return id ? useWorkflowStore.getState().liveRuns[id] || [] : [];
+      },
+      openWorkflows() {
+        useSettingsStore.getState().setMainView('extensions');
+        queueMicrotask(() => window.dispatchEvent(new CustomEvent('blackbox:extension-section', {
+          detail: { section: 'workflows' },
+        })));
+        return { view: 'extensions', section: 'workflows' };
+      },
+      async runWorkflow(name: string, args = '') {
+        const tabId = useSessionStore.getState().selectedSessionId;
+        if (!tabId) throw new Error('No active task for Workflow run');
+        const cwd = useSettingsStore.getState().workingDirectory;
+        const workflows = await bridge.listWorkflows(cwd || undefined);
+        const workflow = workflows.find((item) => item.name === name && item.valid);
+        if (!workflow) throw new Error(`Valid Workflow ${name} not found`);
+        useWorkflowStore.getState().requestRun(tabId, workflow);
+        useWorkflowStore.getState().queueSubmission(
+          tabId,
+          workflow.name,
+          buildNativeWorkflowCommand(workflow.name, args),
+        );
+        useSettingsStore.getState().setMainView('chat');
+        return { tabId, workflow: workflow.name, queued: true };
+      },
+      listActiveProcesses() {
+        return bridge.listActiveProcesses();
+      },
+      killProcess(stdinId: string) {
+        return bridge.killSession(stdinId);
+      },
+      getTaskLocation() {
+        const state = useSessionStore.getState();
+        const id = state.selectedSessionId;
+        const session = state.sessions.find((item) => item.id === id);
+        const cliSessionId = session?.cliResumeId || id;
+        const cwd = useSettingsStore.getState().workingDirectory;
+        if (!cliSessionId || !cwd) return Promise.reject(new Error('No active task location'));
+        return bridge.getTaskLocation(cliSessionId, cwd);
+      },
+      async handoffTask(destination: 'local' | 'worktree') {
+        const state = useSessionStore.getState();
+        const id = state.selectedSessionId;
+        const session = state.sessions.find((item) => item.id === id);
+        const cliSessionId = session?.cliResumeId || id;
+        const cwd = useSettingsStore.getState().workingDirectory;
+        if (!id || !cliSessionId || !cwd) throw new Error('No active task location');
+        const stdinId = useChatStore.getState().tabs.get(id)?.sessionMeta.stdinId;
+        if (stdinId) {
+          await teardownSession(stdinId, id, 'switch');
+          await waitForStdinCleared(id, stdinId);
+        }
+        const result = await bridge.handoffTask(cliSessionId, cwd, destination);
+        useSessionStore.getState().updateSessionProject(id, result.currentCwd);
+        useSettingsStore.getState().setWorkingDirectory(result.currentCwd);
+        useChatStore.getState().setSessionMeta(id, { cwdSnapshot: result.currentCwd });
+        await useSessionStore.getState().fetchSessions();
+        return result;
+      },
+      async runAutomationNow(id: string) {
+        await useProviderStore.getState().flushSave();
+        return bridge.runAutomationNow(id);
+      },
+      cancelAutomationRun(runId: string) {
+        return bridge.cancelAutomationRun(runId);
+      },
+      listAutomationRuns(automationId?: string) {
+        return bridge.listAutomationRuns(automationId, 50);
       },
       isStreaming(tabId?: string) {
         const id = tabId || useSessionStore.getState().selectedSessionId;
@@ -146,6 +343,54 @@ function App() {
           settingsOpen: useSettingsStore.getState().settingsOpen,
           messageCount: tab?.messages?.length || 0,
         };
+      },
+      getContinuationState(tabId?: string) {
+        const id = tabId || useSessionStore.getState().selectedSessionId;
+        const tab = id ? useChatStore.getState().getTab(id) : undefined;
+        return {
+          tabId: id || null,
+          sessionStatus: tab?.sessionStatus || null,
+          phase: tab?.activityStatus?.phase || null,
+          stdinId: tab?.sessionMeta.stdinId || null,
+          hydratingFromDisk: tab?.sessionMeta.hydratingFromDisk === true,
+          hydrationGeneration: tab?.sessionMeta.hydrationGeneration || null,
+          pendingCommandMsgId: tab?.sessionMeta.pendingCommandMsgId || null,
+          pending: (tab?.pendingUserMessages || []).map((item) => ({
+            text: item.text,
+            kind: item.kind || 'user',
+            commandMessageId: item.commandMessageId || null,
+          })),
+          inputDraft: tab?.inputDraft || '',
+          messageCount: tab?.messages.length || 0,
+        };
+      },
+      clearBridgeCallLog() {
+        (window as any).__blackbox_bridge_call_log = [];
+        return { cleared: true };
+      },
+      getBridgeCallLog() {
+        return Array.isArray((window as any).__blackbox_bridge_call_log)
+          ? [...(window as any).__blackbox_bridge_call_log]
+          : [];
+      },
+      setAutoCompactThreshold(value?: number) {
+        if (value == null) delete (window as any).__blackbox_test_auto_compact_threshold;
+        else (window as any).__blackbox_test_auto_compact_threshold = value;
+        return { value: (window as any).__blackbox_test_auto_compact_threshold ?? null };
+      },
+      setSessionLoadDelay(value?: number) {
+        if (value == null || value <= 0) delete (window as any).__blackbox_test_load_session_delay_ms;
+        else (window as any).__blackbox_test_load_session_delay_ms = value;
+        return { value: (window as any).__blackbox_test_load_session_delay_ms ?? 0 };
+      },
+      dropSessionCache(tabId: string) {
+        useChatStore.getState().removeFromCache(tabId);
+        return { dropped: tabId, stillCached: useChatStore.getState().hasCachedSession(tabId) };
+      },
+      setDraft(tabId: string, text: string) {
+        useChatStore.getState().ensureTab(tabId);
+        useChatStore.getState().setInputDraft(tabId, text);
+        return { tabId, text };
       },
       type(text: string) {
         const editor = (window as any).__blackbox_editor;
@@ -196,8 +441,9 @@ function App() {
         const { clearMessages, addMessage, setSessionStatus, setSessionMeta } = useChatStore.getState();
         clearMessages(sessionId);
         useAgentStore.getState().clearAgents();
-        setSessionStatus(sessionId, 'running');
-        setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+          setSessionStatus(sessionId, 'running');
+          setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+          useSessionStore.getState().setCliResumeId(sessionId, sessionId);
         try {
           const rawMessages = await bridge.loadSession(session.path);
           if (useSessionStore.getState().selectedSessionId !== sessionId) {
@@ -242,7 +488,7 @@ function App() {
         if (currentTabId) {
           useChatStore.getState().saveToCache(currentTabId);
           useAgentStore.getState().saveToCache(currentTabId);
-          if (currentTabId.startsWith('desk_')) {
+          if (currentTabId.startsWith('draft_')) {
             const tabState = useChatStore.getState().tabs.get(currentTabId);
             if (!tabState || tabState.messages.length === 0) {
               useSessionStore.getState().removeDraft(currentTabId);
@@ -255,15 +501,27 @@ function App() {
           useSettingsStore.getState().setWorkingDirectory('');
           return { action: 'newSession' };
         }
-        const newId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const newId = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         useSessionStore.getState().setSelectedSession(newId);
         useSettingsStore.getState().setWorkingDirectory(cwd);
         useChatStore.getState().restoreFromCache(newId);
+        // A fresh conversation cannot inherit persistent teammates or team
+        // tasks from the previously selected tab. restoreFromCache clears the
+        // live Agent authority when this new draft has no snapshot.
+        useAgentStore.getState().restoreFromCache(newId);
         return { action: 'newSession', session: newId };
       },
       switchModel(modelId: string) {
         useSettingsStore.getState().setSelectedModel(modelId);
         return { model: modelId };
+      },
+      switchAuxiliaryModel(modelId: string) {
+        useSettingsStore.getState().setAuxiliaryModel(modelId);
+        return { model: modelId };
+      },
+      switchMode(mode: 'ask' | 'code' | 'plan' | 'auto' | 'bypass') {
+        useSettingsStore.getState().setSessionMode(mode);
+        return { mode };
       },
       switchProvider(providerId: string | null) {
         useProviderStore.getState().setActive(providerId);
@@ -303,16 +561,76 @@ function App() {
         button.click();
         return { stopped: true };
       },
-      deleteCurrentSession() {
+      focusWindow() {
+        const window = getCurrentWindow();
+        void window.show()
+          .then(() => window.unminimize())
+          .then(() => window.setFocus());
+        return { focusRequested: true };
+      },
+      closeWindow() {
+        // The dev socket may evaluate a mutating expression more than once.
+        // Never issue duplicate native close commands (Tauri close is one-shot).
+        if ((window as any).__blackbox_close_started) {
+          return { closeRequested: true, duplicateIgnored: true };
+        }
+        (window as any).__blackbox_close_started = true;
+        (window as any).__blackbox_close_result = { state: 'pending' };
+        void getCurrentWindow().close()
+          .then(() => {
+            (window as any).__blackbox_close_result = { state: 'resolved' };
+          })
+          .catch((error) => {
+            (window as any).__blackbox_close_result = {
+              state: 'rejected',
+              error: error instanceof Error ? error.message : String(error),
+            };
+          });
+        return { closeRequested: true };
+      },
+      quitApp() {
+        // Exercise Tauri's RunEvent::ExitRequested path (Cmd-Q / menu Quit),
+        // which is distinct from the red traffic-light CloseRequested event.
+        if ((window as any).__blackbox_quit_started) {
+          return { quitRequested: true, duplicateIgnored: true };
+        }
+        (window as any).__blackbox_quit_started = true;
+        void import('@tauri-apps/plugin-process')
+          .then(({ exit }) => exit(0))
+          .catch((error) => {
+            (window as any).__blackbox_quit_started = false;
+            (window as any).__blackbox_quit_error = error instanceof Error
+              ? error.message
+              : String(error);
+          });
+        return { quitRequested: true };
+      },
+      async deleteCurrentSession() {
         const sessionId = useSessionStore.getState().selectedSessionId;
         if (!sessionId) return { deleted: false, reason: 'no active session' };
+        const session = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
         const stdinId = useChatStore.getState().tabs.get(sessionId)?.sessionMeta?.stdinId;
-        if (stdinId) bridge.killSession(stdinId).catch(() => {});
-        useChatStore.getState().removeTab(sessionId);
+        if (stdinId) {
+          await teardownSession(stdinId, sessionId, 'delete');
+          await waitForStdinCleared(sessionId, stdinId).catch(() => {});
+        }
+        if (session?.path) {
+          await bridge.deleteSession(sessionId, session.path);
+        } else {
+          useSessionStore.getState().removeDraft(sessionId);
+        }
+        useChatStore.getState().removeFromCache(sessionId);
+        useAgentStore.getState().clearCacheForTab(sessionId);
         useAgentStore.getState().clearAgents();
-        if (sessionId.startsWith('desk_')) useSessionStore.getState().removeDraft(sessionId);
         useSessionStore.getState().setSelectedSession(null);
-        return { deleted: true, session: sessionId };
+        useSettingsStore.getState().setWorkingDirectory('');
+        await useSessionStore.getState().fetchSessions();
+        return {
+          deleted: true,
+          detachedFromBlackBox: true,
+          session: sessionId,
+          privateTranscriptPreserved: Boolean(session?.path),
+        };
       },
     };
 
@@ -327,91 +645,13 @@ function App() {
   // 2. Phase 1 lifecycle fixes reduce the root causes of stalled sessions
   // Manual retry is available via the "session unresponsive" button in ChatPanel.
 
-  // Confirm before closing the window (red X / Cmd+Q)
-  const closePendingRef = useRef(false);
-  const tRef = useRef(t);
-  tRef.current = t;
-
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
-      const win = getCurrentWindow();
-      win.onCloseRequested(async (event) => {
-        if (closePendingRef.current) { event.preventDefault(); return; }
-        event.preventDefault();
-        closePendingRef.current = true;
-        try {
-          const { ask } = await import('@tauri-apps/plugin-dialog');
-          const confirmed = await ask(tRef.current('confirm.exit'), {
-            title: APP_NAME,
-            kind: 'warning',
-            okLabel: tRef.current('common.confirm'),
-            cancelLabel: tRef.current('common.cancel'),
-          });
-          if (confirmed) {
-            // B8: flush in-flight streams and materialize any partial
-            // text/thinking as interrupted messages before we exit. Without
-            // this, users lose the last rAF-buffered delta (up to ~16ms of
-            // tokens) and any text/thinking already in partial state.
-            try {
-              const { flushStreamBuffer } = await import('./hooks/useStreamProcessor');
-              const { useChatStore: csMod, generateInterruptedId } = await import('./stores/chatStore');
-              flushStreamBuffer();
-              const cs = csMod.getState();
-              for (const [tabId, tab] of cs.tabs) {
-                if (tab.partialThinking && tab.partialThinking.trim().length > 0) {
-                  cs.addMessage(tabId, {
-                    id: generateInterruptedId('thinking'),
-                    role: 'assistant',
-                    type: 'thinking',
-                    content: tab.partialThinking,
-                    timestamp: Date.now(),
-                  });
-                }
-                if (tab.partialText && tab.partialText.trim().length > 0) {
-                  cs.addMessage(tabId, {
-                    id: generateInterruptedId('text'),
-                    role: 'assistant',
-                    type: 'text',
-                    content: tab.partialText,
-                    timestamp: Date.now(),
-                  });
-                }
-              }
-            } catch (err) {
-              console.warn('[BLACKBOX:close] stream flush failed', err);
-            }
-            const { exit } = await import('@tauri-apps/plugin-process');
-            await exit(0);
-          }
-        } finally {
-          closePendingRef.current = false;
-        }
-      }).then((fn) => { unlisten = fn; });
-    });
-    return () => { unlisten?.(); };
-  }, []);
-
   // TK-329: On app startup (incl. browser refresh), detect and kill orphaned backend processes.
   // After refresh, frontend state (stdinToTab, listeners) is wiped, but Rust ProcessManager
   // may still hold live child processes. Kill any that have no corresponding frontend mapping.
   useEffect(() => {
-    bridge.listActiveProcesses().then((activeIds) => {
-      if (!activeIds.length) return;
-      const orphaned = activeIds.filter((id) => !hasRecoverableFrontendSession(id));
-      for (const id of orphaned) {
-        console.log('[BLACKBOX:cleanup] killing orphaned process:', id);
-        const ownerTabId = useSessionStore.getState().getTabForStdin(id);
-        bridge.killSession(id).catch(() => {});
-        useSessionStore.getState().unregisterStdinTab(id);
-        if (ownerTabId && useChatStore.getState().getTab(ownerTabId)?.sessionMeta.stdinId === id) {
-          useChatStore.getState().setSessionMeta(ownerTabId, {
-            stdinId: undefined,
-            lastProgressAt: undefined,
-          });
-        }
-      }
-    }).catch(() => {});
+    void settleOrphanedBackendProcesses().catch((error) => {
+      console.error('[BLACKBOX] Startup CLI recovery failed:', error);
+    });
   }, []);
 
   // macOS Full Disk Access check — detect TCC restrictions on startup
@@ -426,10 +666,13 @@ function App() {
     }).catch(() => {});
   }, []);
 
-  // Load custom session names and provider config on startup
+  // Load custom session names, provider config, and thread-scoped control state on startup.
   useEffect(() => {
     useSessionStore.getState().loadCustomPreviewsFromDisk();
     useProviderStore.getState().load();
+    usePlanStore.getState().loadPlans();
+    useForkStore.getState().loadForks();
+    useReviewStore.getState().loadComments();
     // Notification permission is requested lazily on first need (see useStreamProcessor.ts)
   }, []);
 
@@ -480,6 +723,10 @@ function App() {
     }
   }, [theme]);
 
+  // Accent and surface are independent: changing one never rewrites the other.
+  useEffect(() => {
+    applyAppearanceClasses(document.documentElement.classList, colorTheme, surfaceTheme);
+  }, [colorTheme, surfaceTheme]);
 
   // Apply font size to document root
   useEffect(() => {
@@ -612,8 +859,14 @@ function App() {
     <>
       <AppShell
         sidebar={<Sidebar />}
-        main={<ChatPanel key={selectedSessionId || 'new'} />}
-        secondary={<SecondaryPanel />}
+        main={mainView === 'extensions'
+          ? <ExtensionCenter />
+          : mainView === 'automations'
+            ? <AutomationCenter />
+            : mainView === 'taskCenter'
+              ? <TaskCenterView />
+              : <ChatPanel key={selectedSessionId || 'new'} />}
+        secondary={mainView === 'chat' ? <SecondaryPanel /> : undefined}
       />
       <CommandPalette />
       {settingsOpen && <SettingsPanel />}

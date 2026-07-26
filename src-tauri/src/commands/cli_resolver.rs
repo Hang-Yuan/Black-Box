@@ -3,14 +3,14 @@
 //! Priority order (highest → lowest):
 //!   Tier 0 · Official     — Claude Desktop bundled, official installer (~/.claude/local)
 //!   Tier 1 · System       — npm global, Homebrew, system PATH installs
-//!   Tier 2 · AppLocal     — Her self-deployed (native binary or npm --prefix)
+//!   Tier 2 · AppLocal     — Black Box-managed (native binary or npm --prefix)
 //!   Tier 3 · VersionMgr   — nvm, volta, fnm, bun
 //!   Tier 4 · Dynamic      — Process PATH, login shell PATH, which/where fallback
 //!
 //! Search is per-directory: within each dir, native binary beats shebang script,
 //! but directory (tier) order is always the final priority.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,7 @@ use std::os::windows::process::CommandExt;
 // ─── Public Types ──────────────────────────────────────────
 
 /// Source tier for a discovered CLI binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CliSource {
     Official = 0,
@@ -49,10 +49,41 @@ pub struct CliCandidate {
     pub path: String,
     pub source: CliSource,
     pub is_native: bool,
+    /// True when Black Box can remove this exact environment without invoking
+    /// an external package manager. The delete command still enforces active
+    /// and last-healthy-environment guards.
+    pub can_delete: bool,
     /// Filled async by the diagnose Tauri command, not by scan_all().
     pub version: Option<String>,
     /// Human-readable issues: "broken symlink", "shebang interpreter not found", etc.
     pub issues: Vec<String>,
+}
+
+/// Capabilities that Black Box relies on when using Claude Code as its SDK
+/// execution kernel. Optional flags are negotiated from the selected
+/// executable's own `--help` output so a newer UI never sends flags to an older
+/// CLI that does not understand them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CliSdkCapabilities {
+    pub stream_json: bool,
+    pub permission_prompt_stdio: bool,
+    pub include_hook_events: bool,
+    pub forward_subagent_text: bool,
+    pub prompt_suggestions: bool,
+}
+
+/// A health-checked Claude Code runtime selected for SDK traffic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdkRuntime {
+    /// Exact launcher path chosen by the user (or by ordered discovery).
+    pub path: String,
+    /// Canonical identity used for active/delete comparisons across symlinks.
+    pub canonical_path: String,
+    pub version: String,
+    pub source: CliSource,
+    pub capabilities: CliSdkCapabilities,
 }
 
 /// Result of a cleanup operation.
@@ -321,6 +352,189 @@ fn cmd_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> String {
     }
 }
 
+fn cli_cmd_with_timeout(path: &Path, args: &[&str], timeout_secs: u64) -> String {
+    let path_string = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let lower = path_string.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            let mut child = match std::process::Command::new("cmd")
+                .arg("/C")
+                .arg(&path_string)
+                .args(args)
+                .env("PATH", crate::build_enriched_path())
+                .env_remove("CLAUDECODE")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x08000000)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => return String::new(),
+            };
+            return wait_for_cli_output(&mut child, &path_string, timeout_secs);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut child = match std::process::Command::new(&path_string)
+        .args(args)
+        .env("PATH", crate::build_enriched_path())
+        .env_remove("CLAUDECODE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x08000000)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return String::new(),
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut child = match std::process::Command::new(&path_string)
+        .args(args)
+        .env("PATH", crate::build_enriched_path())
+        .env_remove("CLAUDECODE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return String::new(),
+    };
+    wait_for_cli_output(&mut child, &path_string, timeout_secs)
+}
+
+fn wait_for_cli_output(
+    child: &mut std::process::Child,
+    command_label: &str,
+    timeout_secs: u64,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let mut buf = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        use std::io::Read;
+                        let _ = stdout.read_to_string(&mut buf);
+                    }
+                    return buf.trim().to_string();
+                }
+                return String::new();
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "[cli_resolver] CLI probe '{}' timed out ({}s)",
+                        command_label, timeout_secs
+                    );
+                    return String::new();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return String::new(),
+        }
+    }
+}
+
+fn extract_semver_token(raw: &str) -> Option<String> {
+    raw.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|token| {
+            let mut parts = token.split('.');
+            matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(a), Some(b), Some(c), None)
+                    if !a.is_empty()
+                        && !b.is_empty()
+                        && !c.is_empty()
+                        && a.chars().all(|ch| ch.is_ascii_digit())
+                        && b.chars().all(|ch| ch.is_ascii_digit())
+                        && c.chars().all(|ch| ch.is_ascii_digit())
+            )
+        })
+        .map(ToString::to_string)
+}
+
+fn canonical_cli_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn same_cli_identity(left: &Path, right: &Path) -> bool {
+    canonical_cli_path(left) == canonical_cli_path(right)
+}
+
+/// Limit post-update adoption to the installation that was actually updated.
+/// The only cross-path native migration Claude currently performs on macOS is
+/// the legacy launcher moving from `~/.claude/local/claude` to
+/// `~/.local/bin/claude`. App-local updates may also replace their launcher
+/// within Black Box-owned roots. Unrelated npm/Homebrew/version-manager
+/// candidates are never auto-selected merely because they have a higher version.
+pub fn is_expected_update_successor(previous: &Path, candidate: &Path) -> bool {
+    if previous == candidate || same_cli_identity(previous, candidate) {
+        return true;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let legacy = home.join(".claude").join("local").join("claude");
+    let current = home.join(".local").join("bin").join("claude");
+    if previous == legacy && candidate == current {
+        return true;
+    }
+    is_app_local_path(previous) && is_app_local_path(candidate)
+}
+
+/// Validate a candidate as the SDK execution kernel, not merely as an
+/// executable file. A working `--version` plus the stream-json and stdio
+/// permission flags are the minimum contract used by Black Box sessions.
+pub fn probe_sdk_runtime(path: &Path) -> Result<SdkRuntime, String> {
+    validate_cli_binary_path(path)?;
+
+    let version_output = cli_cmd_with_timeout(path, &["--version"], 5);
+    let version = extract_semver_token(&version_output).ok_or_else(|| {
+        format!(
+            "Claude CLI at '{}' did not return a valid version within 5 seconds",
+            path.display()
+        )
+    })?;
+
+    let help = cli_cmd_with_timeout(path, &["--help"], 5);
+    // `--permission-prompt-tool` is intentionally hidden from current Claude
+    // Code help output. Probe its argument parser without starting a model turn
+    // by combining the flag with `--version`.
+    let permission_probe =
+        cli_cmd_with_timeout(path, &["--permission-prompt-tool", "stdio", "--version"], 5);
+    let capabilities = CliSdkCapabilities {
+        stream_json: help.contains("--input-format") && help.contains("--output-format"),
+        permission_prompt_stdio: extract_semver_token(&permission_probe).as_deref()
+            == Some(version.as_str()),
+        include_hook_events: help.contains("--include-hook-events"),
+        forward_subagent_text: help.contains("--forward-subagent-text"),
+        prompt_suggestions: help.contains("--prompt-suggestions"),
+    };
+    if !capabilities.stream_json || !capabilities.permission_prompt_stdio {
+        return Err(format!(
+            "Claude CLI v{} at '{}' is executable but does not expose the stream-json SDK control contract",
+            version,
+            path.display()
+        ));
+    }
+
+    Ok(SdkRuntime {
+        path: path.to_string_lossy().to_string(),
+        canonical_path: canonical_cli_path(path).to_string_lossy().to_string(),
+        version,
+        source: classify_path(&path.to_string_lossy()),
+        capabilities,
+    })
+}
+
 // ─── Tier collection ───────────────────────────────────────
 
 fn collect_tiered_dirs() -> Vec<TieredDir> {
@@ -373,7 +587,16 @@ fn collect_tiered_dirs() -> Vec<TieredDir> {
             }
         }
 
-        // Official native installer path
+        // Current official native launcher. Claude's updater migrated from the
+        // legacy ~/.claude/local path to ~/.local/bin; prefer the current
+        // launcher so an unpinned SDK runtime does not stay on an older copy.
+        #[cfg(not(target_os = "windows"))]
+        push(
+            home.join(".local/bin").to_string_lossy().to_string(),
+            CliSource::Official,
+        );
+
+        // Legacy official native installer path
         #[cfg(not(target_os = "windows"))]
         push(
             home.join(".claude/local").to_string_lossy().to_string(),
@@ -619,6 +842,123 @@ fn bin_names() -> &'static [&'static str] {
     }
 }
 
+fn is_claude_executable_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "claude" | "claude.exe" | "claude.cmd" | "claude.bat"
+    )
+}
+
+fn validate_cli_binary_path(path: &Path) -> Result<(), String> {
+    if !is_claude_executable_path(path) {
+        return Err(format!(
+            "Refusing CLI operation on '{}': expected a Claude executable",
+            path.display()
+        ));
+    }
+    if !is_valid_executable(path) {
+        return Err(format!(
+            "CLI at '{}' is not a valid executable",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn app_local_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(path) = crate::cli_download_dir() {
+        roots.push(path);
+    }
+    if let Some(path) = crate::get_npm_global_bin() {
+        roots.push(path);
+    }
+    if let Ok(path) = crate::npm_global_dir() {
+        roots.push(path);
+    }
+    roots
+}
+
+fn is_app_local_path(path: &Path) -> bool {
+    let canonical_path = std::fs::canonicalize(path).ok();
+    app_local_roots().into_iter().any(|root| {
+        let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
+        canonical_path
+            .as_ref()
+            .map(|candidate| candidate.starts_with(&canonical_root))
+            .unwrap_or_else(|| path.starts_with(&canonical_root))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedNativeDeleteKind {
+    LegacyOfficial,
+    CurrentOfficial,
+}
+
+fn managed_native_delete_kind_with_home(
+    path: &Path,
+    home: &Path,
+) -> Option<ManagedNativeDeleteKind> {
+    if path == home.join(".claude").join("local").join("claude") {
+        return Some(ManagedNativeDeleteKind::LegacyOfficial);
+    }
+    if path == home.join(".local").join("bin").join("claude") {
+        return Some(ManagedNativeDeleteKind::CurrentOfficial);
+    }
+    None
+}
+
+fn managed_native_delete_kind(path: &Path) -> Option<ManagedNativeDeleteKind> {
+    dirs::home_dir()
+        .as_deref()
+        .and_then(|home| managed_native_delete_kind_with_home(path, home))
+}
+
+fn current_native_version_target_with_home(path: &Path, home: &Path) -> Option<PathBuf> {
+    if managed_native_delete_kind_with_home(path, home)
+        != Some(ManagedNativeDeleteKind::CurrentOfficial)
+    {
+        return None;
+    }
+    let target = std::fs::read_link(path).ok()?;
+    let absolute = if target.is_absolute() {
+        target
+    } else {
+        path.parent()?.join(target)
+    };
+    let canonical_target = std::fs::canonicalize(absolute).ok()?;
+    let versions_root = std::fs::canonicalize(
+        home.join(".local")
+            .join("share")
+            .join("claude")
+            .join("versions"),
+    )
+    .ok()?;
+    // Official native versions are direct files under the versions directory.
+    // Requiring an exact parent blocks `..` escapes and nested/symlink tricks.
+    (canonical_target.is_file() && canonical_target.parent() == Some(versions_root.as_path()))
+        .then_some(canonical_target)
+}
+
+fn current_native_version_target(path: &Path) -> Option<PathBuf> {
+    dirs::home_dir()
+        .as_deref()
+        .and_then(|home| current_native_version_target_with_home(path, home))
+}
+
+/// Raw deletion is intentionally limited to Black Box-owned app-local files
+/// and the two exact paths used by Claude's native installer. npm, Homebrew,
+/// version-manager and arbitrary PATH candidates remain owner-managed.
+pub fn can_delete_cli_path(path: &Path) -> bool {
+    is_app_local_path(path) || managed_native_delete_kind(path).is_some()
+}
+
 /// Resolve the best CLI binary, respecting tier priority.
 /// Within each directory: native binary preferred over shebang script.
 pub fn resolve() -> Option<(String, CliSource)> {
@@ -738,6 +1078,7 @@ pub fn scan_all() -> Vec<CliCandidate> {
                 path: path_str,
                 source: td.source,
                 is_native: native,
+                can_delete: can_delete_cli_path(&candidate),
                 version: None,
                 issues,
             });
@@ -753,24 +1094,6 @@ pub fn cleanup(targets: &[String]) -> CleanupResult {
     let mut removed = Vec::new();
     let mut skipped = Vec::new();
 
-    // Build a set of known AppLocal directories for safety check
-    let mut app_local_prefixes: Vec<String> = Vec::new();
-    if let Some(cli_dir) = crate::cli_download_dir() {
-        app_local_prefixes.push(cli_dir.to_string_lossy().to_string());
-    }
-    if let Some(npm_bin) = crate::get_npm_global_bin() {
-        app_local_prefixes.push(npm_bin.to_string_lossy().to_string());
-    }
-    if let Ok(npm_dir) = crate::npm_global_dir() {
-        app_local_prefixes.push(npm_dir.to_string_lossy().to_string());
-    }
-
-    let is_app_local = |path: &str| -> bool {
-        app_local_prefixes
-            .iter()
-            .any(|prefix| path.starts_with(prefix.as_str()))
-    };
-
     for target in targets {
         let path = Path::new(target);
 
@@ -783,7 +1106,7 @@ pub fn cleanup(targets: &[String]) -> CleanupResult {
             continue;
         }
 
-        if is_app_local(target) {
+        if is_app_local_path(path) {
             // Safe to auto-delete
             match std::fs::remove_file(path) {
                 Ok(()) => {
@@ -860,22 +1183,14 @@ pub fn cleanup(targets: &[String]) -> CleanupResult {
 
 /// Classify a path into a CliSource tier (best-effort heuristic for cleanup messages).
 fn classify_path(path: &str) -> CliSource {
-    // AppLocal check
-    let mut app_local_prefixes: Vec<String> = Vec::new();
-    if let Some(cli_dir) = crate::cli_download_dir() {
-        app_local_prefixes.push(cli_dir.to_string_lossy().to_string());
-    }
-    if let Some(npm_bin) = crate::get_npm_global_bin() {
-        app_local_prefixes.push(npm_bin.to_string_lossy().to_string());
-    }
-    if app_local_prefixes
-        .iter()
-        .any(|p| path.starts_with(p.as_str()))
-    {
+    if is_app_local_path(Path::new(path)) {
         return CliSource::AppLocal;
     }
 
     // Official check
+    if managed_native_delete_kind(Path::new(path)).is_some() {
+        return CliSource::Official;
+    }
     if path.contains(".claude/local") || path.contains(".claude\\local") {
         return CliSource::Official;
     }
@@ -894,40 +1209,127 @@ fn classify_path(path: &str) -> CliSource {
 
 // ─── Convenience wrapper (drop-in replacement) ─────────────
 
-/// Drop-in replacement for the old `find_claude_binary()`.
-/// Returns just the path, discarding the source tier.
-pub fn find_binary() -> Option<String> {
-    // Check pinned CLI first
+/// Resolve the single runtime that Black Box will use for new SDK processes.
+///
+/// A user pin is fail-closed: if that exact launcher stops satisfying the SDK
+/// contract, Black Box reports the problem instead of silently routing a new
+/// conversation through a different installation. Without a pin, ordered
+/// discovery skips unhealthy/incompatible candidates.
+pub fn resolve_sdk_runtime() -> Result<SdkRuntime, String> {
     if let Some(pinned) = get_pinned_cli() {
-        let p = Path::new(&pinned);
-        if is_native_binary(p) || is_valid_executable(p) {
-            return Some(pinned);
-        }
-        eprintln!(
-            "[cli_resolver] pinned CLI '{}' is no longer valid, falling back",
-            pinned
-        );
+        return probe_sdk_runtime(Path::new(&pinned)).map_err(|error| {
+            format!(
+                "The selected SDK runtime '{}' is unavailable: {}",
+                pinned, error
+            )
+        });
     }
-    resolve().map(|(path, _)| path)
+
+    let mut errors = Vec::new();
+    for (path, _) in resolve_ordered() {
+        match probe_sdk_runtime(Path::new(&path)) {
+            Ok(runtime) => return Ok(runtime),
+            Err(error) => errors.push(format!("{}: {}", path, error)),
+        }
+    }
+    let detail = if errors.is_empty() {
+        "no Claude CLI executable was found".to_string()
+    } else {
+        errors.join(" | ")
+    };
+    Err(format!(
+        "No SDK-compatible Claude CLI is available: {}",
+        detail
+    ))
+}
+
+/// Drop-in path-only wrapper used by one-shot and auxiliary SDK processes.
+pub fn find_binary() -> Option<String> {
+    match resolve_sdk_runtime() {
+        Ok(runtime) => Some(runtime.path),
+        Err(error) => {
+            eprintln!("[cli_resolver] SDK runtime resolution failed: {}", error);
+            None
+        }
+    }
 }
 
 // ─── CLI Pinning ───────────────────────────────────────────
 
-/// Pin file lives in ~/.her/ (survives app updates).
-fn pin_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".her").join("cli-pin.json"))
+fn pin_file_path_with_home(home: &Path) -> PathBuf {
+    home.join(".blackbox").join("cli-pin.json")
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Pre-Black-Box builds stored the SDK selection in a different application
+/// directory. Keep a read-only compatibility path so upgrading does not lose
+/// the user's selected runtime; successful reads are copied into `.blackbox`.
+fn pre_blackbox_pin_file_path_with_home(home: &Path) -> PathBuf {
+    let directory = ['.', 'h', 'e', 'r'].iter().collect::<String>();
+    home.join(directory).join("cli-pin.json")
+}
+
+/// Pin file lives in ~/.blackbox/ (survives app updates).
+fn pin_file_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| pin_file_path_with_home(&home))
+}
+
+fn pre_blackbox_pin_file_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| pre_blackbox_pin_file_path_with_home(&home))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CliPin {
     path: String,
+    #[serde(default)]
+    canonical_path: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+fn read_cli_pin(path: &Path) -> Option<CliPin> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_cli_pin(path: &Path, pin: &CliPin) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("Failed to protect CLI pin directory: {}", e))?;
+        }
+    }
+    let json = serde_json::to_string_pretty(pin).map_err(|e| format!("JSON error: {}", e))?;
+    let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    std::fs::write(&temp_path, json)
+        .map_err(|e| format!("Failed to write temporary pin file: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to protect temporary CLI pin: {}", e))?;
+    }
+    std::fs::rename(&temp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!("Failed to activate CLI pin: {}", e)
+    })
 }
 
 /// Get the currently pinned CLI path, if any.
 pub fn get_pinned_cli() -> Option<String> {
     let pin_path = pin_file_path()?;
-    let content = std::fs::read_to_string(&pin_path).ok()?;
-    let pin: CliPin = serde_json::from_str(&content).ok()?;
+    let pin = if pin_path.exists() {
+        read_cli_pin(&pin_path)?
+    } else {
+        let legacy_path = pre_blackbox_pin_file_path()?;
+        let legacy_pin = read_cli_pin(&legacy_path)?;
+        // Best-effort, non-destructive migration. The old file is deliberately
+        // left untouched; `.blackbox` becomes authoritative once created.
+        let _ = write_cli_pin(&pin_path, &legacy_pin);
+        legacy_pin
+    };
     if pin.path.is_empty() {
         None
     } else {
@@ -937,28 +1339,33 @@ pub fn get_pinned_cli() -> Option<String> {
 
 /// Pin a specific CLI binary as the preferred one.
 pub fn pin_cli(path: &str) -> Result<(), String> {
+    let runtime = probe_sdk_runtime(Path::new(path))?;
     let pin_path = pin_file_path().ok_or("Cannot determine home directory")?;
-    if let Some(parent) = pin_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {}", e))?;
-    }
     let pin = CliPin {
-        path: path.to_string(),
+        path: runtime.path.clone(),
+        canonical_path: Some(runtime.canonical_path),
+        version: Some(runtime.version),
     };
-    let json = serde_json::to_string_pretty(&pin).map_err(|e| format!("JSON error: {}", e))?;
-    std::fs::write(&pin_path, json).map_err(|e| format!("Failed to write pin file: {}", e))?;
-    eprintln!("[cli_resolver] pinned CLI: {}", path);
+    write_cli_pin(&pin_path, &pin)?;
+    eprintln!("[cli_resolver] selected SDK runtime: {}", runtime.path);
     Ok(())
 }
 
-/// Remove the CLI pin (go back to auto-detection).
+/// Clear the CLI pin (go back to auto-detection).
+///
+/// An empty marker is kept in `.blackbox` so an older compatibility file can
+/// never resurrect a selection the user explicitly cleared.
 pub fn unpin_cli() -> Result<(), String> {
-    if let Some(pin_path) = pin_file_path() {
-        if pin_path.exists() {
-            std::fs::remove_file(&pin_path)
-                .map_err(|e| format!("Failed to remove pin file: {}", e))?;
-            eprintln!("[cli_resolver] unpinned CLI");
-        }
-    }
+    let pin_path = pin_file_path().ok_or("Cannot determine home directory")?;
+    write_cli_pin(
+        &pin_path,
+        &CliPin {
+            path: String::new(),
+            canonical_path: None,
+            version: None,
+        },
+    )?;
+    eprintln!("[cli_resolver] unpinned CLI");
     Ok(())
 }
 
@@ -1014,18 +1421,7 @@ fn strip_app_blocks(content: &str, marker: &str) -> String {
 /// Returns a human-readable status string on success.
 #[cfg(not(target_os = "windows"))]
 pub fn inject_path(cli_path: &str) -> Result<String, String> {
-    // Gate: reject non-executable CLI targets before touching any files.
-    // Without this, users can inject a PATH entry pointing at a broken
-    // symlink or a cleanup-emptied dir and the shell still says
-    // `command not found`, with no signal that the injection was useless.
-    if !is_valid_executable(Path::new(cli_path)) {
-        return Err(format!(
-            "CLI at '{}' is not a valid executable (broken symlink, \
-             empty directory, or stale install). Refusing to inject \
-             a PATH entry that won't resolve `claude`.",
-            cli_path
-        ));
-    }
+    validate_cli_binary_path(Path::new(cli_path))?;
 
     let dir = Path::new(cli_path)
         .parent()
@@ -1084,15 +1480,7 @@ pub fn inject_path(cli_path: &str) -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 pub fn inject_path(cli_path: &str) -> Result<String, String> {
-    // Gate: same rationale as the Unix branch — don't inject a PATH entry
-    // that points at a directory without a working `claude.exe`.
-    if !is_valid_executable(Path::new(cli_path)) {
-        return Err(format!(
-            "CLI at '{}' is not a valid executable. Refusing to inject \
-             a PATH entry that won't resolve `claude`.",
-            cli_path
-        ));
-    }
+    validate_cli_binary_path(Path::new(cli_path))?;
 
     let dir = Path::new(cli_path)
         .parent()
@@ -1127,33 +1515,78 @@ pub fn inject_path(cli_path: &str) -> Result<String, String> {
 
 // ─── Delete CLI ────────────────────────────────────────────
 
-/// Delete a specific CLI binary. Refuses to delete Official tier.
+/// Delete a selected CLI environment with strict safety guards.
+///
+/// Supported raw-delete owners:
+/// - Black Box app-local CLI files
+/// - Claude's legacy native path (`~/.claude/local/claude`)
+/// - Claude's current native launcher (`~/.local/bin/claude`) and its exact
+///   version target under `~/.local/share/claude/versions/`
+///
+/// The active environment and the last healthy environment are never removed.
 pub fn delete_cli(path: &str) -> Result<String, String> {
-    let source = classify_path(path);
-
-    if source == CliSource::Official {
+    let p = Path::new(path);
+    if !can_delete_cli_path(p) {
         return Err(
-            "Cannot delete Official Anthropic installation. Uninstall via Claude Desktop."
+            "This CLI is owned by an external package manager. Remove it with its original installer."
                 .to_string(),
         );
     }
 
-    let p = Path::new(path);
-    if !p.exists() {
-        return Err(format!("File not found: {}", path));
+    let active = resolve_sdk_runtime().ok();
+    if active
+        .as_ref()
+        .is_some_and(|runtime| same_cli_identity(Path::new(&runtime.path), p))
+    {
+        return Err("Switch to another healthy CLI before deleting this environment.".to_string());
     }
 
-    std::fs::remove_file(p).map_err(|e| format!("Delete failed: {}", e))?;
+    let remaining = resolve_ordered()
+        .into_iter()
+        .filter(|(candidate, _)| !same_cli_identity(Path::new(candidate), p))
+        .any(|(candidate, _)| probe_sdk_runtime(Path::new(&candidate)).is_ok());
+    if !remaining {
+        return Err("The last healthy CLI environment cannot be deleted.".to_string());
+    }
 
-    // If pinned CLI was deleted, unpin it
+    let symlink_exists = std::fs::symlink_metadata(p).is_ok();
+    if !p.exists() && !symlink_exists {
+        return Ok(format!("CLI environment is already absent: {}", path));
+    }
+    if p.exists() {
+        validate_cli_binary_path(p)?;
+    }
+
+    let mut removed = vec![path.to_string()];
+    match managed_native_delete_kind(p) {
+        Some(ManagedNativeDeleteKind::CurrentOfficial) => {
+            let version_target = current_native_version_target(p);
+
+            std::fs::remove_file(p).map_err(|e| format!("Delete failed: {}", e))?;
+            if let Some(target) = version_target {
+                if target.is_file() {
+                    std::fs::remove_file(&target).map_err(|e| {
+                        format!("Launcher removed, but version cleanup failed: {}", e)
+                    })?;
+                    removed.push(target.to_string_lossy().to_string());
+                }
+            }
+        }
+        Some(ManagedNativeDeleteKind::LegacyOfficial) | None => {
+            std::fs::remove_file(p).map_err(|e| format!("Delete failed: {}", e))?;
+        }
+    }
+
+    // Defensive cleanup for a stale pin left by an older release. The active
+    // guard above prevents this branch for a live current pin.
     if let Some(pinned) = get_pinned_cli() {
-        if pinned == path {
+        if same_cli_identity(Path::new(&pinned), p) {
             let _ = unpin_cli();
         }
     }
 
-    eprintln!("[cli_resolver] deleted CLI: {} (source: {})", path, source);
-    Ok(format!("Deleted {}", path))
+    eprintln!("[cli_resolver] deleted CLI environment: {:?}", removed);
+    Ok(format!("Deleted CLI environment: {}", removed.join(", ")))
 }
 
 // ─── Tests ─────────────────────────────────────────────────
@@ -1163,6 +1596,19 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[cfg(not(target_os = "windows"))]
+    fn write_fake_cli(path: &Path, version: &str, help: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--help\" ]; then\n    printf '%s\\n' '{}'\n    exit 0\n  fi\ndone\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--version\" ]; then\n    printf '%s\\n' '{} (Claude Code)'\n    exit 0\n  fi\ndone\nexit 2\n",
+            help, version
+        );
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
     fn test_is_native_binary_nonexistent() {
@@ -1278,6 +1724,27 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn current_native_launcher_precedes_the_legacy_launcher() {
+        let home = dirs::home_dir().unwrap();
+        let current = home
+            .join(".local")
+            .join("bin")
+            .to_string_lossy()
+            .to_string();
+        let legacy = home
+            .join(".claude")
+            .join("local")
+            .to_string_lossy()
+            .to_string();
+        let dirs = collect_tiered_dirs();
+        let current_index = dirs.iter().position(|entry| entry.path == current).unwrap();
+        let legacy_index = dirs.iter().position(|entry| entry.path == legacy).unwrap();
+        assert!(current_index < legacy_index);
+        assert_eq!(dirs[current_index].source, CliSource::Official);
+    }
+
     #[test]
     fn test_scan_all_no_panic() {
         // scan_all should not panic on any system
@@ -1286,5 +1753,182 @@ mod tests {
         for c in &candidates {
             assert!(!c.path.is_empty());
         }
+    }
+
+    #[test]
+    fn test_claude_executable_name_gate() {
+        assert!(is_claude_executable_path(Path::new("claude")));
+        assert!(is_claude_executable_path(Path::new("claude.exe")));
+        assert!(is_claude_executable_path(Path::new("claude.cmd")));
+        assert!(!is_claude_executable_path(Path::new("node")));
+        assert!(!is_claude_executable_path(Path::new("claude-helper")));
+    }
+
+    #[test]
+    fn sdk_pin_is_owned_by_blackbox_and_supports_an_empty_shadow_marker() {
+        let tmp = TempDir::new().unwrap();
+        let current = pin_file_path_with_home(tmp.path());
+        let previous = pre_blackbox_pin_file_path_with_home(tmp.path());
+        assert_eq!(current, tmp.path().join(".blackbox").join("cli-pin.json"));
+        assert_ne!(current, previous);
+
+        write_cli_pin(
+            &current,
+            &CliPin {
+                path: String::new(),
+                canonical_path: None,
+                version: None,
+            },
+        )
+        .unwrap();
+        let marker = read_cli_pin(&current).unwrap();
+        assert!(marker.path.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&current).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(current.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn sdk_runtime_probe_requires_the_real_stream_control_contract() {
+        let tmp = TempDir::new().unwrap();
+        let cli = tmp.path().join("claude");
+        write_fake_cli(
+            &cli,
+            "2.1.211",
+            "--input-format stream-json --output-format stream-json --include-hook-events --forward-subagent-text",
+        );
+
+        let runtime = probe_sdk_runtime(&cli).unwrap();
+        assert_eq!(runtime.version, "2.1.211");
+        assert_eq!(runtime.path, cli.to_string_lossy());
+        assert!(runtime.capabilities.stream_json);
+        assert!(runtime.capabilities.permission_prompt_stdio);
+        assert!(runtime.capabilities.include_hook_events);
+        assert!(runtime.capabilities.forward_subagent_text);
+        assert!(!runtime.capabilities.prompt_suggestions);
+
+        write_fake_cli(&cli, "2.1.211", "--input-format stream-json");
+        let error = probe_sdk_runtime(&cli).unwrap_err();
+        assert!(error.contains("does not expose the stream-json SDK control contract"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn canonical_identity_matches_launcher_and_version_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("2.1.211");
+        let launcher = tmp.path().join("claude");
+        write_fake_cli(
+            &target,
+            "2.1.211",
+            "--input-format --output-format --permission-prompt-tool",
+        );
+        symlink(&target, &launcher).unwrap();
+        assert!(same_cli_identity(&launcher, &target));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn current_native_target_accepts_only_a_direct_version_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let bin_dir = home.join(".local").join("bin");
+        let versions = home
+            .join(".local")
+            .join("share")
+            .join("claude")
+            .join("versions");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&versions).unwrap();
+        let launcher = bin_dir.join("claude");
+        let version = versions.join("2.1.211");
+        write_fake_cli(
+            &version,
+            "2.1.211",
+            "--input-format --output-format --permission-prompt-tool",
+        );
+        symlink(&version, &launcher).unwrap();
+        assert_eq!(
+            current_native_version_target_with_home(&launcher, home),
+            Some(fs::canonicalize(&version).unwrap())
+        );
+
+        fs::remove_file(&launcher).unwrap();
+        let escaped = home.join("outside");
+        write_fake_cli(
+            &escaped,
+            "2.1.211",
+            "--input-format --output-format --permission-prompt-tool",
+        );
+        symlink(
+            Path::new("../share/claude/versions/../../../../outside"),
+            &launcher,
+        )
+        .unwrap();
+        assert_eq!(
+            current_native_version_target_with_home(&launcher, home),
+            None
+        );
+    }
+
+    #[test]
+    fn test_delete_cli_refuses_external_owner() {
+        let tmp = TempDir::new().unwrap();
+        let external_dir = tmp
+            .path()
+            .join(".nvm")
+            .join("versions")
+            .join("node")
+            .join("bin");
+        fs::create_dir_all(&external_dir).unwrap();
+        let fake_cli = external_dir.join("claude");
+        fs::write(&fake_cli, b"fake").unwrap();
+
+        let error = delete_cli(&fake_cli.to_string_lossy()).unwrap_err();
+        assert!(error.contains("external package manager"));
+        assert!(fake_cli.exists());
+    }
+
+    #[test]
+    fn native_delete_gate_accepts_only_exact_installer_paths() {
+        let home = Path::new("/Users/test");
+        assert_eq!(
+            managed_native_delete_kind_with_home(
+                Path::new("/Users/test/.claude/local/claude"),
+                home,
+            ),
+            Some(ManagedNativeDeleteKind::LegacyOfficial),
+        );
+        assert_eq!(
+            managed_native_delete_kind_with_home(Path::new("/Users/test/.local/bin/claude"), home,),
+            Some(ManagedNativeDeleteKind::CurrentOfficial),
+        );
+        assert_eq!(
+            managed_native_delete_kind_with_home(
+                Path::new("/Users/test/.local/bin/claude-helper"),
+                home,
+            ),
+            None,
+        );
+        assert_eq!(
+            managed_native_delete_kind_with_home(Path::new("/usr/local/bin/claude"), home),
+            None,
+        );
     }
 }

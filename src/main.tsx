@@ -1,6 +1,16 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { DesktopPet } from "./components/desktop-pet/DesktopPet";
+import { DesktopPetStateBridge } from "./components/desktop-pet/DesktopPetStateBridge";
+import { bootstrapAppearance } from "./lib/appearance";
+
+bootstrapAppearance();
+const isDesktopPetWindow = new URLSearchParams(window.location.search).has("desktop-pet");
+if (isDesktopPetWindow) {
+  document.documentElement.classList.add("desktop-pet-document");
+  document.body.classList.add("desktop-pet-document");
+}
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -44,13 +54,14 @@ class ErrorBoundary extends React.Component<
             justifyContent: "center",
             height: "100vh",
             fontFamily: "-apple-system, BlinkMacSystemFont, sans-serif",
-            color: "#333",
+            background: "var(--color-bg-chat)",
+            color: "var(--color-text-primary)",
             padding: 32,
             textAlign: "center",
           }}
         >
           <h2 style={{ marginBottom: 8 }}>Something went wrong</h2>
-          <p style={{ color: "#888", fontSize: 14, marginBottom: 24, maxWidth: 480 }}>
+          <p style={{ color: "var(--color-text-muted)", fontSize: 14, marginBottom: 24, maxWidth: 480 }}>
             {this.state.error?.message || "An unexpected error occurred."}
           </p>
           <div style={{ display: "flex", gap: 12 }}>
@@ -59,8 +70,9 @@ class ErrorBoundary extends React.Component<
               style={{
                 padding: "8px 20px",
                 borderRadius: 8,
-                border: "1px solid #ddd",
-                background: "#fff",
+                border: "1px solid var(--color-border-subtle)",
+                background: "var(--color-bg-card)",
+                color: "var(--color-text-primary)",
                 cursor: "pointer",
                 fontSize: 14,
               }}
@@ -73,8 +85,8 @@ class ErrorBoundary extends React.Component<
                 padding: "8px 20px",
                 borderRadius: 8,
                 border: "none",
-                background: "#8B6CC5",
-                color: "#fff",
+                background: "var(--color-accent)",
+                color: "var(--color-text-inverse)",
                 cursor: "pointer",
                 fontSize: 14,
               }}
@@ -92,7 +104,14 @@ class ErrorBoundary extends React.Component<
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <ErrorBoundary>
-      <App />
+      {isDesktopPetWindow ? (
+        <DesktopPet />
+      ) : (
+        <>
+          <DesktopPetStateBridge />
+          <App />
+        </>
+      )}
     </ErrorBoundary>
   </React.StrictMode>,
 );

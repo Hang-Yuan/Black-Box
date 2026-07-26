@@ -7,7 +7,12 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useLightboxStore } from './ImageLightbox';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useFileStore } from '../../stores/fileStore';
-import { classifyPathToken, resolvePathToken, KNOWN_FILE_EXTENSIONS } from '../../stores/fileReveal';
+import {
+  KNOWN_FILE_EXTENSIONS,
+  parseFileReference,
+  slugifyHeading,
+  type ParsedFileReference,
+} from '../../stores/fileReveal';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 
@@ -257,6 +262,8 @@ interface Props {
   className?: string;
   /** Base path for resolving relative image paths (defaults to workingDirectory) */
   basePath?: string;
+  /** Current Markdown file, required for fragment-only links such as #heading. */
+  sourcePath?: string;
 }
 
 // Sanitize schema: GitHub defaults + className on all elements (needed for highlight.js)
@@ -269,6 +276,7 @@ const SANITIZE_SCHEMA = {
   protocols: {
     ...defaultSchema.protocols,
     src: [...(defaultSchema.protocols?.src || []), 'data'],
+    href: [...(defaultSchema.protocols?.href || []), 'file'],
   },
 };
 
@@ -358,7 +366,7 @@ class MarkdownErrorBoundary extends React.Component<
   }
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, basePath }: Props) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, basePath, sourcePath }: Props) {
   const t = useT();
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const resolveBase = basePath || workingDirectory || '';
@@ -376,6 +384,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
       cancelled = true;
     };
   }, []);
+
+  const openReference = useCallback((reference: ParsedFileReference) => {
+    useSettingsStore.getState().setSecondaryTab('files');
+    const rootHint = workingDirectory || useFileStore.getState().rootPath;
+    void useFileStore.getState().openFileReference(reference, rootHint);
+  }, [workingDirectory]);
 
   // Pre-process: wrap bare file paths in backticks so `code` handler makes them clickable
   const processedContent = useMemo(() => wrapBareFilePaths(content), [content]);
@@ -398,18 +412,54 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
       <td className="px-3 py-2 text-text-primary border-b border-border-subtle
         text-xs">{children}</td>
     ),
+    h1: ({ children }: { children?: ReactNode }) => (
+      <h1 id={slugifyHeading(extractText(children))}>{children}</h1>
+    ),
+    h2: ({ children }: { children?: ReactNode }) => (
+      <h2 id={slugifyHeading(extractText(children))}>{children}</h2>
+    ),
+    h3: ({ children }: { children?: ReactNode }) => (
+      <h3 id={slugifyHeading(extractText(children))}>{children}</h3>
+    ),
+    h4: ({ children }: { children?: ReactNode }) => (
+      <h4 id={slugifyHeading(extractText(children))}>{children}</h4>
+    ),
+    h5: ({ children }: { children?: ReactNode }) => (
+      <h5 id={slugifyHeading(extractText(children))}>{children}</h5>
+    ),
+    h6: ({ children }: { children?: ReactNode }) => (
+      <h6 id={slugifyHeading(extractText(children))}>{children}</h6>
+    ),
     a: ({ href, children }: { href?: string; children?: ReactNode }) => {
       // Detect false-positive autolinks: remark-gfm treats file-like text
       // (e.g. AGENTS.md, config.rs) as URLs because some extensions are
       // valid TLDs (.md = Moldova, .rs = Serbia, .sh = St. Helena, etc.)
       const childText = typeof children === 'string' ? children : '';
       const FILE_EXT_RE = /\.(md|txt|json|ts|tsx|js|jsx|py|rs|go|toml|yaml|yml|html|css|sh|log|env|cfg|ini|xml|csv|sql|lock|swift|kt|java|c|h|cpp|hpp|rb|lua|zig|vue|svelte)$/i;
-      if (
+      const isFalsePositiveAutolink = !!(
         href &&
         FILE_EXT_RE.test(childText) &&
         (href === `http://${childText}` || href === `https://${childText}`)
-      ) {
-        return <code className="rounded bg-black/[0.06] px-1 py-0.5 text-[0.9em] dark:bg-white/[0.08]">{children}</code>;
+      );
+      const localReference = parseFileReference(
+        isFalsePositiveAutolink ? childText : (href || ''),
+        { basePath: resolveBase, sourcePath, explicit: true },
+      );
+
+      if (localReference) {
+        return (
+          <button
+            type="button"
+            onClick={() => openReference(localReference)}
+            className="text-accent hover:underline inline-flex items-center gap-1 cursor-pointer"
+            title={localReference.path}
+          >
+            <span className="text-[10px] leading-none" aria-hidden="true">
+              {localReference.kind === 'folder' ? '📁' : '📄'}
+            </span>
+            {children}
+          </button>
+        );
       }
 
       return (
@@ -513,15 +563,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
       if (className) return <code className={className}>{children}</code>;
 
       const text = extractText(children).trim();
-      const kind = classifyPathToken(text);
-      if (kind) {
-        const resolved = resolvePathToken(text, resolveBase);
+      const reference = parseFileReference(text, { basePath: resolveBase, sourcePath });
+      if (reference) {
         return (
           <button
             onClick={() => {
-              // 纯定位：右侧文件区展开到该路径并高亮（不读内容、不预览）
-              useSettingsStore.getState().setSecondaryTab('files');
-              useFileStore.getState().revealPath(resolved);
+              openReference(reference);
             }}
             className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
               bg-bg-secondary border border-accent/50 rounded-full
@@ -529,16 +576,16 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
               hover:bg-accent/10 hover:border-accent
               transition-all duration-150 select-none
               align-baseline leading-normal whitespace-nowrap"
-            title={resolved}
+            title={reference.path}
           >
-            <span className="text-[10px] leading-none">{kind === 'folder' ? '📁' : '📄'}</span>
+            <span className="text-[10px] leading-none">{reference.kind === 'folder' ? '📁' : '📄'}</span>
             <span className="max-w-[240px] truncate">{text}</span>
           </button>
         );
       }
       return <code>{children}</code>;
     },
-  }), [t, resolveBase]);
+  }), [t, resolveBase, sourcePath, openReference]);
 
   return (
     <div className={`prose prose-sm max-w-none

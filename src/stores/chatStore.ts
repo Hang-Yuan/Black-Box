@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { useSessionStore } from './sessionStore';
 import type { ApiRetryStatus } from '../lib/api-retry';
 import type { FileAttachment } from '../hooks/useFileAttachments';
+import { sanitizeAssistantTextForDisplay } from '../lib/presentation-sanitizer';
+import type { PermissionUpdate } from '../lib/permission-suggestions';
 
 // --- Types ---
 
@@ -38,6 +40,14 @@ export interface PermissionRequestData {
   input: Record<string, unknown>;
   description?: string;
   toolUseId?: string;
+  permissionSuggestions?: PermissionUpdate[];
+  blockedPath?: string;
+  decisionReason?: string;
+  decisionReasonType?: string;
+  classifierApprovable?: boolean;
+  title?: string;
+  displayName?: string;
+  requiresUserInteraction?: boolean;
 }
 
 export interface ChatMessage {
@@ -78,6 +88,10 @@ export interface ChatMessage {
   subAgentDepth?: number;
   // CLI checkpoint UUID for file restoration (from --replay-user-messages)
   checkpointUuid?: string;
+  /** Guidance injected into the currently running Claude turn through
+   * streaming input. It does not start a separate Goal turn. */
+  isSteer?: boolean;
+  steerState?: 'sending' | 'sent';
   /** AskUserQuestion / permission owner — the (tabId, stdinId) that created this card.
    *  Phase 4 §5.3 (S3): QuestionCard answers must flow to the spawning tab/stdin,
    *  NOT getActiveTabState (which is wrong after the user switches tabs). */
@@ -100,6 +114,10 @@ export interface SessionMeta {
   /** True only after system:init confirms the stdin process finished startup and
    *  can safely accept follow-up sendStdin writes (including pre-warm reuse). */
   stdinReady?: boolean;
+  /** Disk transcript hydration is an exclusive phase: no send/resume may
+   * start until the matching generation has finished applying messages. */
+  hydratingFromDisk?: boolean;
+  hydrationGeneration?: string;
   /** User text captured while a pre-warmed stdin exists but has not emitted
    *  system:init yet. Flushed exactly once when that same stdin becomes ready. */
   pendingReadyMessage?: {
@@ -112,9 +130,11 @@ export interface SessionMeta {
   /** Snapshot of config at session spawn time — used for config-mismatch detection */
   configSnapshot?: {
     model: string;
+    auxiliaryModel: string;
     providerId: string;
     thinkingLevel: string;
     permissionMode: string;
+    agentTeamsEnabled: boolean;
   };
   /** Message ID of a pending processing card (for CLI slash commands) */
   pendingCommandMsgId?: string;
@@ -135,13 +155,16 @@ export interface SessionMeta {
   /** JSON fingerprint of the active provider config used when spawning the CLI process.
    *  Compared before sending via stdin to detect stale pre-warm sessions. */
   envFingerprint?: string;
-  /** Stable hash of the 4 spawn-time CLI dimensions (provider + model +
-   *  thinkingLevel + provider.updatedAt). Phase 2 §2.1. Compared in
+  /** Stable hash of spawn-time CLI dimensions (provider + model +
+   *  thinkingLevel + Agent Teams opt-in + provider.updatedAt). Compared in
    *  handleSubmit to detect config drift that requires kill + respawn. */
   spawnConfigHash?: string;
   /** True after the CLI has emitted assistant-side stream evidence for the
    *  current turn. This may be true even when thinking is hidden by settings. */
   turnAcceptedForResume?: boolean;
+  /** Source Claude thread for a pending fork draft. Cleared as soon as the
+   *  CLI emits the independently allocated child UUID. */
+  forkSourceId?: string;
   /** Snapshot of sessionMode at session spawn — per-session isolation (Phase 4) */
   snapshotMode?: import('./settingsStore').SessionMode;
   /** Snapshot of selectedModel at session spawn — per-session isolation (Phase 4) */
@@ -154,12 +177,12 @@ export interface SessionMeta {
    *  Compared before sending via stdin to detect mid-session model switches. */
   spawnedModel?: string;
   /** Set when API provider config changed mid-session (TK-303).
-   *  If resume fails due to thinking signature mismatch, auto-retry without resume. */
+   *  A signature mismatch must fail closed without clearing the resume UUID. */
   providerSwitched?: boolean;
   /** The user message text to re-send if provider-switch auto-retry triggers. */
   providerSwitchPendingText?: string;
   /** Set when model changed mid-session.
-   *  If resume fails due to thinking signature mismatch, auto-retry without resume. */
+   *  A signature mismatch returns the pending text to the composer. */
   modelSwitched?: boolean;
   /** The user message text to re-send if model-switch auto-retry triggers. */
   modelSwitchPendingText?: string;
@@ -210,6 +233,16 @@ export function isSessionBusy(status: SessionStatus | undefined): boolean {
 
 export type ActivityPhase = 'idle' | 'thinking' | 'writing' | 'tool' | 'awaiting' | 'completed' | 'error' | 'reconnecting';
 
+/**
+ * Metadata-only reason a live tab is blocked on user input.
+ *
+ * Keep this deliberately narrower than ChatMessage: the global activity
+ * projection may read this field without hydrating or inspecting conversation
+ * bodies. Question text, permission input, and plan content stay exclusively
+ * on their interactive message cards.
+ */
+export type WaitingForInteraction = 'question' | 'permission' | 'plan_review';
+
 export interface ActivityStatus {
   phase: ActivityPhase;
   toolName?: string;  // only when phase === 'tool'
@@ -225,6 +258,10 @@ export interface ActivityStatus {
  */
 export interface PendingUserMessage {
   text: string;
+  /** Commands are serialized through the same FIFO but are never merged into
+   * a user turn. Each receives its own processing-card lifecycle. */
+  kind?: 'user' | 'command' | 'steer';
+  commandMessageId?: string;
   /** spawnConfigHash() snapshot captured when the message was enqueued. */
   enqueueConfigHash?: string;
   /** stdinId of the CLI process the user was talking to at enqueue time. */
@@ -241,6 +278,7 @@ export interface SessionSnapshot {
   sessionStatus: SessionStatus;
   sessionMeta: SessionMeta;
   activityStatus: ActivityStatus;
+  waitingFor?: WaitingForInteraction;
   inputDraft: string;
   pendingAttachments: FileAttachment[];
   /** User messages queued while AI is actively processing (not yet sent to stdin) */
@@ -258,6 +296,8 @@ export interface TabSession {
   sessionStatus: SessionStatus;
   sessionMeta: SessionMeta;
   activityStatus: ActivityStatus;
+  /** Live, metadata-only interaction kind; never restored from transcript text. */
+  waitingFor?: WaitingForInteraction;
   inputDraft: string;
   pendingAttachments: FileAttachment[];
   pendingUserMessages: PendingUserMessage[];
@@ -292,10 +332,19 @@ interface ChatState {
   addPendingMessage: (
     tabId: string,
     text: string,
-    meta?: { enqueueConfigHash?: string; enqueueStdinId?: string },
+    meta?: {
+      enqueueConfigHash?: string;
+      enqueueStdinId?: string;
+      kind?: 'user' | 'command' | 'steer';
+      commandMessageId?: string;
+    },
   ) => void;
+  /** Take startup-gated steers for this exact live stdin route. */
+  takePendingSteers: (tabId: string, stdinId: string) => PendingUserMessage[];
   /** Dequeue the first pending message (FIFO). Returns undefined if empty. */
   shiftPendingMessage: (tabId: string) => PendingUserMessage | undefined;
+  /** Remove one queued command by its stable processing-card id. */
+  removePendingCommand: (tabId: string, commandMessageId: string) => PendingUserMessage | undefined;
   flushPendingMessages: (tabId: string) => PendingUserMessage[];
   clearPendingMessages: (tabId: string) => void;
   restorePendingQueueToDraft: (tabId: string) => void;
@@ -361,6 +410,7 @@ const EMPTY_TAB: TabSession = {
   sessionStatus: 'idle',
   sessionMeta: {},
   activityStatus: { phase: 'idle' },
+  waitingFor: undefined,
   inputDraft: '',
   pendingAttachments: [],
   pendingUserMessages: [],
@@ -396,7 +446,10 @@ function hasLiveStdinBinding(tabId: string, stdinId?: string): boolean {
 
 /**
  * Immutable Map update helper: get tab, apply updater, return new Map.
- * Returns undefined if tab doesn't exist (caller should return {} to skip).
+ * Returns undefined if the tab is missing or the updater returns the existing
+ * tab object. Callers must return their current Zustand state to make that a
+ * true no-op; returning `{}` still creates a new root object and notifies every
+ * subscriber.
  */
 function updateTab(
   tabs: Map<string, TabSession>,
@@ -405,9 +458,62 @@ function updateTab(
 ): { tabs: Map<string, TabSession>; sessionCache: Map<string, TabSession> } | undefined {
   const tab = tabs.get(tabId);
   if (!tab) return undefined;
+  const updated = updater(tab);
+  // Zustand notifies every subscriber when the root object changes. Let
+  // targeted setters return the current tab for a semantic no-op so editor
+  // bridges cannot turn a same-value write into a React update loop.
+  if (updated === tab) return undefined;
   const newTabs = new Map(tabs);
-  newTabs.set(tabId, updater(tab));
+  newTabs.set(tabId, updated);
   return { tabs: newTabs, sessionCache: newTabs };
+}
+
+function sameAttachments(
+  current: readonly FileAttachment[],
+  next: readonly FileAttachment[],
+): boolean {
+  if (current === next) return true;
+  if (current.length !== next.length) return false;
+  return current.every((file, index) => {
+    const candidate = next[index];
+    return file.id === candidate.id
+      && file.name === candidate.name
+      && file.path === candidate.path
+      && file.size === candidate.size
+      && file.type === candidate.type
+      && file.isImage === candidate.isImage
+      && file.preview === candidate.preview;
+  });
+}
+
+function waitingForMessage(message: ChatMessage): WaitingForInteraction | undefined {
+  // `sending` means the user has already responded. A failed send remains
+  // cleared until the card explicitly returns to `pending` for retry.
+  const isPending = !message.resolved
+    && (message.interactionState === undefined || message.interactionState === 'pending');
+  if (!isPending) return undefined;
+  if (message.type === 'question') return 'question';
+  if (message.type === 'permission') return 'permission';
+  if (message.type === 'plan_review') return 'plan_review';
+  return undefined;
+}
+
+/** Derive only the interaction kind; never copy content/tool input into tab metadata. */
+function deriveWaitingFor(messages: readonly ChatMessage[]): WaitingForInteraction | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const waitingFor = waitingForMessage(messages[index]);
+    if (waitingFor) return waitingFor;
+  }
+  return undefined;
+}
+
+function deriveLiveWaitingFor(
+  status: SessionStatus,
+  messages: readonly ChatMessage[],
+): WaitingForInteraction | undefined {
+  return status === 'running' || status === 'reconnecting'
+    ? deriveWaitingFor(messages)
+    : undefined;
 }
 
 // --- Selector helpers ---
@@ -445,51 +551,54 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
   addMessage: (tabId, message) =>
     set((state) => {
+      const displayMessage = message.role === 'assistant' && message.type === 'text'
+        ? { ...message, content: sanitizeAssistantTextForDisplay(message.content) }
+        : message;
       const result = updateTab(state.tabs, tabId, (tab) => {
         // De-duplicate: if a message with the same ID already exists, update it
         // instead of appending a duplicate. This happens when the CLI re-sends
         // a complete assistant message that was previously delivered partially.
-        const existingIdx = tab.messages.findIndex((m) => m.id === message.id);
+        const existingIdx = tab.messages.findIndex((m) => m.id === displayMessage.id);
         const messages = existingIdx !== -1
-          ? tab.messages.map((m, i) => i === existingIdx ? { ...m, ...message } : m)
-          : [...tab.messages, message];
-        return { ...tab, messages };
+          ? tab.messages.map((m, i) => i === existingIdx ? { ...m, ...displayMessage } : m)
+          : [...tab.messages, displayMessage];
+        return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
         // NOTE: partialText/isStreaming are NOT cleared here. Clearing is handled
         // explicitly by clearPartial() in the result/process_exit handlers and
         // in the assistant message handler when a text block supersedes streaming.
       });
-      return result ?? {};
+      return result ?? state;
     }),
 
   removeMessage: (tabId, id) =>
     set((state) => {
-      const result = updateTab(state.tabs, tabId, (tab) => ({
-        ...tab,
-        messages: tab.messages.filter((m) => m.id !== id),
-      }));
-      return result ?? {};
+      const result = updateTab(state.tabs, tabId, (tab) => {
+        const messages = tab.messages.filter((m) => m.id !== id);
+        return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
+      });
+      return result ?? state;
     }),
 
   updateMessage: (tabId, id, updates) =>
     set((state) => {
-      const result = updateTab(state.tabs, tabId, (tab) => ({
-        ...tab,
-        messages: tab.messages.map((m) =>
+      const result = updateTab(state.tabs, tabId, (tab) => {
+        const messages = tab.messages.map((m) =>
           m.id === id ? { ...m, ...updates } : m,
-        ),
-      }));
-      return result ?? {};
+        );
+        return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
+      });
+      return result ?? state;
     }),
 
   updatePartialMessage: (tabId, text) =>
     set((state) => {
       const result = updateTab(state.tabs, tabId, (tab) => ({
         ...tab,
-        partialText: tab.partialText + text,
+        partialText: sanitizeAssistantTextForDisplay(tab.partialText + text),
         isStreaming: true,
         activityStatus: { phase: 'writing' as ActivityPhase },
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   updatePartialThinking: (tabId, text) =>
@@ -507,7 +616,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
               ? { phase: 'writing' as ActivityPhase }
               : { phase: 'thinking' as ActivityPhase },
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   setSessionStatus: (tabId, status) => {
@@ -542,8 +651,11 @@ export const useChatStore = create<ChatState>()((set, get) => ({
           : status === 'stopped' ? { activityStatus: { phase: 'completed' as ActivityPhase } }
           : status === 'reconnecting' ? { activityStatus: { phase: 'reconnecting' as ActivityPhase } }
           : {}),
+        // A terminal state or explicit teardown cannot still be waiting for a
+        // card response. `running`/`reconnecting` preserve a real live card.
+        waitingFor: deriveLiveWaitingFor(status, tab.messages),
       }));
-      return result ?? {};
+      return result ?? state;
     });
   },
 
@@ -553,7 +665,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         ...tab,
         activityStatus: status,
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   clearMessages: (tabId) =>
@@ -567,17 +679,18 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         sessionStatus: 'idle',
         // Preserve sessionMeta (especially sessionId for resume)
         activityStatus: { phase: 'idle' },
+        waitingFor: undefined,
         inputDraft: '',
         pendingAttachments: [],
         pendingUserMessages: [],
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   resetTab: (tabId) =>
     set((state) => {
       const result = updateTab(state.tabs, tabId, () => createTab(tabId));
-      return result ?? {};
+      return result ?? state;
     }),
 
   setSessionMeta: (tabId, meta) =>
@@ -586,31 +699,35 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         ...tab,
         sessionMeta: { ...tab.sessionMeta, ...meta },
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   setInputDraft: (tabId, text) =>
     set((state) => {
-      const result = updateTab(state.tabs, tabId, (tab) => ({
-        ...tab,
-        inputDraft: text,
-      }));
-      return result ?? {};
+      const result = updateTab(state.tabs, tabId, (tab) => (
+        tab.inputDraft === text
+          ? tab
+          : { ...tab, inputDraft: text }
+      ));
+      return result ?? state;
     }),
 
   setPendingAttachments: (tabId, files) =>
     set((state) => {
-      const result = updateTab(state.tabs, tabId, (tab) => ({
-        ...tab,
-        pendingAttachments: files,
-      }));
-      return result ?? {};
+      const result = updateTab(state.tabs, tabId, (tab) => (
+        sameAttachments(tab.pendingAttachments, files)
+          ? tab
+          : { ...tab, pendingAttachments: files }
+      ));
+      return result ?? state;
     }),
 
   addPendingMessage: (tabId, text, meta) =>
     set((state) => {
       const item: PendingUserMessage = {
         text,
+        kind: meta?.kind ?? 'user',
+        commandMessageId: meta?.commandMessageId,
         enqueueConfigHash: meta?.enqueueConfigHash,
         enqueueStdinId: meta?.enqueueStdinId,
         enqueueAt: Date.now(),
@@ -619,7 +736,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         ...tab,
         pendingUserMessages: [...tab.pendingUserMessages, item],
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   shiftPendingMessage: (tabId) => {
@@ -634,6 +751,43 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       return r ?? {};
     });
     return first;
+  },
+
+  removePendingCommand: (tabId, commandMessageId) => {
+    const tab = get().tabs.get(tabId);
+    if (!tab) return undefined;
+    const index = tab.pendingUserMessages.findIndex(
+      (item) => item.kind === 'command' && item.commandMessageId === commandMessageId,
+    );
+    if (index < 0) return undefined;
+    const item = tab.pendingUserMessages[index];
+    set((state) => {
+      const result = updateTab(state.tabs, tabId, (current) => ({
+        ...current,
+        pendingUserMessages: current.pendingUserMessages.filter((_, itemIndex) => itemIndex !== index),
+      }));
+      return result ?? state;
+    });
+    return item;
+  },
+
+  takePendingSteers: (tabId, stdinId) => {
+    const tab = get().tabs.get(tabId);
+    if (!tab) return [];
+    const steers = tab.pendingUserMessages.filter(
+      (item) => item.kind === 'steer' && item.enqueueStdinId === stdinId,
+    );
+    if (steers.length === 0) return [];
+    set((state) => {
+      const result = updateTab(state.tabs, tabId, (current) => ({
+        ...current,
+        pendingUserMessages: current.pendingUserMessages.filter(
+          (item) => !(item.kind === 'steer' && item.enqueueStdinId === stdinId),
+        ),
+      }));
+      return result ?? state;
+    });
+    return steers;
   },
 
   flushPendingMessages: (tabId) => {
@@ -656,7 +810,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         ...tab,
         pendingUserMessages: [],
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   restorePendingQueueToDraft: (tabId) =>
@@ -675,7 +829,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         inputDraft: nextDraft,
         pendingUserMessages: [],
       }));
-      return result ?? {};
+      return result ?? state;
     }),
 
   rewindToTurn: (tabId, startMsgIdx) =>
@@ -690,35 +844,38 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             partialText: '',
             partialThinking: '',
             activityStatus: { phase: 'idle' as ActivityPhase },
+            waitingFor: undefined,
           };
         }
+        const messages = tab.messages.slice(0, startMsgIdx);
         return {
           ...tab,
-          messages: tab.messages.slice(0, startMsgIdx),
+          messages,
           isStreaming: false,
           partialText: '',
           partialThinking: '',
           // Keep sessionMeta (sessionId needed for resume), reset transient state
           activityStatus: { phase: 'idle' as ActivityPhase },
+          waitingFor: undefined,
         };
       });
-      return result ?? {};
+      return result ?? state;
     }),
 
   setInteractionState: (tabId, msgId, interactionState, error) =>
     set((state) => {
-      const result = updateTab(state.tabs, tabId, (tab) => ({
-        ...tab,
-        messages: tab.messages.map((m) =>
+      const result = updateTab(state.tabs, tabId, (tab) => {
+        const messages = tab.messages.map((m) =>
           m.id === msgId ? {
             ...m,
             interactionState,
             interactionError: error,
             resolved: interactionState === 'resolved',
           } : m,
-        ),
-      }));
-      return result ?? {};
+        );
+        return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
+      });
+      return result ?? state;
     }),
 
   getActiveInteraction: (tabId) => {
@@ -834,6 +991,18 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         return false;
       }
     }
+    // `waitingFor` is live process metadata, not durable transcript state.
+    // Preserve it only when this tab still owns the stdin that created the
+    // interaction; cache/disk restores must not resurrect stale waiting cards.
+    if (tab.waitingFor && !hasLiveStdinBinding(tabId, tab.sessionMeta.stdinId)) {
+      set((state) => {
+        const result = updateTab(state.tabs, tabId, (current) => ({
+          ...current,
+          waitingFor: undefined,
+        }));
+        return result ?? state;
+      });
+    }
     // TK-329: Validate stdinId ownership — prevent cross-tab contamination
     if (tab.sessionMeta.stdinId) {
       const ownerTab = useSessionStore.getState().getTabForStdin(tab.sessionMeta.stdinId);
@@ -849,7 +1018,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
               pendingReadyMessage: undefined,
             },
           }));
-          return result ?? {};
+          return result ?? state;
         });
       }
     }
@@ -870,7 +1039,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             partialThinking: '',
             lastAccessedAt: restoredAt,
           }));
-          return result ?? {};
+          return result ?? state;
         });
         useSessionStore.getState().setSessionRunning(tabId, false);
         return true;
@@ -882,7 +1051,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         ...t,
         lastAccessedAt: restoredAt,
       }));
-      return result ?? {};
+      return result ?? state;
     });
     // Sync running state to sessionStore for sidebar indicator (FI-1 fix)
     useSessionStore.getState().setSessionRunning(tabId, tab.sessionStatus === 'running');

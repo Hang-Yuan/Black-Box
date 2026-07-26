@@ -16,7 +16,9 @@ if (typeof globalThis.window === 'undefined') {
 // Mock tauri-bridge
 const mockStartSession = vi.fn();
 const mockKillSession = vi.fn();
+const mockGracefulStopSession = vi.fn();
 const mockTrackSession = vi.fn();
+const mockListActiveProcesses = vi.fn();
 const mockOnClaudeStream = vi.fn();
 const mockOnClaudeStderr = vi.fn();
 const mockOnSessionExit = vi.fn();
@@ -25,7 +27,9 @@ vi.mock('../lib/tauri-bridge', () => ({
   bridge: {
     startSession: (...args: any[]) => mockStartSession(...args),
     killSession: (...args: any[]) => mockKillSession(...args),
+    gracefulStopSession: (...args: any[]) => mockGracefulStopSession(...args),
     trackSession: (...args: any[]) => mockTrackSession(...args),
+    listActiveProcesses: (...args: any[]) => mockListActiveProcesses(...args),
   },
   onClaudeStream: (...args: any[]) => mockOnClaudeStream(...args),
   onClaudeStderr: (...args: any[]) => mockOnClaudeStderr(...args),
@@ -79,6 +83,9 @@ vi.mock('../stores/chatStore', () => ({
     }),
   },
   generateInterruptedId: (kind: string) => `interrupted_${kind}_${Date.now()}`,
+  isSessionBusy: (status: string | undefined) => (
+    status === 'running' || status === 'reconnecting' || status === 'stopping'
+  ),
 }));
 
 // Mock stream controller
@@ -101,6 +108,8 @@ import {
   hasRecoverableFrontendSession,
   clearFinalized,
   getRecentlyFinalizedStdin,
+  planCliUpdateSessions,
+  __sessionLifecycleTesting,
   type SpawnParams,
 } from '../lib/sessionLifecycle';
 
@@ -111,9 +120,11 @@ function makeSpawnParams(overrides?: Partial<SpawnParams>): SpawnParams {
     cwdSnapshot: '/home/user/project',
     configSnapshot: {
       model: 'claude-opus-4-20250514',
+      auxiliaryModel: 'claude-sonnet-5',
       providerId: 'default',
       thinkingLevel: 'high',
       permissionMode: 'acceptEdits',
+      agentTeamsEnabled: false,
     },
     sessionModeSnapshot: 'code',
     sessionParams: {
@@ -136,6 +147,7 @@ describe('spawnSession', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __sessionLifecycleTesting.resetStartupRecovery();
     // Setup default mock returns
     mockOnClaudeStream.mockResolvedValue(unlistenStream);
     mockOnClaudeStderr.mockResolvedValue(unlistenStderr);
@@ -147,6 +159,7 @@ describe('spawnSession', () => {
       cli_path: '/usr/bin/claude',
     });
     mockTrackSession.mockResolvedValue(undefined);
+    mockListActiveProcesses.mockResolvedValue([]);
     // Provide a global for __claudeUnlisteners
     (window as any).__claudeUnlisteners = {};
   });
@@ -165,6 +178,14 @@ describe('spawnSession', () => {
 
     expect(callOrder[0]).toBe('register');
     expect(callOrder[1]).toBe('stream');
+  });
+
+  it('fails closed before registering a route when startup orphan recovery fails', async () => {
+    mockListActiveProcesses.mockRejectedValueOnce(new Error('backend unavailable'));
+
+    await expect(spawnSession(makeSpawnParams())).rejects.toThrow('backend unavailable');
+    expect(mockRegisterStdinTab).not.toHaveBeenCalled();
+    expect(mockStartSession).not.toHaveBeenCalled();
   });
 
   it('registers 3 listeners (stream, stderr, exit)', async () => {
@@ -277,6 +298,7 @@ describe('teardownSession', () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     mockKillSession.mockResolvedValue(undefined);
+    mockGracefulStopSession.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -293,9 +315,18 @@ describe('teardownSession', () => {
     expect(mockKillSession).toHaveBeenCalledWith('desk_123');
   });
 
-  it('does NOT unregister or clear listeners', async () => {
+  it('finalizes the route only after backend exit confirmation', async () => {
     await teardownSession('desk_123', 'tab-1', 'stop');
+    expect(mockUnregisterStdinTab).toHaveBeenCalledWith('desk_123');
+  });
+
+  it('keeps ownership and propagates a backend stop failure', async () => {
+    mockKillSession.mockRejectedValueOnce(new Error('SESSION_STOP_TIMEOUT'));
+
+    await expect(teardownSession('desk_123', 'tab-1', 'stop'))
+      .rejects.toThrow('SESSION_STOP_TIMEOUT');
     expect(mockUnregisterStdinTab).not.toHaveBeenCalled();
+    expect(mockSetSessionStatus).toHaveBeenCalledWith('tab-1', 'error');
   });
 
   it('all 5 reasons are accepted', async () => {
@@ -303,6 +334,7 @@ describe('teardownSession', () => {
     for (const reason of reasons) {
       vi.clearAllMocks();
       mockKillSession.mockResolvedValue(undefined);
+      mockGracefulStopSession.mockResolvedValue(undefined);
       await teardownSession('desk_x', 'tab-x', reason);
       expect(mockSetSessionStatus).toHaveBeenCalledWith('tab-x', 'stopping');
     }
@@ -346,6 +378,55 @@ describe('checkOwnership', () => {
     });
     const result = checkOwnership('desk_OLD');
     expect(result).toEqual({ valid: false, reason: 'stale-stdinId' });
+  });
+});
+
+describe('planCliUpdateSessions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('classifies completed persistent connections as safe warm sessions', () => {
+    mockGetTabForStdin.mockReturnValue('tab-warm');
+    mockGetTab.mockReturnValue({
+      tabId: 'tab-warm',
+      sessionStatus: 'completed',
+      activityStatus: { phase: 'completed' },
+      sessionMeta: { stdinId: 'desk-warm' },
+    });
+
+    expect(planCliUpdateSessions(['desk-warm'])).toEqual({
+      warmIds: [{ stdinId: 'desk-warm', tabId: 'tab-warm' }],
+      busyIds: [],
+      unknownIds: [],
+    });
+  });
+
+  it('keeps generating and AskUserQuestion sessions under chat controls', () => {
+    mockGetTabForStdin.mockImplementation((stdinId: string) => `tab-${stdinId}`);
+    mockGetTab.mockImplementation((tabId: string) => {
+      const stdinId = tabId.replace('tab-', '');
+      return {
+        tabId,
+        sessionStatus: stdinId === 'desk-running' ? 'running' : 'completed',
+        activityStatus: {
+          phase: stdinId === 'desk-awaiting' ? 'awaiting' : 'thinking',
+        },
+        sessionMeta: { stdinId },
+      };
+    });
+
+    const plan = planCliUpdateSessions(['desk-running', 'desk-awaiting']);
+    expect(plan.warmIds).toEqual([]);
+    expect(plan.busyIds).toEqual([
+      { stdinId: 'desk-running', tabId: 'tab-desk-running' },
+      { stdinId: 'desk-awaiting', tabId: 'tab-desk-awaiting' },
+    ]);
+  });
+
+  it('does not authorize an unowned backend process for automatic shutdown', () => {
+    mockGetTabForStdin.mockReturnValue(undefined);
+    expect(planCliUpdateSessions(['desk-orphan']).unknownIds).toEqual(['desk-orphan']);
   });
 });
 

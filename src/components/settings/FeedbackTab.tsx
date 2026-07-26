@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { bridge, type FeedbackMetadata } from '../../lib/tauri-bridge';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { resolveModelOrError } from '../../lib/api-provider';
 import { useProviderStore } from '../../stores/providerStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -108,7 +109,11 @@ export function FeedbackTab() {
       app_version: appVersion || 'unknown',
       locale,
       provider_name: providerName,
-      model: useSettingsStore.getState().selectedModel,
+      model: (() => {
+        const selected = useSettingsStore.getState().selectedModel;
+        const resolution = resolveModelOrError(selected);
+        return resolution.ok ? resolution.model : `${selected} (unmapped)`;
+      })(),
       session_id: (selectedTabId ? useSessionStore.getState().sessions.find((s) => s.id === selectedTabId)?.cliResumeId : null) ?? fallbackSessionId,
       user_contact: contact.trim() || undefined,
     };

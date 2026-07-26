@@ -4,9 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 /// <reference types="vitest/config" />
 
-// @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
-// @ts-expect-error process is a nodejs global
 const edition = process.env.EDITION || 'stable';
 
 // https://vite.dev/config/
@@ -15,7 +13,7 @@ export default defineConfig(async () => ({
 
   define: {
     __APP_EDITION__: JSON.stringify(edition),
-    __APP_NAME__: JSON.stringify(edition === 'alpha' ? 'TCAlpha' : 'Black Box'),
+    __APP_NAME__: JSON.stringify(edition === 'alpha' ? 'Black Box Preview' : 'Black Box'),
   },
 
   test: {
@@ -42,7 +40,10 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // The isolated runtime contains symlinked Rust registry caches. Watching
+      // those caches makes every Cargo compile look like an app source edit and
+      // triggers reload storms while `tauri dev` is starting.
+      ignored: ["**/src-tauri/**", "**/.dev-runtime/**"],
     },
   },
 }));

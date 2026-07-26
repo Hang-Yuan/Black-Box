@@ -7,6 +7,7 @@
  * - Provider preset thinkingSupport accuracy
  */
 import { describe, it, expect } from 'vitest';
+import { buildAskUserQuestionAnswers } from '../../lib/ask-user-question';
 
 // We can't import settingsStore directly (it uses zustand persist + localStorage)
 // Instead, test the migration logic and type definitions by examining source.
@@ -178,5 +179,72 @@ describe('Root Cause 2: AskUserQuestion dual-path race', () => {
 
     // Already resolved → not blocked regardless
     expect(isBlocked(true, undefined)).toBe(false);
+  });
+
+  it('AskUserQuestion answers must be keyed by exact question text', () => {
+    const questions = [
+      {
+        question: 'Pick the operating mode',
+        options: [{ label: 'Manual' }, { label: 'Auto' }],
+      },
+      {
+        question: 'Any extra constraint?',
+        options: [{ label: 'No' }, { label: 'Yes' }],
+      },
+    ];
+    const selectedMap: Record<number, Set<number>> = {
+      0: new Set([1]),
+      1: new Set([0]),
+    };
+
+    const answers = buildAskUserQuestionAnswers(questions, {
+      selectedMap,
+      useOther: {},
+      otherText: {},
+    });
+
+    expect(answers).toEqual({
+      'Pick the operating mode': 'Auto',
+      'Any extra constraint?': 'No',
+    });
+    expect(answers).not.toHaveProperty('0');
+    expect(answers).not.toHaveProperty('1');
+  });
+
+  it('keeps custom answers under the exact original question text', () => {
+    const question = 'Describe the required output exactly';
+    const answers = buildAskUserQuestionAnswers(
+      [{ question, options: [{ label: 'Use the default' }] }],
+      {
+        selectedMap: { 0: new Set([0]) },
+        useOther: { 0: true },
+        otherText: { 0: '  Preserve this custom answer  ' },
+      },
+    );
+
+    expect(answers).toEqual({ [question]: 'Preserve this custom answer' });
+    expect(answers).not.toHaveProperty('0');
+  });
+
+  it('keeps multi-select labels in the order selected by the user', () => {
+    const question = 'Choose every required capability';
+    const answers = buildAskUserQuestionAnswers(
+      [{
+        question,
+        options: [
+          { label: 'Search' },
+          { label: 'Write' },
+          { label: 'Verify' },
+        ],
+      }],
+      {
+        selectedMap: { 0: new Set([2, 0]) },
+        useOther: {},
+        otherText: {},
+      },
+    );
+
+    expect(answers).toEqual({ [question]: 'Verify, Search' });
+    expect(answers).not.toHaveProperty('0');
   });
 });

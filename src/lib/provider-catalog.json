@@ -1,0 +1,152 @@
+{
+  "version": 2,
+  "providers": [
+    {
+      "id": "anthropic",
+      "name": "Claude",
+      "baseUrl": "https://api.anthropic.com",
+      "apiFormat": "anthropic",
+      "authScheme": "x-api-key",
+      "extraEnv": {},
+      "keyUrl": "https://console.anthropic.com/settings/keys",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "claude-fable-5",
+        "opus": "claude-opus-4-8",
+        "sonnet": "claude-sonnet-4-6",
+        "haiku": "claude-haiku-4-5-20251001"
+      }
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiFormat": "openai",
+      "authScheme": "bearer",
+      "extraEnv": {},
+      "keyUrl": "https://platform.openai.com/api-keys",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "gpt-5.5",
+        "opus": "gpt-5.6-sol",
+        "sonnet": "gpt-5.6-terra",
+        "haiku": "gpt-5.6-luna"
+      }
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+      "apiFormat": "gemini",
+      "authScheme": "x-goog-api-key",
+      "extraEnv": {},
+      "keyUrl": "https://aistudio.google.com/app/apikey",
+      "thinkingSupport": "unknown",
+      "defaultModels": {
+        "fable": "gemini-3.1-pro-preview",
+        "opus": "gemini-3.1-pro-preview",
+        "sonnet": "gemini-3.5-flash",
+        "haiku": "gemini-3.1-flash-lite"
+      }
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "apiFormat": "anthropic",
+      "authScheme": "x-api-key",
+      "extraEnv": {},
+      "keyUrl": "https://platform.deepseek.com/api_keys",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "deepseek-v4-pro",
+        "opus": "deepseek-v4-pro",
+        "sonnet": "deepseek-v4-flash",
+        "haiku": "deepseek-v4-flash"
+      }
+    },
+    {
+      "id": "zhipu",
+      "name": "GLM",
+      "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+      "apiFormat": "anthropic",
+      "authScheme": "x-api-key",
+      "extraEnv": {},
+      "keyUrl": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "glm-5.2",
+        "opus": "glm-5.2",
+        "sonnet": "glm-5.2",
+        "haiku": "glm-4.7"
+      }
+    },
+    {
+      "id": "doubao",
+      "name": "豆包",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/coding",
+      "apiFormat": "anthropic",
+      "authScheme": "bearer",
+      "extraEnv": {},
+      "keyUrl": "https://console.volcengine.com/ark",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "doubao-seed-2.0-pro",
+        "opus": "doubao-seed-2.0-code",
+        "sonnet": "doubao-seed-2.0-lite",
+        "haiku": "doubao-seed-2.0-lite"
+      }
+    },
+    {
+      "id": "qwen",
+      "name": "千问",
+      "baseUrl": "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+      "apiFormat": "anthropic",
+      "authScheme": "bearer",
+      "extraEnv": {},
+      "keyUrl": "https://bailian.console.aliyun.com/?apiKey=1",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "qwen3.7-plus",
+        "opus": "qwen3.7-plus",
+        "sonnet": "qwen3.6-plus",
+        "haiku": "qwen3.5-plus"
+      }
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "baseUrl": "https://api.minimaxi.com/anthropic",
+      "apiFormat": "anthropic",
+      "authScheme": "x-api-key",
+      "extraEnv": {},
+      "keyUrl": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "MiniMax-M3",
+        "opus": "MiniMax-M3",
+        "sonnet": "MiniMax-M2.7",
+        "haiku": "MiniMax-M2.5"
+      }
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi",
+      "baseUrl": "https://api.moonshot.cn/anthropic",
+      "apiFormat": "anthropic",
+      "authScheme": "bearer",
+      "extraEnv": {
+        "ENABLE_TOOL_SEARCH": "false",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "262144"
+      },
+      "keyUrl": "https://platform.moonshot.cn/console/api-keys",
+      "thinkingSupport": "full",
+      "defaultModels": {
+        "fable": "kimi-k3[1m]",
+        "opus": "kimi-k2.7-code",
+        "sonnet": "kimi-k2.6",
+        "haiku": "kimi-k2.6"
+      }
+    }
+  ]
+}

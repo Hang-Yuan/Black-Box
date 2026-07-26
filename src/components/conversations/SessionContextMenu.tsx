@@ -1,7 +1,12 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { SessionListItem } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
+import {
+  placeContextMenu,
+  placeSubmenu,
+  type FloatingMenuPosition,
+} from '../../lib/floating-menu-placement';
 
 /** A group option offered in the "add to group" section. */
 export interface GroupOption {
@@ -14,11 +19,17 @@ interface SessionContextMenuProps {
   y: number;
   session: SessionListItem;
   onRename: (session: SessionListItem) => void;
+  onFork?: (session: SessionListItem) => void;
+  forkDisabled?: boolean;
+  onCompare?: (session: SessionListItem) => void;
+  compareDisabled?: boolean;
   onRevealInFinder: (session: SessionListItem) => void;
   onExport: (session: SessionListItem) => void;
   onDelete: (session: SessionListItem) => void;
   onPin?: (session: SessionListItem) => void;
   isPinned?: boolean;
+  onArchive?: (session: SessionListItem) => void;
+  isArchived?: boolean;
   // --- Session grouping ---
   /** Create a new group in this session's workspace and drop it in. */
   onCreateGroupWithSession?: (session: SessionListItem) => void;
@@ -40,11 +51,17 @@ export function SessionContextMenu({
   y,
   session,
   onRename,
+  onFork,
+  forkDisabled,
+  onCompare,
+  compareDisabled,
   onRevealInFinder,
   onExport,
   onDelete,
   onPin,
   isPinned,
+  onArchive,
+  isArchived,
   onCreateGroupWithSession,
   availableGroups,
   onAddToGroup,
@@ -54,10 +71,94 @@ export function SessionContextMenu({
 }: SessionContextMenuProps) {
   const t = useT();
   const menuRef = useRef<HTMLDivElement>(null);
+  const groupTriggerRef = useRef<HTMLButtonElement>(null);
+  const groupSubmenuRef = useRef<HTMLDivElement>(null);
+  const groupMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState<FloatingMenuPosition>({
+    left: x,
+    top: y,
+    horizontal: 'right',
+    vertical: 'down',
+  });
+  const [groupMenuPosition, setGroupMenuPosition] = useState<FloatingMenuPosition>({
+    left: x + 184,
+    top: y,
+    horizontal: 'right',
+    vertical: 'down',
+  });
+
+  const positionMainMenu = useCallback(() => {
+    const menu = menuRef.current;
+    if (!menu) return;
+    const rect = menu.getBoundingClientRect();
+    setMenuPosition(placeContextMenu(
+      x,
+      y,
+      { width: rect.width, height: rect.height },
+      { width: window.innerWidth, height: window.innerHeight },
+    ));
+  }, [x, y]);
+
+  const positionGroupSubmenu = useCallback(() => {
+    const trigger = groupTriggerRef.current;
+    const submenu = groupSubmenuRef.current;
+    if (!trigger || !submenu) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const submenuRect = submenu.getBoundingClientRect();
+    setGroupMenuPosition(placeSubmenu(
+      {
+        left: triggerRect.left,
+        right: triggerRect.right,
+        top: triggerRect.top,
+        bottom: triggerRect.bottom,
+      },
+      { width: submenuRect.width, height: submenuRect.height },
+      { width: window.innerWidth, height: window.innerHeight },
+    ));
+  }, []);
+
+  const cancelGroupMenuClose = useCallback(() => {
+    if (groupMenuCloseTimerRef.current) {
+      clearTimeout(groupMenuCloseTimerRef.current);
+      groupMenuCloseTimerRef.current = null;
+    }
+  }, []);
+
+  const openGroupMenu = useCallback(() => {
+    cancelGroupMenuClose();
+    setGroupMenuOpen(true);
+  }, [cancelGroupMenuClose]);
+
+  const scheduleGroupMenuClose = useCallback(() => {
+    cancelGroupMenuClose();
+    groupMenuCloseTimerRef.current = setTimeout(() => {
+      groupMenuCloseTimerRef.current = null;
+      setGroupMenuOpen(false);
+    }, 120);
+  }, [cancelGroupMenuClose]);
+
+  useLayoutEffect(() => {
+    positionMainMenu();
+    window.addEventListener('resize', positionMainMenu);
+    return () => window.removeEventListener('resize', positionMainMenu);
+  }, [positionMainMenu]);
+
+  useLayoutEffect(() => {
+    if (!groupMenuOpen) return;
+    positionGroupSubmenu();
+    window.addEventListener('resize', positionGroupSubmenu);
+    return () => window.removeEventListener('resize', positionGroupSubmenu);
+  }, [groupMenuOpen, menuPosition, positionGroupSubmenu]);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        menuRef.current
+        && !menuRef.current.contains(target)
+        && !groupSubmenuRef.current?.contains(target)
+      ) {
         onClose();
       }
     };
@@ -72,17 +173,25 @@ export function SessionContextMenu({
     };
   }, [onClose]);
 
+  useEffect(() => () => cancelGroupMenuClose(), [cancelGroupMenuClose]);
+
   const showGrouping =
     !!onCreateGroupWithSession || !!onRemoveFromGroup || (availableGroups?.length ?? 0) > 0;
 
   return createPortal(
-    <div
-      ref={menuRef}
-      className="fixed z-[9999] min-w-[180px] py-1.5 rounded-lg
-        bg-bg-card border border-border-subtle shadow-xl animate-fade-in
-        max-h-[70vh] overflow-y-auto"
-      style={{ left: x, top: y }}
-    >
+    <>
+      <div
+        ref={menuRef}
+        className="fixed z-[9999] min-w-[180px] py-1.5 rounded-lg
+          bg-bg-card border border-border-subtle shadow-xl animate-fade-in
+          overflow-visible"
+        data-placement={menuPosition.vertical}
+        style={{
+          left: menuPosition.left,
+          top: menuPosition.top,
+          maxHeight: 'calc(100vh - 16px)',
+        }}
+      >
       <button onClick={() => { onClose(); onRename(session); }} className={itemCls}>
         <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
           stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
@@ -90,6 +199,48 @@ export function SessionContextMenu({
         </svg>
         {t('conv.rename')}
       </button>
+
+      {onFork && (
+        <button
+          data-testid={`fork-session-${session.id}`}
+          onClick={() => {
+            if (forkDisabled) return;
+            onClose();
+            onFork(session);
+          }}
+          disabled={forkDisabled}
+          title={forkDisabled ? t('conv.forkRunningBlocked') : t('conv.forkHint')}
+          className={`${itemCls} disabled:opacity-40 disabled:cursor-not-allowed`}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 2v3.5A3.5 3.5 0 006.5 9H13" />
+            <path d="M9.5 5.5L13 9l-3.5 3.5" />
+          </svg>
+          {t('conv.fork')}
+        </button>
+      )}
+
+      {onCompare && (
+        <button
+          data-testid={`compare-session-${session.id}`}
+          onClick={() => {
+            if (compareDisabled) return;
+            onClose();
+            onCompare(session);
+          }}
+          disabled={compareDisabled}
+          title={compareDisabled ? t('conv.compareDisabled') : t('conv.compareHint')}
+          className={`${itemCls} disabled:opacity-40 disabled:cursor-not-allowed`}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+            <rect x="1.5" y="2.5" width="5.5" height="11" rx="1.5" />
+            <rect x="9" y="2.5" width="5.5" height="11" rx="1.5" />
+          </svg>
+          {t('conv.compareSideBySide')}
+        </button>
+      )}
 
       {onPin && (
         <button onClick={() => { onClose(); onPin(session); }} className={itemCls}>
@@ -99,6 +250,26 @@ export function SessionContextMenu({
             <path d="M4.5 11.5L1.5 14.5" />
           </svg>
           {isPinned ? t('conv.unpin') : t('conv.pin')}
+        </button>
+      )}
+
+      {onArchive && (
+        <button onClick={() => { onClose(); onArchive(session); }} className={itemCls}>
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            {isArchived ? (
+              <>
+                <path d="M2.5 5.5h11v8h-11z" />
+                <path d="M1.5 2.5h13v3h-13zM8 11V7M5.8 9.2L8 7l2.2 2.2" />
+              </>
+            ) : (
+              <>
+                <path d="M2.5 5.5h11v8h-11z" />
+                <path d="M1.5 2.5h13v3h-13zM6 9h4" />
+              </>
+            )}
+          </svg>
+          {isArchived ? t('conv.unarchive') : t('conv.archive')}
         </button>
       )}
 
@@ -117,25 +288,39 @@ export function SessionContextMenu({
       )}
 
       {availableGroups && availableGroups.length > 0 && onAddToGroup && (
-        <>
-          <div className="px-3 pt-1.5 pb-0.5 text-[10px] text-text-tertiary select-none">
-            加入任务组
-          </div>
-          {availableGroups.map((g) => (
-            <button
-              key={g.id}
-              onClick={() => { onClose(); onAddToGroup(session, g.id); }}
-              className={itemCls}
-            >
-              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
-                stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
-                className="text-accent/70">
-                <rect x="3" y="3" width="10" height="10" rx="2.5" />
-              </svg>
-              <span className="truncate">{g.label}</span>
-            </button>
-          ))}
-        </>
+        <div
+          className="relative"
+          onMouseEnter={openGroupMenu}
+          onMouseLeave={scheduleGroupMenuClose}
+        >
+          <button
+            ref={groupTriggerRef}
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded={groupMenuOpen}
+            data-testid="session-group-submenu-trigger"
+            onFocus={openGroupMenu}
+            onClick={() => setGroupMenuOpen((open) => !open)}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowRight') {
+                event.preventDefault();
+                setGroupMenuOpen(true);
+              }
+            }}
+            className={itemCls}
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="10" height="10" rx="2.5" />
+            </svg>
+            <span className="flex-1 text-left">加入任务组</span>
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"
+              strokeLinejoin="round" className="text-text-tertiary">
+              <path d="M6 3.5L10.5 8 6 12.5" />
+            </svg>
+          </button>
+        </div>
       )}
 
       {currentGroupId && onRemoveFromGroup && (
@@ -183,7 +368,52 @@ export function SessionContextMenu({
         </svg>
         {t('conv.delete')}
       </button>
-    </div>,
+      </div>
+
+      {groupMenuOpen && availableGroups && onAddToGroup && (
+        <div
+          ref={groupSubmenuRef}
+          role="menu"
+          data-testid="session-group-submenu"
+          data-placement={`${groupMenuPosition.horizontal}-${groupMenuPosition.vertical}`}
+          onMouseEnter={cancelGroupMenuClose}
+          onMouseLeave={scheduleGroupMenuClose}
+          className="fixed z-[10000] min-w-[210px] max-w-[280px] py-1.5
+            rounded-lg bg-bg-card border border-border-subtle shadow-xl
+            overflow-y-auto overscroll-contain animate-fade-in"
+          style={{
+            left: groupMenuPosition.left,
+            top: groupMenuPosition.top,
+            maxHeight: 'calc(100vh - 16px)',
+          }}
+        >
+          <div className="px-3 py-1 text-[10px] font-medium text-text-tertiary
+            border-b border-border-subtle select-none">
+            选择任务组
+          </div>
+          {availableGroups.map((group) => (
+            <button
+              key={group.id}
+              role="menuitem"
+              onClick={() => {
+                onClose();
+                onAddToGroup(session, group.id);
+              }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs
+                text-text-primary hover:bg-bg-secondary transition-smooth"
+              title={group.label}
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+                stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
+                strokeLinejoin="round" className="text-text-tertiary flex-shrink-0">
+                <rect x="3" y="3" width="10" height="10" rx="2.5" />
+              </svg>
+              <span className="truncate">{group.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </>,
     document.body,
   );
 }

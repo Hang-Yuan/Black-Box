@@ -1,0 +1,235 @@
+.pet-avatar {
+  --pet-body: #202b42;
+  --pet-accent: #87b9ff;
+  --pet-phase: #e8d694;
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--pet-accent);
+  filter: drop-shadow(0 10px 14px rgba(0, 0, 0, 0.24));
+  transform-origin: center bottom;
+}
+
+.pet-avatar__canvas {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.pet-avatar--compact .pet-avatar__character {
+  transform: translate(9px, 9px) scale(0.85);
+  transform-origin: 60px 60px;
+}
+
+.pet-avatar--large .pet-avatar__character {
+  transform: translate(-6px, -6px) scale(1.1);
+  transform-origin: 60px 60px;
+}
+
+.pet-avatar__body,
+.pet-avatar__tail {
+  stroke: color-mix(in srgb, var(--pet-accent) 58%, #ffffff 10%);
+  stroke-width: 2.4;
+  stroke-linejoin: round;
+}
+
+.pet-avatar__tail {
+  opacity: 0.86;
+}
+
+.pet-avatar__detail,
+.pet-avatar__wing,
+.pet-avatar__gill {
+  fill: none;
+  stroke: var(--pet-accent);
+  stroke-width: 3.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.78;
+}
+
+.pet-avatar__wing {
+  stroke-width: 4.5;
+}
+
+.pet-avatar__gill {
+  stroke-width: 5;
+}
+
+.pet-avatar__ear-inner,
+.pet-avatar__muzzle,
+.pet-avatar__eye-disc,
+.pet-avatar__panel,
+.pet-avatar__mask {
+  fill: color-mix(in srgb, var(--pet-accent) 30%, transparent);
+}
+
+.pet-avatar__mask {
+  opacity: 0.72;
+}
+
+.pet-avatar__shine {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.58);
+  stroke-width: 5;
+  stroke-linecap: round;
+  opacity: 0.7;
+}
+
+circle.pet-avatar__shine {
+  fill: rgba(255, 255, 255, 0.24);
+  stroke: none;
+}
+
+.pet-avatar__antenna,
+.pet-avatar__beak {
+  fill: var(--pet-accent);
+}
+
+.pet-avatar__hourglass .pet-avatar__line {
+  fill: none;
+  stroke: var(--pet-accent);
+  stroke-width: 3.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.72;
+}
+
+.pet-avatar__hourglass .pet-avatar__line--strong {
+  stroke-width: 4.2;
+  opacity: 1;
+}
+
+.pet-avatar__grain {
+  fill: var(--pet-accent);
+  transform-origin: 60px 58px;
+}
+
+.pet-avatar__eyes,
+.pet-avatar__mouth {
+  fill: color-mix(in srgb, var(--pet-accent) 88%, #111827 55%);
+  stroke: color-mix(in srgb, var(--pet-accent) 88%, #111827 55%);
+  stroke-width: 3.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pet-avatar__eyes rect {
+  fill: color-mix(in srgb, var(--pet-accent) 70%, #081018 62%);
+  stroke: var(--pet-accent);
+  stroke-width: 2;
+}
+
+.pet-avatar__mouth circle {
+  stroke: none;
+}
+
+.pet-avatar__accessory-fill {
+  fill: var(--pet-accent);
+  stroke: color-mix(in srgb, var(--pet-accent) 65%, #ffffff 20%);
+  stroke-width: 1.8;
+  stroke-linejoin: round;
+}
+
+.pet-avatar__accessory-line {
+  fill: none;
+  stroke: var(--pet-accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pet-avatar__accessory-line .pet-avatar__accessory-fill {
+  fill: var(--pet-accent);
+}
+
+.pet-avatar__orbit {
+  fill: var(--pet-accent);
+  opacity: 0;
+  transform-origin: 60px 60px;
+}
+
+.pet-avatar--orbit .pet-avatar__orbit {
+  opacity: 0.88;
+  animation: pet-avatar-orbit 4.6s linear infinite;
+}
+
+.pet-avatar__status {
+  fill: var(--pet-phase);
+  stroke: rgba(8, 12, 18, 0.9);
+  stroke-width: 3.5;
+  filter: drop-shadow(0 0 6px var(--pet-phase));
+}
+
+.pet-avatar--float .pet-avatar__canvas {
+  animation: pet-avatar-float 3.4s ease-in-out infinite;
+}
+
+.pet-avatar--bounce .pet-avatar__canvas {
+  animation: pet-avatar-bounce 2.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.pet-avatar--pulse .pet-avatar__character {
+  animation: pet-avatar-pulse 2.5s ease-in-out infinite;
+  transform-origin: 60px 72px;
+}
+
+.pet-avatar[data-phase='thinking'] .pet-avatar__grain,
+.pet-avatar[data-phase='tool'] .pet-avatar__status,
+.pet-avatar[data-phase='running'] .pet-avatar__status {
+  animation: pet-avatar-status-pulse 1.15s ease-in-out infinite;
+}
+
+.pet-avatar[data-phase='waiting'] .pet-avatar__canvas {
+  animation-duration: 1.35s;
+}
+
+.pet-avatar[data-phase='error'] .pet-avatar__canvas {
+  animation: pet-avatar-error 0.48s ease-in-out 2;
+}
+
+.pet-avatar--still *,
+.pet-avatar--still *::before,
+.pet-avatar--still *::after {
+  animation: none !important;
+}
+
+@keyframes pet-avatar-float {
+  0%, 100% { transform: translateY(2px) rotate(-0.7deg); }
+  50% { transform: translateY(-4px) rotate(0.7deg); }
+}
+
+@keyframes pet-avatar-bounce {
+  0%, 100% { transform: translateY(2px) scaleY(0.98); }
+  45% { transform: translateY(-6px) scaleY(1.02); }
+  55% { transform: translateY(-6px) scaleY(1.02); }
+}
+
+@keyframes pet-avatar-pulse {
+  0%, 100% { transform: scale(0.985); }
+  50% { transform: scale(1.035); }
+}
+
+@keyframes pet-avatar-orbit {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pet-avatar-status-pulse {
+  0%, 100% { opacity: 0.58; transform: scale(0.75); transform-origin: 102px 101px; }
+  50% { opacity: 1; transform: scale(1.18); transform-origin: 102px 101px; }
+}
+
+@keyframes pet-avatar-error {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px) rotate(-1deg); }
+  75% { transform: translateX(4px) rotate(1deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-avatar *,
+  .pet-avatar *::before,
+  .pet-avatar *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

@@ -7,7 +7,7 @@
 //! a two-tier allowlist:
 //!
 //! 1. **Fixed roots** — paths that are always allowed (project cwd[s],
-//!    `~/.claude.json`, `~/.claude/`, `~/.blackbox/`, system temp dir).
+//!    Black Box's private Claude root, `~/.blackbox/`, system temp dir).
 //! 2. **Session grants** — paths that the user has explicitly authorized at
 //!    runtime (via the native file dialog, OS drag-drop, or a Markdown
 //!    "authorize" button). Grants are scoped per stdin/tab id and cleared
@@ -46,13 +46,14 @@ impl PathAccessManager {
         let mut roots: Vec<PathBuf> = Vec::new();
 
         if let Some(home) = dirs::home_dir() {
-            push_canonical(&mut roots, home.join(".claude.json"));
-            push_canonical(&mut roots, home.join(".claude"));
             push_canonical(&mut roots, home.join(".blackbox"));
             push_canonical(
                 &mut roots,
                 home.join("Library/Application Support/BLACKBOX"),
             );
+        }
+        if let Ok(private_claude) = crate::client_runtime::claude_config_dir() {
+            push_canonical(&mut roots, private_claude);
         }
         // System temp dir — save_temp_file writes here when cwd is missing.
         push_canonical(&mut roots, std::env::temp_dir());

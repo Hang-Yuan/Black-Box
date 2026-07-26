@@ -1,6 +1,6 @@
 /**
- * useRemoteSession — stub for BLACKBOX (remote sessions not supported).
- * Her has the full implementation; this is a no-op to satisfy imports.
+ * useRemoteSession — Black Box stub (remote sessions are not supported).
+ * This remains a no-op so call sites can share the same hook boundary.
  */
 export function useRemoteSession() {
   // No-op: BLACKBOX does not support remote sessions (Telegram, Feishu, etc.)

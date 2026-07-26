@@ -3,9 +3,15 @@ import { useProviderStore, type ApiProvider, type ModelMapping } from '../../sto
 import { bridge, type ConnectionTestResult } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { PROVIDER_PRESETS } from '../../lib/provider-presets';
+import {
+  PROVIDER_PRESETS,
+  inferProviderAuthScheme,
+  type ProviderApiFormat,
+} from '../../lib/provider-presets';
+import { getProviderConnectionTestModel } from '../../lib/api-provider';
 
-const MODEL_TIERS: { tier: 'opus' | 'sonnet' | 'haiku'; labelKey: string; placeholderKey: string }[] = [
+const MODEL_TIERS: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; labelKey: string; placeholderKey: string }[] = [
+  { tier: 'fable', labelKey: 'provider.fableModel', placeholderKey: 'provider.fablePlaceholder' },
   { tier: 'opus', labelKey: 'provider.opusModel', placeholderKey: 'provider.opusPlaceholder' },
   { tier: 'sonnet', labelKey: 'provider.sonnetModel', placeholderKey: 'provider.sonnetPlaceholder' },
   { tier: 'haiku', labelKey: 'provider.haikuModel', placeholderKey: 'provider.haikuPlaceholder' },
@@ -48,6 +54,8 @@ interface ProviderFormProps {
 export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStatusChange }: ProviderFormProps) {
   const t = useT();
   const updateProvider = useProviderStore((s) => s.updateProvider);
+  const flushSave = useProviderStore((s) => s.flushSave);
+  const clearProviderCredential = useProviderStore((s) => s.clearProviderCredential);
 
   const [name, setName] = useState(provider.name);
   const [baseUrl, setBaseUrl] = useState(provider.baseUrl);
@@ -56,42 +64,52 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   const [showKey, setShowKey] = useState(false);
   const [proxyUrl, setProxyUrl] = useState(provider.proxyUrl || '');
   const [mappings, setMappings] = useState<ModelMapping[]>(provider.modelMappings);
-  const [extraEnv, setExtraEnv] = useState<Record<string, string>>(provider.extra_env || {});
+  const [extraEnv, setExtraEnv] = useState<Record<string, string>>(provider.extraEnv || {});
   const [testStatus, _setTestStatus] = useState<TestStatus>('idle');
   const [_testError, setTestError] = useState('');
   const [testTimeMs, setTestTimeMs] = useState<number | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [clearKeyConfirm, setClearKeyConfirm] = useState(false);
+  const [credentialError, setCredentialError] = useState('');
 
   const setTestStatus = useCallback((status: TestStatus) => {
     _setTestStatus(status);
     onTestStatusChange?.(status);
   }, [onTestStatusChange]);
 
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
   useEffect(() => {
-    return () => clearTimeout(saveTimerRef.current);
-  }, []);
+    return () => {
+      void flushSave().catch((error) => {
+        console.error('[ProviderForm] failed to flush provider changes:', error);
+      });
+    };
+  }, [flushSave]);
 
   const autoSave = useCallback((patch: Partial<ApiProvider>) => {
-    clearTimeout(saveTimerRef.current);
     // Reset test status on any field change
     setTestStatus('idle');
     setTestError('');
     setTestTimeMs(null);
-    saveTimerRef.current = setTimeout(() => {
-      updateProvider(provider.id, patch);
-    }, 500);
+    // Update the in-memory provider immediately so consecutive edits to
+    // different fields cannot cancel each other. providerStore coalesces the
+    // disk write, and the unmount cleanup above flushes it before the form is
+    // closed or another provider is opened.
+    updateProvider(provider.id, patch);
   }, [provider.id, updateProvider]);
 
   const handleNameChange = (v: string) => { setName(v); autoSave({ name: v }); };
   const handleBaseUrlChange = (v: string) => { setBaseUrl(v); autoSave({ baseUrl: v }); };
   const handleApiKeyChange = (v: string) => { setApiKey(v); autoSave({ apiKey: v || undefined }); };
   const handleProxyUrlChange = (v: string) => { setProxyUrl(v); autoSave({ proxyUrl: v || undefined }); };
-  // API format selector hidden from UI — kept for backward compat
-  const _handleApiFormatChange = (v: 'anthropic' | 'openai') => { setApiFormat(v); autoSave({ apiFormat: v }); }; void _handleApiFormatChange;
+  const handleApiFormatChange = (v: ProviderApiFormat) => {
+    setApiFormat(v);
+    autoSave({
+      apiFormat: v,
+      authScheme: inferProviderAuthScheme({ apiFormat: v, preset: provider.preset }),
+    });
+  };
 
-  const FIXED_TIERS = new Set(['opus', 'sonnet', 'haiku']);
+  const FIXED_TIERS = new Set(['fable', 'opus', 'sonnet', 'haiku']);
 
   const getMapping = (tier: string): string => {
     return mappings.find((m) => m.tier === tier)?.providerModel || '';
@@ -132,14 +150,14 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   const handleExtraEnvChange = (key: string, value: string) => {
     const updated = { ...extraEnv, [key]: value };
     setExtraEnv(updated);
-    autoSave({ extra_env: updated });
+    autoSave({ extraEnv: updated });
   };
 
   const handleExtraEnvRemove = (key: string) => {
     const updated = { ...extraEnv };
     delete updated[key];
     setExtraEnv(updated);
-    autoSave({ extra_env: updated });
+    autoSave({ extraEnv: updated });
   };
 
   const handleExtraEnvAdd = () => {
@@ -153,19 +171,27 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
     setTestTimeMs(null);
     setTestResult(null);
     try {
-      const testModel = mappings.find((m) => m.providerModel)?.providerModel || '';
+      const testModel = getProviderConnectionTestModel(mappings);
       if (!testModel) {
         setTestStatus('failed');
         setTestError(t('provider.testNoModel'));
         return;
       }
-      if (!apiKey) {
+      if (!apiKey && (!provider.credentialState || provider.credentialState === 'missing')) {
         setTestStatus('failed');
         setTestError(t('provider.testNoKey'));
         return;
       }
       const start = Date.now();
-      const result = await bridge.testProviderConnection(baseUrl, apiFormat, apiKey, testModel, proxyUrl || undefined);
+      const result = await bridge.testProviderConnection(
+        baseUrl,
+        apiFormat,
+        apiKey || undefined,
+        testModel,
+        proxyUrl || undefined,
+        provider.id,
+        provider.authScheme,
+      );
       const elapsed = Date.now() - start;
       setTestResult(result);
       setTestTimeMs(elapsed);
@@ -183,7 +209,7 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
       setTestStatus('failed');
       setTestError(String(e));
     }
-  }, [baseUrl, apiFormat, apiKey, mappings, t]);
+  }, [baseUrl, apiFormat, apiKey, mappings, provider.authScheme, provider.credentialState, provider.id, proxyUrl, t]);
 
   // Auto-trigger test when opened via card test button
   const autoTestDone = useRef(false);
@@ -299,8 +325,22 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
           placeholder={t('provider.baseUrlPlaceholder')} />
       </div>
 
-      {/* API Format — hidden from UI, defaults to anthropic.
-          Existing providers with 'openai' format still work via stored config. */}
+      {/* API protocol */}
+      <div>
+        <label className="text-xs text-text-muted mb-1 block">{t('provider.format')}</label>
+        <select
+          className={INPUT_CLASS}
+          value={apiFormat}
+          onChange={(event) => handleApiFormatChange(event.target.value as ProviderApiFormat)}
+        >
+          <option value="anthropic">{t('provider.formatAnthropic')}</option>
+          <option value="openai">{t('provider.formatOpenai')}</option>
+          <option value="gemini">{t('provider.formatGemini')}</option>
+        </select>
+        <p className="mt-1 text-[11px] leading-4 text-text-tertiary">
+          {t('provider.formatHint')}
+        </p>
+      </div>
 
       {/* API Key */}
       <div>
@@ -322,7 +362,7 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
             type={showKey ? 'text' : 'password'}
             value={apiKey}
             onChange={(e) => handleApiKeyChange(e.target.value)}
-            placeholder={t('provider.apiKeyPlaceholder')}
+            placeholder={provider.credentialHint || t('provider.apiKeyPlaceholder')}
           />
           <button onClick={() => setShowKey(!showKey)}
             className="px-2 py-1.5 rounded-md border border-border-subtle
@@ -330,6 +370,43 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
             {showKey ? <EyeClosedIcon /> : <EyeOpenIcon />}
           </button>
         </div>
+        {provider.credentialState === 'local_file' && (
+          <p className="mt-1 text-xs text-success">{t('provider.keyStoredLocally')}</p>
+        )}
+        {provider.credentialState && provider.credentialState !== 'missing' && (
+          <div className="mt-1.5 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={async () => {
+                if (!clearKeyConfirm) {
+                  setClearKeyConfirm(true);
+                  return;
+                }
+                setCredentialError('');
+                try {
+                  await clearProviderCredential(provider.id);
+                  setApiKey('');
+                  setClearKeyConfirm(false);
+                } catch (error) {
+                  setCredentialError(String(error));
+                }
+              }}
+              className="text-xs text-error/80 hover:text-error"
+            >
+              {clearKeyConfirm ? t('provider.confirmRemoveKey') : t('provider.removeStoredKey')}
+            </button>
+            {clearKeyConfirm && (
+              <button
+                type="button"
+                onClick={() => setClearKeyConfirm(false)}
+                className="text-xs text-text-tertiary hover:text-text-primary"
+              >
+                {t('common.cancel')}
+              </button>
+            )}
+          </div>
+        )}
+        {credentialError && <p className="mt-1 text-xs text-error">{credentialError}</p>}
       </div>
 
       {/* Proxy URL */}
@@ -346,9 +423,11 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
         <label className="text-xs text-text-muted mb-1 block">{t('provider.modelMappings')}</label>
         <p className="text-xs text-text-tertiary mb-1.5">{t('provider.modelMappingsHint')}</p>
         <div className="space-y-1.5">
-          {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }) => (
+          {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }, index) => (
             <div key={tier} className="flex items-center gap-2">
-              <span className="text-xs text-text-muted w-14 shrink-0">{t(labelKey)}</span>
+              <span className="text-xs text-text-muted w-14 shrink-0">
+                {provider.preset === 'anthropic' ? t(labelKey) : `${t('provider.modelChoice')} ${index + 1}`}
+              </span>
               <input className={INPUT_CLASS}
                 value={getMapping(tier)}
                 onChange={(e) => updateMapping(tier, e.target.value)}
@@ -395,7 +474,7 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
                   delete newEnv[key];
                   newEnv[e.target.value] = value;
                   setExtraEnv(newEnv);
-                  autoSave({ extra_env: newEnv });
+                  autoSave({ extraEnv: newEnv });
                 }}
                 placeholder="KEY" />
               <span className="text-xs text-text-tertiary">=</span>

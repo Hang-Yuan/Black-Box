@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "blackbox://experimental/petpack-v1",
+  "title": "Black Box PetPack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "status",
+    "packId",
+    "version",
+    "displayName",
+    "species",
+    "renderer",
+    "license",
+    "assetRootSha256",
+    "performance",
+    "states"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "status": {
+      "enum": ["prototype_asset_validated", "ship_candidate", "shippable"]
+    },
+    "packId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "description": { "type": "string", "maxLength": 500 },
+    "species": {
+      "enum": ["cat", "dog", "human_stylized", "creature", "custom"]
+    },
+    "renderer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "pixelSize", "anchor", "hitRegions"],
+      "properties": {
+        "type": { "enum": ["sprite_webp", "png_sequence", "rive", "vrm"] },
+        "pixelSize": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height"],
+          "properties": {
+            "width": { "type": "integer", "minimum": 32, "maximum": 2048 },
+            "height": { "type": "integer", "minimum": 32, "maximum": 2048 }
+          }
+        },
+        "anchor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y"],
+          "properties": {
+            "x": { "type": "number", "minimum": 0, "maximum": 1 },
+            "y": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "hitRegions": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "shape", "action", "bounds"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "shape": { "enum": ["rect", "ellipse", "alpha"] },
+              "action": { "enum": ["drag", "open_app", "pet", "menu", "ignore"] },
+              "bounds": {
+                "type": "array",
+                "prefixItems": [
+                  { "type": "number", "minimum": 0, "maximum": 1 },
+                  { "type": "number", "minimum": 0, "maximum": 1 },
+                  { "type": "number", "minimum": 0, "maximum": 1 },
+                  { "type": "number", "minimum": 0, "maximum": 1 }
+                ],
+                "minItems": 4,
+                "maxItems": 4
+              }
+            }
+          }
+        }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assetOwner",
+        "source",
+        "provenance",
+        "receiptRelativePath",
+        "receiptSha256",
+        "currentUse",
+        "commercialUse",
+        "redistribution",
+        "modification",
+        "attributionRequired",
+        "legalReviewRequired",
+        "licenseTextSha256"
+      ],
+      "properties": {
+        "assetOwner": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "provenance": {
+          "enum": [
+            "original_generated",
+            "original_commissioned",
+            "user_owned",
+            "licensed_third_party"
+          ]
+        },
+        "receiptRelativePath": { "$ref": "#/$defs/relativePath" },
+        "receiptSha256": { "$ref": "#/$defs/sha256" },
+        "currentUse": {
+          "enum": ["internal_prototype", "redistributable_product_asset"]
+        },
+        "commercialUse": { "type": "boolean" },
+        "redistribution": { "type": "boolean" },
+        "modification": { "type": "boolean" },
+        "attributionRequired": { "type": "boolean" },
+        "attributionText": { "type": "string" },
+        "likenessReleaseReference": { "type": "string" },
+        "legalReviewRequired": { "type": "boolean" },
+        "licenseTextSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "assetRootSha256": { "$ref": "#/$defs/sha256" },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxResidentMiB", "maxGpuMiB", "targetFps", "maxAssetBytes"],
+      "properties": {
+        "maxResidentMiB": { "type": "integer", "minimum": 1, "maximum": 512 },
+        "maxGpuMiB": { "type": "integer", "minimum": 0, "maximum": 1024 },
+        "targetFps": { "enum": [12, 15, 24, 30, 60] },
+        "maxAssetBytes": { "type": "integer", "minimum": 1024, "maximum": 104857600 }
+      }
+    },
+    "states": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["idle", "thinking", "tool", "running", "waiting", "error"],
+      "properties": {
+        "idle": { "$ref": "#/$defs/state" },
+        "thinking": { "$ref": "#/$defs/state" },
+        "tool": { "$ref": "#/$defs/state" },
+        "running": { "$ref": "#/$defs/state" },
+        "waiting": { "$ref": "#/$defs/state" },
+        "error": { "$ref": "#/$defs/state" }
+      }
+    },
+    "customization": { "type": "array" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset",
+        "assetSha256",
+        "assetByteSize",
+        "mimeType",
+        "loop",
+        "durationMs",
+        "fallback"
+      ],
+      "properties": {
+        "asset": { "$ref": "#/$defs/relativePath" },
+        "assetSha256": { "$ref": "#/$defs/sha256" },
+        "assetByteSize": { "type": "integer", "minimum": 1, "maximum": 104857600 },
+        "mimeType": {
+          "enum": ["image/webp", "image/png", "application/rive", "model/gltf-binary"]
+        },
+        "loop": { "type": "boolean" },
+        "durationMs": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "fallback": {
+          "enum": ["idle", "thinking", "tool", "running", "waiting", "error"]
+        },
+        "audio": { "$ref": "#/$defs/relativePath" },
+        "reducedMotion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["asset", "assetSha256", "assetByteSize", "mimeType"],
+          "properties": {
+            "asset": { "$ref": "#/$defs/relativePath" },
+            "assetSha256": { "$ref": "#/$defs/sha256" },
+            "assetByteSize": { "type": "integer", "minimum": 1, "maximum": 104857600 },
+            "mimeType": { "enum": ["image/webp", "image/png"] }
+          }
+        }
+      }
+    }
+  }
+}

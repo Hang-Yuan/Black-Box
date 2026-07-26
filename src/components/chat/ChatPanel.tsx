@@ -1,11 +1,11 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
-import { useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
+import { useChatStore, useActiveTab, isSessionBusy, type ChatMessage } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
 import { ToolGroup } from './ToolGroup';
 import { InputBar } from './InputBar';
 import { ExportMenu } from '../conversations/ExportMenu';
-import { useSettingsStore, MODEL_OPTIONS, mapSessionModeToPermissionMode } from '../../stores/settingsStore';
+import { useSettingsStore, mapSessionModeToPermissionMode } from '../../stores/settingsStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useAgentStore } from '../../stores/agentStore';
@@ -13,7 +13,8 @@ import { AgentPanel } from '../agents/AgentPanel';
 // bridge import removed — spawn goes through sessionLifecycle module
 import { open } from '@tauri-apps/plugin-dialog';
 import { useT } from '../../lib/i18n';
-import { envFingerprint, is1MModel as isOneMillionModel, resolveModelForProvider, spawnConfigHash } from '../../lib/api-provider';
+import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
+import { flushAndCaptureSpawnConfiguration, getResolvedModelDisplayName, is1MModel as isOneMillionModel, resolveModelOrError } from '../../lib/api-provider';
 import { useProviderStore } from '../../stores/providerStore';
 import { spawnSession } from '../../lib/sessionLifecycle';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
@@ -23,6 +24,21 @@ import { useFindInPage } from '../../hooks/useFindInPage';
 import { FindBar } from './FindBar';
 import { formatElapsedCompact } from '../../lib/elapsed-time';
 import { formatRetryDelaySeconds, isRateLimitRetry, type ApiRetryStatus } from '../../lib/api-retry';
+import { TaskLocationControl } from './TaskLocationControl';
+import { GoalControl } from './GoalControl';
+import { ModeSelector } from './ModeSelector';
+import { LoopControl } from './LoopControl';
+import { WorkflowControl } from './WorkflowControl';
+import { ProviderQuickSelector } from './ProviderQuickSelector';
+import { usePlanStore } from '../../stores/planStore';
+import { useForkStore } from '../../stores/forkStore';
+import { getPlanProgress, type PersistentPlanItem } from '../../lib/plan-contract';
+import { adoptCliSessionIdentity } from '../../lib/session-identity';
+import { bridge } from '../../lib/tauri-bridge';
+import { parseSessionMessages } from '../../lib/session-loader';
+import { useComposerModeStore } from '../../stores/composerModeStore';
+import type { TaskComposerMode } from '../../lib/composer-mode';
+import { useCommandStore } from '../../stores/commandStore';
 
 /** Shared plan panel toggle — used by ChatPanel (panel) and InputBar (button) */
 export const usePlanPanelStore = create<{
@@ -35,12 +51,218 @@ export const usePlanPanelStore = create<{
   close: () => set({ open: false }),
 }));
 
+function ForkBanner() {
+  const t = useT();
+  const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
+  const record = useForkStore((state) => selectedSessionId ? state.forks[selectedSessionId] : undefined);
+  const parentSession = useSessionStore((state) =>
+    record ? state.sessions.find((session) => session.id === record.parentThreadId) : undefined,
+  );
+  const customPreviews = useSessionStore((state) => state.customPreviews);
+  if (!record) return null;
+
+  const parentName = customPreviews[record.parentThreadId]
+    || parentSession?.preview
+    || record.parentTitle
+    || record.parentThreadId.slice(0, 8);
+  const lineageLabel = record.forkPoint === 'checkpoint' && record.checkpointTurnIndex
+    ? t('conv.forkedBeforeTurn')
+      .replace('{name}', parentName)
+      .replace('{n}', String(record.checkpointTurnIndex))
+    : t('conv.forkedFrom').replace('{name}', parentName);
+
+  return (
+    <div
+      data-testid="fork-banner"
+      data-parent-thread-id={record.parentThreadId}
+      className="flex items-center gap-2 border-b border-border-subtle bg-accent/[0.04]
+        px-5 py-1.5 text-[10px] text-text-muted"
+    >
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+        className="flex-shrink-0 text-accent">
+        <path d="M3 2v3.5A3.5 3.5 0 006.5 9H13" />
+        <path d="M9.5 5.5L13 9l-3.5 3.5" />
+      </svg>
+      <span className="min-w-0 flex-1 truncate" title={parentName}>
+        {lineageLabel}
+      </span>
+      <button
+        type="button"
+        data-testid="compare-fork-parent"
+        disabled={!parentSession}
+        onClick={() => {
+          if (!parentSession) return;
+          const settings = useSettingsStore.getState();
+          if (settings.secondaryPanelOpen) settings.toggleSecondaryPanel();
+          usePlanPanelStore.getState().close();
+          useForkStore.getState().openComparison(record.parentThreadId);
+        }}
+        className="rounded-md px-2 py-0.5 text-accent hover:bg-accent/10
+          disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {t('conv.compareSideBySide')}
+      </button>
+      <button
+        type="button"
+        data-testid="open-fork-parent"
+        disabled={!parentSession}
+        onClick={() => window.dispatchEvent(new CustomEvent('blackbox:open-session', {
+          detail: { sessionId: record.parentThreadId },
+        }))}
+        className="rounded-md px-2 py-0.5 text-accent hover:bg-accent/10
+          disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {t('conv.openParent')}
+      </button>
+    </div>
+  );
+}
+
+function ConversationComparePane() {
+  const t = useT();
+  const comparisonThreadId = useForkStore((state) => state.comparisonThreadId);
+  const closeComparison = useForkStore((state) => state.closeComparison);
+  const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
+  const session = useSessionStore((state) =>
+    comparisonThreadId
+      ? state.sessions.find((item) => item.id === comparisonThreadId)
+      : undefined,
+  );
+  const customPreviews = useSessionStore((state) => state.customPreviews);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [width, setWidth] = useState(460);
+  const widthRef = useRef(width);
+  widthRef.current = width;
+
+  useEffect(() => {
+    if (comparisonThreadId && comparisonThreadId === selectedSessionId) {
+      closeComparison();
+    }
+  }, [comparisonThreadId, selectedSessionId, closeComparison]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMessages([]);
+    setError('');
+    if (!comparisonThreadId || !session?.path) return;
+    setLoading(true);
+    bridge.loadSession(session.path)
+      .then((rawMessages) => {
+        if (cancelled) return;
+        setMessages(parseSessionMessages(rawMessages).messages);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [comparisonThreadId, session?.path]);
+
+  const startResize = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = widthRef.current;
+    const onMove = (moveEvent: MouseEvent) => {
+      const next = startWidth + (startX - moveEvent.clientX);
+      setWidth(Math.max(320, Math.min(760, next)));
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
+
+  if (!comparisonThreadId || comparisonThreadId === selectedSessionId) return null;
+
+  const title = session
+    ? customPreviews[session.id] || session.preview || session.id.slice(0, 8)
+    : comparisonThreadId.slice(0, 8);
+
+  return (
+    <aside
+      data-testid="conversation-compare-pane"
+      data-comparison-thread-id={comparisonThreadId}
+      className="relative flex min-w-[320px] max-w-[65%] flex-col border-l
+        border-border-subtle bg-bg-chat"
+      style={{ width }}
+    >
+      <div
+        data-testid="conversation-compare-resize"
+        onMouseDown={startResize}
+        className="absolute bottom-0 left-0 top-0 z-10 w-1 cursor-col-resize
+          hover:bg-accent/30 active:bg-accent/50"
+      />
+      <div className="flex h-11 flex-shrink-0 items-center gap-2 border-b
+        border-border-subtle px-3">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-medium text-text-primary" title={title}>{title}</div>
+          <div className="text-[9px] text-text-tertiary">{t('conv.readOnlyComparison')}</div>
+        </div>
+        {session && (
+          <button
+            type="button"
+            data-testid="open-comparison-session"
+            onClick={() => window.dispatchEvent(new CustomEvent('blackbox:open-session', {
+              detail: { sessionId: session.id },
+            }))}
+            className="rounded-md px-2 py-1 text-[10px] text-accent hover:bg-accent/10"
+          >
+            {t('conv.openComparison')}
+          </button>
+        )}
+        <button
+          type="button"
+          data-testid="close-conversation-compare"
+          onClick={closeComparison}
+          aria-label={t('common.close')}
+          className="rounded-md p-1 text-text-tertiary hover:bg-bg-tertiary hover:text-text-primary"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+            stroke="currentColor" strokeWidth="1.5">
+            <path d="M3 3l6 6M9 3l-6 6" />
+          </svg>
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto px-4 py-4">
+        {loading ? (
+          <div className="py-8 text-center text-xs text-text-tertiary">{t('common.loading')}</div>
+        ) : error ? (
+          <div className="rounded-lg border border-error/20 bg-error/5 p-3 text-xs text-error">
+            {t('conv.loadFailed')}: {error}
+          </div>
+        ) : messages.length === 0 ? (
+          <div className="py-8 text-center text-xs text-text-tertiary">{t('conv.empty')}</div>
+        ) : (
+          <div className="mx-auto max-w-3xl space-y-4">
+            {messages.map((message) => (
+              <MessageBubble key={message.id} message={message} />
+            ))}
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
 /** Resizable right-side plan panel */
 function PlanPanel({ planMessages, onClose }: {
   planMessages: ChatMessage[];
   onClose: () => void;
 }) {
   const t = useT();
+  const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
+  const plan = usePlanStore((s) => selectedSessionId ? s.plans[selectedSessionId] : undefined);
   const [width, setWidth] = useState(420);
   const dragging = useRef(false);
   const startX = useRef(0);
@@ -97,25 +319,51 @@ function PlanPanel({ planMessages, onClose }: {
             <path d="M2 3.5h10M2 7h8M2 10.5h5" />
           </svg>
           <span className="text-xs font-semibold text-text-primary">
-            {t('msg.planTitle')}
+            {t('plan.title')}
           </span>
+          {plan && (() => {
+            const progress = getPlanProgress(plan.items);
+            return (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent font-medium">
+                {progress.completed}/{progress.total}
+              </span>
+            );
+          })()}
         </div>
-        <button
-          onClick={onClose}
-          className="p-1 rounded-md hover:bg-bg-tertiary text-text-tertiary
-            transition-smooth cursor-pointer"
-        >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
-            stroke="currentColor" strokeWidth="1.5">
-            <path d="M3 3l6 6M9 3l-6 6" />
-          </svg>
-        </button>
+        <div className="flex items-center gap-1">
+          {plan && selectedSessionId && (
+            <button
+              data-testid="clear-persistent-plan"
+              onClick={() => {
+                if (window.confirm(t('plan.clearConfirm'))) {
+                  usePlanStore.getState().clearPlan(selectedSessionId);
+                }
+              }}
+              className="px-2 py-1 rounded-md text-[10px] text-text-tertiary
+                hover:bg-bg-tertiary hover:text-text-primary transition-smooth cursor-pointer"
+            >
+              {t('plan.clear')}
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            className="p-1 rounded-md hover:bg-bg-tertiary text-text-tertiary
+              transition-smooth cursor-pointer"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+              stroke="currentColor" strokeWidth="1.5">
+              <path d="M3 3l6 6M9 3l-6 6" />
+            </svg>
+          </button>
+        </div>
       </div>
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
-        {planMessages.length === 0 ? (
+        {plan ? (
+          <PersistentPlanView items={plan.items} explanation={plan.explanation} updatedAt={plan.updatedAt} />
+        ) : planMessages.length === 0 ? (
           <p className="text-xs text-text-muted text-center py-4">
-            {t('msg.noPlan')}
+            {t('plan.none')}
           </p>
         ) : (
           planMessages.map((planMsg) => (
@@ -129,12 +377,75 @@ function PlanPanel({ planMessages, onClose }: {
   );
 }
 
-/** Map raw model ID to friendly display name */
-function getModelDisplayName(modelId: string): string {
-  const option = MODEL_OPTIONS.find((m) => modelId.includes(m.id));
-  return option?.short || modelId;
-}
+function PersistentPlanView({ items, explanation, updatedAt }: {
+  items: PersistentPlanItem[];
+  explanation?: string;
+  updatedAt: number;
+}) {
+  const t = useT();
+  const progress = getPlanProgress(items);
+  const percent = progress.total ? Math.round((progress.completed / progress.total) * 100) : 0;
 
+  return (
+    <div data-testid="persistent-plan" className="space-y-3">
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between text-[10px] text-text-tertiary">
+          <span>{t('plan.progress')}</span>
+          <span>{progress.completed}/{progress.total} · {percent}%</span>
+        </div>
+        <div className="h-1.5 rounded-full bg-bg-tertiary overflow-hidden">
+          <div className="h-full rounded-full bg-accent transition-all duration-300" style={{ width: `${percent}%` }} />
+        </div>
+      </div>
+
+      {explanation && (
+        <p className="text-xs leading-relaxed text-text-muted border-l-2 border-accent/40 pl-2">
+          {explanation}
+        </p>
+      )}
+
+      <div className="space-y-1.5">
+        {items.map((item, index) => (
+          <div
+            key={`${index}-${item.step}`}
+            data-plan-status={item.status}
+            className={`flex items-start gap-2 rounded-lg px-2.5 py-2 border transition-colors
+              ${item.status === 'in_progress'
+                ? 'border-accent/30 bg-accent/10'
+                : 'border-border-subtle/60 bg-bg-secondary/30'}`}
+          >
+            <span className="mt-0.5 flex-shrink-0">
+              {item.status === 'completed' ? (
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="var(--color-success)" strokeWidth="1.5">
+                  <circle cx="7" cy="7" r="5.5" /><path d="M4.5 7l1.7 1.8 3.5-3.7" />
+                </svg>
+              ) : item.status === 'in_progress' ? (
+                <span className="block w-3.5 h-3.5 rounded-full border-2 border-accent border-t-transparent animate-spin" />
+              ) : (
+                <span className="block w-3.5 h-3.5 rounded-full border border-border-strong" />
+              )}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className={`text-xs leading-relaxed ${item.status === 'completed' ? 'text-text-tertiary line-through' : 'text-text-primary'}`}>
+                {item.step}
+              </div>
+              {item.status === 'in_progress' && item.activeForm && item.activeForm !== item.step && (
+                <div className="mt-0.5 text-[10px] text-accent">{item.activeForm}</div>
+              )}
+            </div>
+            <span className="text-[9px] text-text-tertiary whitespace-nowrap">
+              {t(`plan.status.${item.status}`)}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div className="text-[9px] text-text-tertiary text-right">
+        {t('plan.updated')} {new Date(updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+      </div>
+    </div>
+  );
+}
 
 /** Format token count: "3.2k" for >=1000, raw number for <1000 */
 function formatTokens(n: number): string {
@@ -270,7 +581,8 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   // Context pressure warning: threshold depends on model context window size
   // 1M models → warn at 600K; others at 120K (60% of 200K).
   const selectedModel = useSettingsStore((s) => s.selectedModel);
-  const resolvedModel = resolveModelForProvider(selectedModel);
+  const selectedModelResolution = resolveModelOrError(selectedModel);
+  const resolvedModel = selectedModelResolution.ok ? selectedModelResolution.model : '';
   const is1MContextModel = isOneMillionModel(resolvedModel);
   const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
   const inputTokens = sessionMeta.inputTokens || 0;
@@ -333,16 +645,35 @@ export function ChatPanel() {
   const sidebarOpen = useSettingsStore((s) => s.sidebarOpen);
   const toggleSidebar = useSettingsStore((s) => s.toggleSidebar);
   const toggleSecondaryPanel = useSettingsStore((s) => s.toggleSecondaryPanel);
+  const secondaryPanelOpen = useSettingsStore((s) => s.secondaryPanelOpen);
+  const secondaryPanelTab = useSettingsStore((s) => s.secondaryPanelTab);
+  const setSecondaryTab = useSettingsStore((s) => s.setSecondaryTab);
   const agentPanelOpen = useSettingsStore((s) => s.agentPanelOpen);
+  const agentTeamsEnabled = useSettingsStore((s) => s.agentTeamsEnabled);
   const toggleAgentPanel = useSettingsStore((s) => s.toggleAgentPanel);
-  const sessionMode = useSettingsStore((s) => s.sessionMode);
+  const selectedModel = useSettingsStore((s) => s.selectedModel);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const directoryMissing = useFileStore((s) => s.directoryMissing);
   const activeProvider = useProviderStore((s) => {
     if (!s.activeProviderId) return null;
     return s.providers.find((p) => p.id === s.activeProviderId) ?? null;
   });
+  const selectedModelResolution = useMemo(
+    () => resolveModelOrError(selectedModel),
+    [selectedModel, activeProvider],
+  );
+  const resolvedHeaderModel = (
+    (sessionStatus === 'running' || sessionStatus === 'stopping') && sessionMeta.model
+      ? sessionMeta.model
+      : selectedModelResolution.ok
+        ? selectedModelResolution.model
+        : sessionMeta.model || selectedModel
+  );
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
+  const taskComposerMode = useComposerModeStore((state) => (
+    selectedSessionId ? state.tabs[selectedSessionId]?.taskMode || null : null
+  ));
+  const selectTaskComposerMode = useComposerModeStore((state) => state.selectTaskMode);
   const sessions = useSessionStore((s) => s.sessions);
   const isFilePreviewMode = !!useFileStore((s) => s.selectedFile);
 
@@ -350,14 +681,40 @@ export function ChatPanel() {
   const agents = useAgentStore((s) => s.agents);
   const activeAgentCount = useMemo(
     () => Array.from(agents.values()).filter(
-      (a) => a.phase !== 'completed' && a.phase !== 'error'
+      (a) => !['idle', 'completed', 'error'].includes(a.phase)
     ).length,
     [agents],
   );
   const totalAgentCount = agents.size;
 
+  const openSecondaryTab = useCallback((tab: 'activity' | 'files') => {
+    if (secondaryPanelOpen && secondaryPanelTab === tab) {
+      toggleSecondaryPanel();
+      return;
+    }
+    setSecondaryTab(tab);
+  }, [secondaryPanelOpen, secondaryPanelTab, setSecondaryTab, toggleSecondaryPanel]);
+
+  const selectTaskMode = useCallback((mode: TaskComposerMode) => {
+    if (!selectedSessionId || isSessionBusy(sessionStatus)) return;
+    useCommandStore.getState().clearPrefix();
+    selectTaskComposerMode(selectedSessionId, mode);
+  }, [selectedSessionId, selectTaskComposerMode, sessionStatus]);
+
   const showPlanPanel = usePlanPanelStore((s) => s.open);
   const closePlanPanel = usePlanPanelStore((s) => s.close);
+
+  useEffect(() => {
+    const close = () => closePlanPanel();
+    window.addEventListener('blackbox:close-plan-panel', close);
+    return () => window.removeEventListener('blackbox:close-plan-panel', close);
+  }, [closePlanPanel]);
+
+  useEffect(() => subscribeHeaderPopover('agent', () => {
+    if (useSettingsStore.getState().agentPanelOpen) {
+      useSettingsStore.getState().toggleAgentPanel();
+    }
+  }), []);
 
 
   // Listen for internal file tree drag-drop (mouse-based, not HTML5 drag-and-drop)
@@ -367,9 +724,11 @@ export function ChatPanel() {
     const onOpenFile = (e: Event) => {
       const filePath = (e as CustomEvent<string>).detail;
       if (!filePath) return;
-      // Open secondary panel to files tab and select the file
+      // Open secondary panel, hydrate ancestors, then select/preview the file.
       useSettingsStore.getState().setSecondaryTab('files');
-      useFileStore.getState().selectFile(filePath);
+      const rootHint = useSettingsStore.getState().workingDirectory
+        || useFileStore.getState().rootPath;
+      void useFileStore.getState().openFileReference(filePath, rootHint);
     };
     window.addEventListener('blackbox:open-file', onOpenFile);
     return () => window.removeEventListener('blackbox:open-file', onOpenFile);
@@ -483,25 +842,24 @@ export function ChatPanel() {
             </svg>
           </button>
         )}
-        {/* Left: model name + project hint */}
-        <div className="flex items-center gap-3 pointer-events-none">
-          {sessionMeta.model && (
-            <span className="text-sm font-medium text-text-muted">
-              {getModelDisplayName(sessionMeta.model)}
-            </span>
-          )}
-          {workingDirectory && (
-            <span className="text-[10px] text-text-tertiary truncate max-w-[160px]"
-              title={workingDirectory}>
-              {workingDirectory.split(/[\\/]/).pop()}
-            </span>
-          )}
+        {/* Primary identity: the concrete model actually used by this task. */}
+        <div
+          data-testid="current-resolved-model"
+          className="min-w-0 max-w-[220px] flex-shrink-0 truncate text-xl font-medium
+            tracking-[-0.02em] text-text-primary"
+          title={resolvedHeaderModel}
+        >
+          {getResolvedModelDisplayName(resolvedHeaderModel)}
         </div>
 
-        {/* Integrated status: Agent + API route — left-aligned with color dots */}
-        <div className="relative flex items-center gap-3 ml-3">
+        {/* Integrated controls: Agent Teams, Provider/API key, permission mode. */}
+        <div className="relative ml-5 flex min-w-0 items-center gap-3">
           {/* Agent status — clickable dot + label → opens AgentPanel */}
-          <button onClick={toggleAgentPanel}
+          <button onClick={() => {
+            if (!agentPanelOpen) announceHeaderPopover('agent');
+            toggleAgentPanel();
+          }}
+            data-testid="agent-panel-toggle"
             className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded-md
               transition-smooth text-[9px]
               ${agentPanelOpen ? 'bg-accent/10' : 'hover:bg-bg-secondary/50'}`}
@@ -513,30 +871,14 @@ export function ChatPanel() {
                   ? 'bg-success'
                   : 'bg-text-tertiary/30'}`} />
             <span className={`${activeAgentCount > 0 ? 'text-amber-400' : totalAgentCount > 0 ? 'text-success' : 'text-text-tertiary'}`}>
-              Agent{totalAgentCount > 1 ? ` (${totalAgentCount})` : ''}
+              {agentTeamsEnabled ? 'Team' : 'Agent'}{totalAgentCount > 1 ? ` (${totalAgentCount})` : ''}
             </span>
           </button>
 
-          {/* API route status — dot + label */}
-          <div className="flex items-center gap-1.5 text-[9px]">
-            <span className={`w-[6px] h-[6px] rounded-full flex-shrink-0 transition-smooth
-              ${sessionStatus === 'running'
-                ? 'bg-success shadow-[0_0_6px_var(--color-accent-glow)] animate-pulse-soft'
-                : sessionStatus === 'error'
-                  ? 'bg-error'
-                  : 'bg-text-tertiary/30'}`} />
-            <span className="text-text-tertiary">
-              {activeProvider ? (activeProvider.name || 'Custom') : 'CLI'}
-            </span>
-          </div>
+          <ProviderQuickSelector compact={secondaryPanelOpen} />
 
-          {/* Current session mode indicator */}
-          <div className={`flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded
-            ${sessionMode === 'bypass'
-              ? 'text-warning/80'
-              : 'text-text-tertiary'}`}>
-            <span>{t(`mode.${sessionMode}`)}</span>
-          </div>
+          {/* Current session mode — visible and switchable in place. */}
+          <ModeSelector placement="down" compact iconOnly={secondaryPanelOpen} />
 
           {/* Floating agent panel popover — anchored to agent button */}
           {agentPanelOpen && (
@@ -553,10 +895,43 @@ export function ChatPanel() {
 
         {/* Spacer + right-side actions */}
         <div className="ml-auto flex items-center" />
+        <WorkflowControl
+          compact={secondaryPanelOpen}
+          active={taskComposerMode === 'workflow'}
+          disabled={isSessionBusy(sessionStatus)}
+          onSelect={() => selectTaskMode('workflow')}
+        />
+        <LoopControl
+          compact={secondaryPanelOpen}
+          active={taskComposerMode === 'loop'}
+          disabled={isSessionBusy(sessionStatus)}
+          onSelect={() => selectTaskMode('loop')}
+        />
+        <GoalControl
+          compact={secondaryPanelOpen}
+          active={taskComposerMode === 'goal'}
+          disabled={isSessionBusy(sessionStatus)}
+          onSelect={() => selectTaskMode('goal')}
+        />
+        <TaskLocationControl compact={secondaryPanelOpen} />
+        <button onClick={() => openSecondaryTab('activity')}
+          data-testid="activity-panel-toggle"
+          className={`p-1.5 rounded-md text-text-tertiary transition-smooth
+            ${secondaryPanelOpen && secondaryPanelTab === 'activity' ? 'bg-accent/10 text-accent' : 'hover:bg-bg-tertiary'}`}
+          title={t('activity.toggle')}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+            <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h11" />
+            <circle cx="6" cy="3.5" r="1.2" fill="currentColor" stroke="none" />
+            <circle cx="10.5" cy="8" r="1.2" fill="currentColor" stroke="none" />
+            <circle cx="5" cy="12.5" r="1.2" fill="currentColor" stroke="none" />
+          </svg>
+        </button>
         <ExportMenu sessionPath={currentSessionPath} />
-        <button onClick={toggleSecondaryPanel}
-          className="p-1.5 rounded-md hover:bg-bg-tertiary text-text-tertiary
-            transition-smooth" title={t('chat.toggleFiles')}>
+        <button onClick={() => openSecondaryTab('files')}
+          className={`p-1.5 rounded-md text-text-tertiary transition-smooth
+            ${secondaryPanelOpen && secondaryPanelTab === 'files' ? 'bg-accent/10 text-accent' : 'hover:bg-bg-tertiary'}`}
+          title={t('chat.toggleFiles')}>
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
             stroke="currentColor" strokeWidth="1.5">
             <rect x="1" y="2" width="14" height="12" rx="2" />
@@ -564,6 +939,8 @@ export function ChatPanel() {
           </svg>
         </button>
       </div>
+
+      <ForkBanner />
 
       <div className="flex flex-1 min-h-0 relative">
       {/* Main chat area */}
@@ -711,7 +1088,7 @@ export function ChatPanel() {
                       <circle cx="8" cy="8" r="6" />
                       <path d="M8 5v3l2 1.5" strokeLinecap="round" />
                     </svg>
-                    {t('chat.queued')}
+                    {pending.kind === 'steer' ? t('chat.steerQueued') : t('chat.queued')}
                   </span>
                 </div>
                 <UserAvatar size="w-8 h-8 text-xs" className="mt-0.5 flex-shrink-0" />
@@ -778,6 +1155,8 @@ export function ChatPanel() {
       {workingDirectory && !directoryMissing && <InputBar />}
       </div>{/* end main chat area */}
 
+      <ConversationComparePane />
+
       {/* Right-side plan panel (resizable) */}
       {showPlanPanel && (
         <PlanPanel
@@ -816,9 +1195,9 @@ async function startDraftSession(folderPath: string) {
   // Send empty prompt — Rust will skip the NDJSON send.
   const preWarmId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   try {
+    const spawnConfig = await flushAndCaptureSpawnConfiguration();
+    if (!spawnConfig.ok) return;
     const settings = useSettingsStore.getState();
-    const model = resolveModelForProvider(settings.selectedModel);
-    const providerId = useProviderStore.getState().activeProviderId || '';
     const permissionMode = mapSessionModeToPermissionMode(settings.sessionMode);
 
     // Ensure tab exists before writing sessionMeta
@@ -828,32 +1207,31 @@ async function startDraftSession(folderPath: string) {
       pendingReadyMessage: undefined,
     });
 
-    // Phase 2 §2.1: capture spawn-time fingerprint and config hash BEFORE
-    // the async spawn so they reflect the config actually used, not whatever
-    // the user might change while the spawn is in flight.
-    const preEnvFingerprint = envFingerprint();
-    const preSpawnConfigHash = spawnConfigHash();
-
     // Use lifecycle module for unified spawn
     const spawnResult = await spawnSession({
       tabId: draftId,
       stdinId: preWarmId,
       cwdSnapshot: folderPath,
       configSnapshot: {
-        model,
-        providerId,
-        thinkingLevel: settings.thinkingLevel,
+        model: spawnConfig.model,
+        auxiliaryModel: spawnConfig.auxiliaryModel,
+        providerId: spawnConfig.providerId,
+        thinkingLevel: spawnConfig.thinkingLevel,
         permissionMode,
+        agentTeamsEnabled: spawnConfig.agentTeamsEnabled,
       },
       sessionModeSnapshot: settings.sessionMode,
       sessionParams: {
         prompt: '',  // empty = pre-warm, no message sent
         cwd: folderPath,
-        model,
+        model: spawnConfig.model,
+        auxiliary_model: spawnConfig.auxiliaryModel,
+        auxiliary_model_tier: spawnConfig.auxiliaryModelTier,
         session_id: preWarmId,
-        thinking_level: settings.thinkingLevel,
-        provider_id: providerId || undefined,
+        thinking_level: spawnConfig.thinkingLevel,
+        provider_id: spawnConfig.providerId || undefined,
         permission_mode: permissionMode,
+        agent_teams_enabled: spawnConfig.agentTeamsEnabled,
       },
       onStream: (msg: any) => {
         // Forward to InputBar's handler via a global
@@ -876,18 +1254,29 @@ async function startDraftSession(folderPath: string) {
       setRunning: false,
     });
 
+    // The CLI UUID is authoritative even if system:init arrived after this tab
+    // moved to the background. Resolve the current stdin owner before writing
+    // post-spawn metadata so no state is stranded under draft_*.
+    const ownerBeforeAdoption = useSessionStore.getState().getTabForStdin(preWarmId) ?? draftId;
+    const ownerTabId = spawnResult.sessionInfo.cli_session_id
+      ? adoptCliSessionIdentity(
+        ownerBeforeAdoption,
+        spawnResult.sessionInfo.cli_session_id,
+        preWarmId,
+      )
+      : ownerBeforeAdoption;
     // Write additional meta (uses pre-captured values to avoid race)
-    useChatStore.getState().setSessionMeta(draftId, {
+    useChatStore.getState().setSessionMeta(ownerTabId, {
       sessionId: spawnResult.sessionInfo.cli_session_id ?? undefined,
-      envFingerprint: preEnvFingerprint,
-      spawnedModel: model,
+      envFingerprint: spawnConfig.envFingerprint,
+      spawnedModel: spawnConfig.model,
       stdinReady: false,
       pendingReadyMessage: undefined,
       // Phase 2 §2.1: lock in the pre-warm spawn config hash so the first
       // real user submit can detect drift correctly.
       // Uses pre-computed value captured before async spawn to avoid
       // race with user config changes during the spawn window.
-      spawnConfigHash: preSpawnConfigHash,
+      spawnConfigHash: spawnConfig.configHash,
     });
   } catch {
     // Pre-warm failed — InputBar will spawn on first message instead
@@ -933,7 +1322,7 @@ function WelcomeScreen() {
       <div
         className="absolute -top-32 left-1/2 -translate-x-1/2 w-[700px] h-[500px]"
         style={{
-          background: 'radial-gradient(ellipse 50% 60% at 50% 0%, rgba(59,111,224,0.12), transparent)',
+          background: 'radial-gradient(ellipse 50% 60% at 50% 0%, var(--color-accent-glow), transparent)',
         }}
       />
 

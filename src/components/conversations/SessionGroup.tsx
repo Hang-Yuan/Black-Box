@@ -35,7 +35,6 @@ function getDateCategory(ms: number): 'today' | 'yesterday' | 'thisWeek' | 'earl
 interface SessionGroupProps {
   projectKey: string;
   projectLabel: string;
-  projectPath: string;
   sessions: SessionListItem[];
   isExpanded: boolean;
   selectedId: string | null;
@@ -64,12 +63,13 @@ interface SessionGroupProps {
   onRenameGroupCancel: () => void;
   onReorderGroups: (workspace: string, orderedGroupIds: string[]) => void;
   onNewSessionInGroup: (groupId: string) => void;
+  /** Archived history preserves the ledger but does not mutate its structure. */
+  readOnly?: boolean;
 }
 
 export function SessionGroup({
   projectKey,
   projectLabel: label,
-  projectPath,
   sessions,
   isExpanded,
   selectedId,
@@ -97,6 +97,7 @@ export function SessionGroup({
   onRenameGroupCancel,
   onReorderGroups,
   onNewSessionInGroup,
+  readOnly = false,
 }: SessionGroupProps) {
   const t = useT();
 
@@ -142,6 +143,7 @@ export function SessionGroup({
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
   );
   const handleGroupDragEnd = (e: DragEndEvent) => {
+    if (readOnly) return;
     const { active, over } = e;
     if (!over || active.id === over.id) return;
     const currentOrder = taskGroups.map((tg) => tg.group.id);
@@ -154,7 +156,7 @@ export function SessionGroup({
       {/* Project header */}
       <div
         onClick={() => onToggleCollapse(projectKey)}
-        onContextMenu={(e) => onProjectContextMenu(e, projectKey)}
+        onContextMenu={readOnly ? undefined : (e) => onProjectContextMenu(e, projectKey)}
         className="w-full flex items-center gap-2 px-2.5 py-1 cursor-pointer
           hover:bg-bg-secondary rounded-sm transition-smooth group"
         role="button"
@@ -171,30 +173,25 @@ export function SessionGroup({
           truncate flex-1 text-left min-w-0">
           {label}
         </span>
-        <span className="text-[10px] text-text-tertiary flex-shrink-0">
-          {sessions.length} {t('conv.sessions')}
-        </span>
-        <button
-          onClick={(e) => { e.stopPropagation(); onNewSession(projectKey); }}
-          className="flex-shrink-0 p-0.5 rounded opacity-0 group-hover:opacity-100
-            hover:bg-bg-tertiary transition-smooth text-text-tertiary hover:text-accent"
-          title={t('conv.newChat')}
-        >
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
-            stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <path d="M8 3v10M3 8h10" />
-          </svg>
-        </button>
-      </div>
-
-      {/* Project path */}
-      {isExpanded && projectKey !== label && (
-        <div className="px-6 pb-0.5">
-          <span className="text-[10px] text-text-tertiary truncate block">
-            {projectPath}
+        {!readOnly && (
+          <span className="text-[10px] text-text-tertiary flex-shrink-0">
+            {sessions.length} {t('conv.sessions')}
           </span>
-        </div>
-      )}
+        )}
+        {!readOnly && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onNewSession(projectKey); }}
+            className="flex-shrink-0 p-0.5 rounded opacity-0 group-hover:opacity-100
+              hover:bg-bg-tertiary transition-smooth text-text-tertiary hover:text-accent"
+            title={t('conv.newChat')}
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
+          </button>
+        )}
+      </div>
 
       {/* Sessions */}
       {isExpanded && (
@@ -258,6 +255,7 @@ export function SessionGroup({
                   onRenameGroupCommit={onRenameGroupCommit}
                   onRenameCancel={onRenameGroupCancel}
                   onNewSessionInGroup={onNewSessionInGroup}
+                  readOnly={readOnly}
                 />
               ))}
             </SortableContext>

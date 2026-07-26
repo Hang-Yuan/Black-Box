@@ -24,6 +24,7 @@ import { lua } from '@codemirror/legacy-modes/mode/lua';
 import { toml } from '@codemirror/legacy-modes/mode/toml';
 import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
 import { useFileStore } from '../../stores/fileStore';
+import { dirnamePath, slugifyHeading } from '../../stores/fileReveal';
 import { bridge } from '../../lib/tauri-bridge';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { FileIcon } from '../shared/FileIcon';
@@ -89,6 +90,29 @@ function injectBaseTag(html: string, filePath: string): string {
   return baseTag + html;
 }
 
+function revealEditorLocation(
+  view: EditorView,
+  location: { line?: number; endLine?: number; column?: number },
+) {
+  if (!location.line || view.state.doc.lines < 1) return;
+  const startNumber = Math.min(Math.max(1, location.line), view.state.doc.lines);
+  const endNumber = Math.min(
+    Math.max(startNumber, location.endLine ?? startNumber),
+    view.state.doc.lines,
+  );
+  const startLine = view.state.doc.line(startNumber);
+  const endLine = view.state.doc.line(endNumber);
+  const from = location.column
+    ? Math.min(startLine.to, startLine.from + Math.max(0, location.column - 1))
+    : startLine.from;
+  const to = location.column && endNumber === startNumber ? from : endLine.to;
+
+  view.dispatch({
+    selection: { anchor: from, head: to },
+    effects: EditorView.scrollIntoView(from, { y: 'center' }),
+  });
+}
+
 const MARKDOWN_EXTS = new Set(['md', 'mdx']);
 const HTML_EXTS = new Set(['html', 'htm', 'xhtml']);
 const SVG_EXT = 'svg';
@@ -109,6 +133,7 @@ export function FilePreview() {
   const fileContent = useFileStore((s) => s.fileContent);
   const isLoadingContent = useFileStore((s) => s.isLoadingContent);
   const previewMode = useFileStore((s) => s.previewMode);
+  const previewLocation = useFileStore((s) => s.previewLocation);
   const setPreviewMode = useFileStore((s) => s.setPreviewMode);
   const closePreview = useFileStore((s) => s.closePreview);
   const editContent = useFileStore((s) => s.editContent);
@@ -122,6 +147,8 @@ export function FilePreview() {
   const confirmDiscard = useFileStore((s) => s.confirmDiscard);
   const confirmSaveAndSwitch = useFileStore((s) => s.confirmSaveAndSwitch);
   const cancelNavigation = useFileStore((s) => s.cancelNavigation);
+  const editorViewRef = useRef<EditorView | null>(null);
+  const markdownPreviewRef = useRef<HTMLDivElement | null>(null);
 
   // Auto-refresh preview when the selected file is modified externally
   const reloadRef = useRef(reloadContent);
@@ -133,6 +160,50 @@ export function FilePreview() {
       reloadRef.current();
     }
   }, [selectedFile, changedFiles]);
+
+  const handleEditorCreate = useCallback((view: EditorView) => {
+    editorViewRef.current = view;
+    if (previewLocation?.line) revealEditorLocation(view, previewLocation);
+  }, [previewLocation]);
+
+  useEffect(() => {
+    if (previewMode !== 'source' || !previewLocation?.line || !fileContent) return;
+    const frame = requestAnimationFrame(() => {
+      if (editorViewRef.current) {
+        revealEditorLocation(editorViewRef.current, previewLocation);
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [selectedFile, fileContent, previewMode, previewLocation]);
+
+  useEffect(() => {
+    if (previewMode !== 'preview' || !previewLocation?.anchor) return;
+    const root = markdownPreviewRef.current;
+    if (!root) return;
+
+    let frame = 0;
+    const scrollToAnchor = () => {
+      const wanted = new Set([
+        previewLocation.anchor,
+        slugifyHeading(previewLocation.anchor || ''),
+      ]);
+      const target = Array.from(root.querySelectorAll<HTMLElement>('[id]'))
+        .find((element) => wanted.has(element.id));
+      if (!target) return false;
+      target.scrollIntoView({ block: 'start' });
+      return true;
+    };
+
+    frame = requestAnimationFrame(scrollToAnchor);
+    const observer = new MutationObserver(() => {
+      if (scrollToAnchor()) observer.disconnect();
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [selectedFile, fileContent, previewMode, previewLocation]);
 
   const ext = useMemo(() => selectedFile ? getExt(selectedFile) : '', [selectedFile]);
   const fileName = useMemo(() => selectedFile ? getFileName(selectedFile) : '', [selectedFile]);
@@ -167,9 +238,10 @@ export function FilePreview() {
   /* Mode tabs for the header */
   const modeTabs = useMemo(() => {
     if (isMarkdown) {
-      // Markdown — preview + edit only
+      // Markdown — rendered preview, source (for :line targets), and edit.
       return [
         { id: 'preview' as const, label: t('files.preview') },
+        { id: 'source' as const, label: t('files.source') },
         { id: 'edit' as const, label: t('files.edit') },
       ];
     }
@@ -370,6 +442,7 @@ export function FilePreview() {
             value={editContent ?? fileContent ?? ''}
             extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, blackboxHighlight]}
             theme={blackboxTheme}
+            onCreateEditor={handleEditorCreate}
             onChange={(value) => setEditContent(value)}
             height="100%"
             style={{ height: '100%', fontSize: '13px' }}
@@ -411,7 +484,7 @@ export function FilePreview() {
           </div>
         ) : previewMode === 'preview' && isMarkdown && fileContent !== null ? (
           /* Markdown preview: rendered */
-          <div className="overflow-auto h-full p-4">
+          <div ref={markdownPreviewRef} className="overflow-auto h-full p-4">
             <div className="text-sm leading-relaxed selectable max-w-3xl mx-auto">
               {(() => {
                 // Extract YAML frontmatter if present
@@ -432,7 +505,11 @@ export function FilePreview() {
                         </div>
                       </div>
                     )}
-                    <MarkdownRenderer content={body} />
+                    <MarkdownRenderer
+                      content={body}
+                      basePath={selectedFile ? dirnamePath(selectedFile) : undefined}
+                      sourcePath={selectedFile || undefined}
+                    />
                   </>
                 );
               })()}
@@ -444,6 +521,7 @@ export function FilePreview() {
             value={fileContent}
             extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, blackboxHighlight]}
             theme={blackboxTheme}
+            onCreateEditor={handleEditorCreate}
             editable={false}
             readOnly={true}
             height="100%"

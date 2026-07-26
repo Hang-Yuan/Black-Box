@@ -1,4 +1,5 @@
 import { useProviderStore, type ApiProvider } from '../stores/providerStore';
+import type { ProviderApiFormat, ProviderAuthScheme } from './provider-presets';
 
 /**
  * Canonical JSON format for API provider config import/export (v2).
@@ -9,7 +10,8 @@ export interface ApiConfigFileV2 {
   provider: {
     name: string;
     baseUrl: string;
-    apiFormat: string;
+    apiFormat: ProviderApiFormat;
+    authScheme?: ProviderAuthScheme;
     apiKey?: string;
     modelMappings: { tier: string; model: string }[];
     extra_env?: Record<string, string>;
@@ -30,12 +32,12 @@ export function exportProvider(provider: ApiProvider): string {
       name: provider.name,
       baseUrl: provider.baseUrl,
       apiFormat: provider.apiFormat,
-      ...(provider.apiKey ? { apiKey: provider.apiKey } : {}),
+      ...(provider.authScheme ? { authScheme: provider.authScheme } : {}),
       modelMappings: provider.modelMappings
         .filter((m) => m.providerModel)
         .map((m) => ({ tier: m.tier, model: m.providerModel })),
-      ...(provider.extra_env && Object.keys(provider.extra_env).length > 0
-        ? { extra_env: provider.extra_env }
+      ...(provider.extraEnv && Object.keys(provider.extraEnv).length > 0
+        ? { extra_env: provider.extraEnv }
         : {}),
       ...(provider.proxyUrl ? { proxyUrl: provider.proxyUrl } : {}),
     },
@@ -93,10 +95,31 @@ export function parseAndValidate(
   }
 
   // apiFormat
-  const validFormats = ['anthropic', 'openai'];
+  const validFormats: readonly string[] = ['anthropic', 'openai', 'gemini'];
   const apiFormat = typeof p.apiFormat === 'string' ? p.apiFormat : 'anthropic';
   if (!validFormats.includes(apiFormat)) {
-    return { ok: false, error: `API 格式无效：${apiFormat}，仅支持 anthropic 或 openai` };
+    return { ok: false, error: `API 格式无效：${apiFormat}，仅支持 anthropic、openai 或 gemini` };
+  }
+
+  const validAuthSchemes: readonly string[] = ['x-api-key', 'bearer', 'x-goog-api-key'];
+  const authScheme = typeof p.authScheme === 'string' ? p.authScheme : undefined;
+  if (authScheme && !validAuthSchemes.includes(authScheme)) {
+    return { ok: false, error: `鉴权方式无效：${authScheme}，仅支持 x-api-key、bearer 或 x-goog-api-key` };
+  }
+  const normalizedApiFormat = apiFormat as ProviderApiFormat;
+  const allowedAuthSchemes: Record<ProviderApiFormat, readonly ProviderAuthScheme[]> = {
+    anthropic: ['x-api-key', 'bearer'],
+    openai: ['bearer'],
+    gemini: ['x-goog-api-key'],
+  };
+  if (
+    authScheme
+    && !allowedAuthSchemes[normalizedApiFormat].includes(authScheme as ProviderAuthScheme)
+  ) {
+    return {
+      ok: false,
+      error: `鉴权方式 ${authScheme} 不适用于 ${apiFormat} 协议`,
+    };
   }
 
   // apiKey
@@ -114,8 +137,8 @@ export function parseAndValidate(
     rawMappings = p.modelMappings;
   }
 
-  const validTiers = ['opus', 'sonnet', 'haiku'];
-  const mappings: { tier: 'opus' | 'sonnet' | 'haiku'; providerModel: string }[] = [];
+  const validTiers = ['fable', 'opus', 'sonnet', 'haiku'];
+  const mappings: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; providerModel: string }[] = [];
   for (const item of rawMappings) {
     if (typeof item !== 'object' || item === null) {
       return { ok: false, error: '模型映射条目格式不正确' };
@@ -123,10 +146,10 @@ export function parseAndValidate(
     const m = item as Record<string, unknown>;
     const tier = String(m.tier ?? '');
     if (!validTiers.includes(tier)) {
-      return { ok: false, error: `无效的模型层级：${tier}，仅支持 opus / sonnet / haiku` };
+      return { ok: false, error: `无效的模型层级：${tier}，仅支持 fable / opus / sonnet / haiku` };
     }
     const model = String(m.model ?? m.providerModel ?? '');
-    mappings.push({ tier: tier as 'opus' | 'sonnet' | 'haiku', providerModel: model });
+    mappings.push({ tier: tier as 'fable' | 'opus' | 'sonnet' | 'haiku', providerModel: model });
   }
 
   // extra_env (v2 only)
@@ -143,10 +166,11 @@ export function parseAndValidate(
     provider: {
       name: typeof p.name === 'string' ? p.name : '',
       baseUrl,
-      apiFormat: apiFormat as 'anthropic' | 'openai',
+      apiFormat: normalizedApiFormat,
+      ...(authScheme ? { authScheme: authScheme as ProviderAuthScheme } : {}),
       ...(apiKey ? { apiKey } : {}),
       modelMappings: mappings,
-      ...(extra_env ? { extra_env } : {}),
+      ...(extra_env ? { extraEnv: extra_env } : {}),
       ...(proxyUrl ? { proxyUrl } : {}),
     },
   };

@@ -4,7 +4,8 @@
  *
  * Phase 2 §2.1 + appendix E.2 H2:
  * - hash MUST react to: providerId, selectedModel, thinkingLevel, and the
- *   active provider's `updatedAt` (captures base URL / key / mapping edits)
+ *   active provider's persisted revision and local updatedAt (the latter
+ *   catches URL / credential / mapping edits before their save finishes)
  * - hash MUST NOT react to sessionMode — mode changes go through the
  *   runtime `set_permission_mode` control protocol, not kill + respawn.
  */
@@ -38,9 +39,10 @@ beforeEach(() => {
   });
   // Reset settings relevant to the hash.
   useSettingsStore.setState({
-    selectedModel: 'claude-sonnet-4-6',
+    selectedModel: 'sonnet',
     thinkingLevel: 'medium',
     sessionMode: 'code',
+    agentTeamsEnabled: false,
   });
 });
 
@@ -55,7 +57,7 @@ describe('spawnConfigHash', () => {
 
   it('changes when selectedModel changes', () => {
     const before = spawnConfigHash();
-    useSettingsStore.setState({ selectedModel: 'claude-opus-4-8' });
+    useSettingsStore.setState({ selectedModel: 'opus' });
     const after = spawnConfigHash();
     expect(after).not.toBe(before);
   });
@@ -65,6 +67,12 @@ describe('spawnConfigHash', () => {
     useSettingsStore.setState({ thinkingLevel: 'max' });
     const after = spawnConfigHash();
     expect(after).not.toBe(before);
+  });
+
+  it('changes when Agent Teams opt-in changes', () => {
+    const before = spawnConfigHash();
+    useSettingsStore.setState({ agentTeamsEnabled: true });
+    expect(spawnConfigHash()).not.toBe(before);
   });
 
   it('changes when activeProviderId changes', () => {
@@ -77,16 +85,27 @@ describe('spawnConfigHash', () => {
     expect(after).not.toBe(before);
   });
 
-  it('changes when the active provider\'s updatedAt changes', () => {
-    const p = makeProvider({ id: 'p1', updatedAt: 1000 });
+  it('changes when the active provider revision changes', () => {
+    const p = makeProvider({ id: 'p1', updatedAt: 1000, revision: 1 });
     useProviderStore.setState({ providers: [p], activeProviderId: 'p1' });
     const before = spawnConfigHash();
     useProviderStore.setState({
-      providers: [{ ...p, updatedAt: 2000 }],
+      providers: [{ ...p, updatedAt: 1000, revision: 2 }],
       activeProviderId: 'p1',
     });
     const after = spawnConfigHash();
     expect(after).not.toBe(before);
+  });
+
+  it('changes immediately for an unsaved provider edit with the same revision', () => {
+    const p = makeProvider({ id: 'p1', updatedAt: 1000, revision: 7 });
+    useProviderStore.setState({ providers: [p], activeProviderId: 'p1' });
+    const before = spawnConfigHash();
+    useProviderStore.setState({
+      providers: [{ ...p, baseUrl: 'https://new.example.com', updatedAt: 1001 }],
+      activeProviderId: 'p1',
+    });
+    expect(spawnConfigHash()).not.toBe(before);
   });
 
   it('DOES NOT change when sessionMode changes (E.2 H2)', () => {

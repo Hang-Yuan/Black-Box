@@ -34,6 +34,8 @@ interface TaskGroupProps {
   onRenameCancel: () => void;
   /** Create a new session that lands straight in this group (card-head ➕). */
   onNewSessionInGroup: (groupId: string) => void;
+  /** Archive history can be expanded but cannot reorder or edit groups. */
+  readOnly?: boolean;
 }
 
 export function TaskGroup({
@@ -58,6 +60,7 @@ export function TaskGroup({
   onRenameGroupCommit,
   onRenameCancel,
   onNewSessionInGroup,
+  readOnly = false,
 }: TaskGroupProps) {
   const [draft, setDraft] = useState(group.label);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -66,7 +69,7 @@ export function TaskGroup({
   // Sortable wiring — the card is the sortable node, but only the six-dot
   // handle carries the drag listeners (so clicking the body still toggles).
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: group.id });
+    useSortable({ id: group.id, disabled: readOnly });
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -102,33 +105,58 @@ export function TaskGroup({
     >
       {/* Card header */}
       <div
-        onClick={() => !isRenaming && onToggleCollapse(group.id)}
-        onContextMenu={(e) => onGroupContextMenu(e, group.id)}
+        onClick={readOnly ? undefined : () => !isRenaming && onToggleCollapse(group.id)}
+        onContextMenu={readOnly ? undefined : (e) => onGroupContextMenu(e, group.id)}
         className="w-full flex items-center gap-2 pl-2 pr-2 py-1.5 cursor-pointer
           hover:bg-bg-secondary/40 transition-smooth group"
         role="button"
         tabIndex={0}
+        onKeyDown={(e) => {
+          if (!readOnly && (e.key === 'Enter' || e.key === ' ') && !isRenaming) {
+            e.preventDefault();
+            onToggleCollapse(group.id);
+          }
+        }}
       >
         {/* Six-dot drag handle — the only drag origin */}
-        <span
-          {...attributes}
-          {...listeners}
-          onClick={(e) => e.stopPropagation()}
-          className="flex-shrink-0 cursor-grab active:cursor-grabbing touch-none
-            select-none text-text-tertiary/70 hover:text-text-tertiary
-            transition-colors"
-          title="拖动调整组的顺序"
-          aria-label="拖动调整组的顺序"
-        >
-          <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden>
-            <circle cx="2" cy="2" r="1.3" />
-            <circle cx="8" cy="2" r="1.3" />
-            <circle cx="2" cy="7" r="1.3" />
-            <circle cx="8" cy="7" r="1.3" />
-            <circle cx="2" cy="12" r="1.3" />
-            <circle cx="8" cy="12" r="1.3" />
-          </svg>
-        </span>
+        {readOnly ? (
+          <button
+            type="button"
+            data-testid={`task-group-toggle-${group.id}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCollapse(group.id);
+            }}
+            className="flex-shrink-0 rounded-sm p-0.5 text-text-tertiary hover:text-text-primary"
+            aria-label={isExpanded ? '折叠归档任务组' : '展开归档任务组'}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
+              stroke="currentColor" strokeWidth="1.5"
+              className={`transition-transform ${isExpanded ? 'rotate-90' : ''}`}>
+              <path d="M3 1l4 4-4 4" />
+            </svg>
+          </button>
+        ) : (
+          <span
+            {...attributes}
+            {...listeners}
+            onClick={(e) => e.stopPropagation()}
+            className="flex-shrink-0 cursor-grab active:cursor-grabbing touch-none
+              select-none text-text-tertiary/70 hover:text-text-tertiary
+              transition-colors"
+            title="拖动调整组的顺序"
+            aria-label="拖动调整组的顺序"
+          >
+            <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden>
+              <circle cx="2" cy="2" r="1.3" />
+              <circle cx="8" cy="2" r="1.3" />
+              <circle cx="2" cy="7" r="1.3" />
+              <circle cx="8" cy="7" r="1.3" />
+              <circle cx="2" cy="12" r="1.3" />
+              <circle cx="8" cy="12" r="1.3" />
+            </svg>
+          </span>
+        )}
 
         {/* Group label or inline rename input */}
         {isRenaming ? (
@@ -153,24 +181,28 @@ export function TaskGroup({
           </span>
         )}
 
-        {/* Member count */}
-        <span className="text-[11px] text-text-tertiary flex-shrink-0 tabular-nums">
-          {sessions.length}
-        </span>
+        {/* Active groups show their size; archive history stays visually quiet. */}
+        {!readOnly && (
+          <span className="text-[11px] text-text-tertiary flex-shrink-0 tabular-nums">
+            {sessions.length}
+          </span>
+        )}
 
         {/* New-session-in-group — dark rounded square (reference card language) */}
-        <button
-          onClick={(e) => { e.stopPropagation(); onNewSessionInGroup(group.id); }}
-          className="flex-shrink-0 p-0.5 flex items-center justify-center
-            text-text-tertiary hover:text-accent transition-smooth"
-          title="在这个组里新建会话"
-          aria-label="在这个组里新建会话"
-        >
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-            stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-            <path d="M8 3v10M3 8h10" />
-          </svg>
-        </button>
+        {!readOnly && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onNewSessionInGroup(group.id); }}
+            className="flex-shrink-0 p-0.5 flex items-center justify-center
+              text-text-tertiary hover:text-accent transition-smooth"
+            title="在这个组里新建会话"
+            aria-label="在这个组里新建会话"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
+              stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
+          </button>
+        )}
       </div>
 
       {/* Members */}

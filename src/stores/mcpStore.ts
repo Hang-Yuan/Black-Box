@@ -1,159 +1,221 @@
 import { create } from 'zustand';
-import { bridge } from '../lib/tauri-bridge';
+import {
+  bridge,
+  type McpConnectionStatus,
+  type McpSaveRequest,
+  type McpScope,
+  type McpServerConfig,
+  type McpServerRecord,
+} from '../lib/tauri-bridge';
 
-// --- Types ---
+export type { McpConnectionStatus, McpScope, McpServerConfig, McpServerRecord };
+export type McpServer = McpServerRecord;
 
-export interface McpServerConfig {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-  type: string;
+export function mcpServerKey(server: Pick<McpServerRecord, 'scope' | 'name'>): string {
+  return `${server.scope}:${server.name}`;
 }
 
-export interface McpServer {
-  name: string;
-  config: McpServerConfig;
+interface RuntimeMcpServer {
+  name?: string;
+  status?: string;
 }
 
 interface McpState {
-  servers: McpServer[];
+  servers: McpServerRecord[];
+  /** Exact native + MCP tool inventory from the latest Claude system:init. */
+  runtimeTools: string[];
   isLoading: boolean;
+  isChecking: boolean;
   editingServer: string | null;
+  authenticatingServer: string | null;
   isAdding: boolean;
+  error: string;
 
-  fetchServers: () => Promise<void>;
-  addServer: (name: string, config: McpServerConfig) => Promise<void>;
-  updateServer: (oldName: string, newName: string, config: McpServerConfig) => Promise<void>;
-  deleteServer: (name: string) => Promise<void>;
-  setEditing: (name: string | null) => void;
+  fetchServers: (cwd?: string, checkHealth?: boolean) => Promise<void>;
+  addServer: (
+    name: string,
+    scope: McpScope,
+    config: McpServerConfig,
+    cwd?: string,
+  ) => Promise<void>;
+  updateServer: (
+    original: McpServerRecord,
+    name: string,
+    scope: McpScope,
+    config: McpServerConfig,
+    cwd?: string,
+  ) => Promise<void>;
+  deleteServer: (server: McpServerRecord, cwd?: string) => Promise<void>;
+  setProjectApproval: (name: string, approved: boolean, cwd: string) => Promise<void>;
+  loginServer: (name: string, cwd?: string) => Promise<void>;
+  logoutServer: (name: string, cwd?: string) => Promise<void>;
+  recordRuntimeServers: (servers: RuntimeMcpServer[], tools: string[]) => void;
+  clearError: () => void;
+  setEditing: (key: string | null) => void;
   setAdding: (adding: boolean) => void;
 }
 
-// --- Helpers ---
-
-async function readClaudeJson(): Promise<Record<string, unknown>> {
-  const home = await bridge.getHomeDir();
-  const path = `${home}/.claude.json`;
-  try {
-    const content = await bridge.readFileContent(path);
-    return JSON.parse(content);
-  } catch {
-    return {};
-  }
+function errorMessage(error: unknown): string {
+  return String(error).replace(/^Error:\s*/, '');
 }
 
-async function writeClaudeJson(data: Record<string, unknown>): Promise<void> {
-  const home = await bridge.getHomeDir();
-  const path = `${home}/.claude.json`;
-  await bridge.writeFileContent(path, JSON.stringify(data, null, 2));
+function runtimeStatus(value: string | undefined): McpConnectionStatus {
+  const normalized = (value || '').toLowerCase();
+  if (normalized.includes('pending')) return 'pendingApproval';
+  if (normalized.includes('reject')) return 'rejected';
+  if (normalized.includes('auth') || normalized.includes('login')) return 'needsAuth';
+  if (normalized.includes('connect') && !normalized.includes('fail')) return 'connected';
+  if (normalized.includes('fail') || normalized.includes('error')) return 'failed';
+  return 'unknown';
 }
 
-/** Detect and flatten double-nested mcpServers.mcpServers structure (Issue #33). */
-function normalizeMcpServers(
-  raw: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-  if (!raw || typeof raw !== 'object') return raw;
-  // If the only (or first) key is "mcpServers" and its value looks like a server map,
-  // the user has a double-nested config — unwrap one level.
-  if ('mcpServers' in raw && typeof raw.mcpServers === 'object' && raw.mcpServers !== null) {
-    console.warn(
-      '[mcpStore] WARNING: detected double-nested mcpServers.mcpServers in ~/.claude.json, auto-flattening',
-    );
-    return raw.mcpServers as Record<string, unknown>;
-  }
-  return raw;
-}
-
-function parseServers(mcpServers: Record<string, unknown> | undefined): McpServer[] {
-  const normalized = normalizeMcpServers(mcpServers);
-  if (!normalized || typeof normalized !== 'object') return [];
-  return Object.entries(normalized).map(([name, raw]) => {
-    const cfg = raw as Record<string, unknown>;
+function preserveRuntimeState(
+  previous: McpServerRecord[],
+  next: McpServerRecord[],
+): McpServerRecord[] {
+  const previousByKey = new Map(previous.map((server) => [mcpServerKey(server), server]));
+  return next.map((server) => {
+    const prior = previousByKey.get(mcpServerKey(server));
+    if (!prior) return server;
     return {
-      name,
-      config: {
-        command: (cfg.command as string) || '',
-        args: Array.isArray(cfg.args) ? (cfg.args as string[]) : [],
-        env: (cfg.env as Record<string, string>) || {},
-        type: (cfg.type as string) || 'stdio',
-      },
+      ...server,
+      toolCount: server.toolCount ?? prior.toolCount,
+      status: server.status === 'unknown' ? prior.status : server.status,
+      statusDetail: server.statusDetail ?? prior.statusDetail,
     };
   });
 }
 
-// --- Store ---
-
-export const useMcpStore = create<McpState>()((set) => ({
+export const useMcpStore = create<McpState>()((set, get) => ({
   servers: [],
+  runtimeTools: [],
   isLoading: false,
+  isChecking: false,
   editingServer: null,
+  authenticatingServer: null,
   isAdding: false,
+  error: '',
 
-  fetchServers: async () => {
-    set({ isLoading: true });
+  fetchServers: async (cwd, checkHealth = false) => {
+    set(checkHealth ? { isChecking: true, error: '' } : { isLoading: true, error: '' });
     try {
-      const json = await readClaudeJson();
-      const rawMcp = json.mcpServers as Record<string, unknown> | undefined;
-      // Auto-fix double-nested mcpServers.mcpServers on disk
-      if (
-        rawMcp &&
-        typeof rawMcp === 'object' &&
-        'mcpServers' in rawMcp &&
-        typeof rawMcp.mcpServers === 'object'
-      ) {
-        json.mcpServers = rawMcp.mcpServers;
-        await writeClaudeJson(json);
-      }
-      const servers = parseServers(json.mcpServers as Record<string, unknown> | undefined);
-      set({ servers, isLoading: false });
-    } catch {
-      set({ isLoading: false });
+      const servers = await bridge.listMcpServers(cwd, checkHealth);
+      set({
+        servers: preserveRuntimeState(get().servers, servers),
+        isLoading: false,
+        isChecking: false,
+      });
+    } catch (error) {
+      set({ isLoading: false, isChecking: false, error: errorMessage(error) });
     }
   },
 
-  addServer: async (name, config) => {
-    const json = await readClaudeJson();
-    const mcpServers = (json.mcpServers as Record<string, unknown>) || {};
-    mcpServers[name] = {
-      command: config.command,
-      args: config.args,
-      env: Object.keys(config.env).length > 0 ? config.env : undefined,
-      type: config.type,
+  addServer: async (name, scope, config, cwd) => {
+    const request: McpSaveRequest = {
+      originalName: null,
+      originalScope: null,
+      name,
+      scope,
+      config,
+      cwd: cwd || null,
     };
-    json.mcpServers = mcpServers;
-    await writeClaudeJson(json);
-    const servers = parseServers(mcpServers);
-    set({ servers, isAdding: false });
-  },
-
-  updateServer: async (oldName, newName, config) => {
-    const json = await readClaudeJson();
-    const mcpServers = (json.mcpServers as Record<string, unknown>) || {};
-    if (oldName !== newName) {
-      delete mcpServers[oldName];
+    try {
+      const servers = await bridge.saveMcpServer(request);
+      set({ servers, isAdding: false, error: '' });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      throw error;
     }
-    mcpServers[newName] = {
-      command: config.command,
-      args: config.args,
-      env: Object.keys(config.env).length > 0 ? config.env : undefined,
-      type: config.type,
+  },
+
+  updateServer: async (original, name, scope, config, cwd) => {
+    const request: McpSaveRequest = {
+      originalName: original.name,
+      originalScope: original.scope,
+      name,
+      scope,
+      config,
+      cwd: cwd || null,
     };
-    json.mcpServers = mcpServers;
-    await writeClaudeJson(json);
-    const servers = parseServers(mcpServers);
-    set({ servers, editingServer: null });
+    try {
+      const servers = await bridge.saveMcpServer(request);
+      set({ servers, editingServer: null, error: '' });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      throw error;
+    }
   },
 
-  deleteServer: async (name) => {
-    const json = await readClaudeJson();
-    const mcpServers = (json.mcpServers as Record<string, unknown>) || {};
-    delete mcpServers[name];
-    json.mcpServers = mcpServers;
-    await writeClaudeJson(json);
-    const servers = parseServers(mcpServers);
-    set({ servers });
+  deleteServer: async (server, cwd) => {
+    try {
+      const servers = await bridge.deleteMcpServer(server.name, server.scope, cwd);
+      set({ servers, error: '' });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      throw error;
+    }
   },
 
-  setEditing: (name) => set({ editingServer: name, isAdding: false }),
-  setAdding: (adding) => set({ isAdding: adding, editingServer: null }),
+  setProjectApproval: async (name, approved, cwd) => {
+    try {
+      const servers = await bridge.setProjectMcpApproval(name, approved, cwd);
+      set({ servers, error: '' });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      throw error;
+    }
+  },
+
+  loginServer: async (name, cwd) => {
+    const key = `auth:${name}`;
+    set({ authenticatingServer: key, error: '' });
+    try {
+      await bridge.loginMcpServer(name, cwd);
+      set({ authenticatingServer: null });
+      await get().fetchServers(cwd, true);
+    } catch (error) {
+      set({ authenticatingServer: null, error: errorMessage(error) });
+      throw error;
+    }
+  },
+
+  logoutServer: async (name, cwd) => {
+    const key = `auth:${name}`;
+    set({ authenticatingServer: key, error: '' });
+    try {
+      await bridge.logoutMcpServer(name, cwd);
+      set({ authenticatingServer: null });
+      await get().fetchServers(cwd, true);
+    } catch (error) {
+      set({ authenticatingServer: null, error: errorMessage(error) });
+      throw error;
+    }
+  },
+
+  recordRuntimeServers: (runtimeServers, tools) => {
+    const byName = new Map(
+      runtimeServers
+        .filter((server): server is RuntimeMcpServer & { name: string } => Boolean(server?.name))
+        .map((server) => [server.name, runtimeStatus(server.status)]),
+    );
+    set((state) => ({
+      runtimeTools: [...new Set(tools)],
+      servers: state.servers.map((server) => {
+        if (!server.effective) return server;
+        const prefix = `mcp__${server.name}__`;
+        const toolCount = tools.filter((tool) => tool.startsWith(prefix)).length;
+        const status = byName.get(server.name);
+        const wasReportedByRuntime = byName.has(server.name);
+        return {
+          ...server,
+          status: status && status !== 'unknown' ? status : server.status,
+          toolCount: wasReportedByRuntime ? toolCount : server.toolCount,
+        };
+      }),
+    }));
+  },
+
+  clearError: () => set({ error: '' }),
+  setEditing: (key) => set({ editingServer: key, isAdding: false, error: '' }),
+  setAdding: (adding) => set({ isAdding: adding, editingServer: null, error: '' }),
 }));

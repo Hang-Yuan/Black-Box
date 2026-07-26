@@ -1,135 +1,120 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# Black Box / TCAlpha macOS Local Build Script
-# Builds, signs, notarizes for both aarch64 and x86_64
-# Then uploads artifacts to the existing GitHub Draft Release
-#
-# Usage:
-#   ./scripts/build-macos-local.sh              # stable (Black Box)
-#   EDITION=alpha ./scripts/build-macos-local.sh # alpha  (CourteousAlpha)
-# ============================================================
+# Local-only release builder for the current Mac architecture.
+# It never uploads artifacts and does not use the disabled app-updater key.
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$PROJECT_DIR"
+project_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$project_dir"
 
-EDITION="${EDITION:-stable}"
-VERSION=$(python3 -c "import json; print(json.load(open('package.json'))['version'])")
+archive_root="${BLACKBOX_RELEASE_ARCHIVE_DIR:-$project_dir/release-artifacts}"
+archive_helper="$project_dir/scripts/archive-release-artifact.sh"
+release_manifest_helper="$project_dir/scripts/write-release-manifest.mjs"
+release_bundle_checker="$project_dir/scripts/check-release-bundle.mjs"
 
-if [ "$EDITION" = "alpha" ]; then
-  TAG="v$VERSION-alpha"
-  PRODUCT_NAME="CourteousAlpha"
-  TAURI_EXTRA_ARGS="--config editions/alpha/tauri.alpha.conf.json"
-else
-  TAG="v$VERSION"
-  PRODUCT_NAME="Black Box"
-  TAURI_EXTRA_ARGS=""
-fi
+preserve_existing_dmgs() {
+  local dmg_dir="$project_dir/src-tauri/target/release/bundle/dmg"
+  local existing_dmg
 
-echo "============================================"
-echo " $PRODUCT_NAME macOS Local Build"
-echo " Edition: $EDITION  Version: $VERSION  Tag: $TAG"
-echo "============================================"
+  [[ -d "$dmg_dir" ]] || return 0
+  shopt -s nullglob
+  for existing_dmg in "$dmg_dir"/*.dmg; do
+    bash "$archive_helper" "$existing_dmg" "$archive_root"
+  done
+  shopt -u nullglob
+}
 
-# --- Environment Variables ---
-# Required env vars — set in shell profile, .env file, or export before running.
-# See .env.example for the full list.
-#
-#   APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: Name (TEAMID)"
-#   APPLE_ID                     Your Apple ID email
-#   APPLE_PASSWORD               App-specific password (appleid.apple.com → Security)
-#   APPLE_TEAM_ID                10-char Apple Developer Team ID
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  Tauri updater signing key passphrase
-
-# Load .env if present (ignored by git)
-[ -f "$PROJECT_DIR/.env" ] && set -a && source "$PROJECT_DIR/.env" && set +a
-
-: "${APPLE_SIGNING_IDENTITY:?Set APPLE_SIGNING_IDENTITY in .env or environment}"
-: "${APPLE_ID:?Set APPLE_ID in .env or environment}"
-: "${APPLE_PASSWORD:?Set APPLE_PASSWORD in .env or environment}"
-: "${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in .env or environment}"
-: "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?Set TAURI_SIGNING_PRIVATE_KEY_PASSWORD in .env or environment}"
-
-export APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
-export TAURI_SIGNING_PRIVATE_KEY
-TAURI_SIGNING_PRIVATE_KEY="$(cat "$HOME/.tauri/blackbox.key")"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-export EDITION
-
-# --- Preflight Checks ---
-echo ""
-echo "[1/6] Preflight checks..."
+command -v node >/dev/null || { echo "ERROR: node not found"; exit 1; }
 command -v pnpm >/dev/null || { echo "ERROR: pnpm not found"; exit 1; }
 command -v cargo >/dev/null || { echo "ERROR: cargo not found"; exit 1; }
-command -v xcrun >/dev/null || { echo "ERROR: xcrun not found"; exit 1; }
-rustup target list --installed | grep -q aarch64-apple-darwin || { echo "ERROR: aarch64 target missing"; exit 1; }
-rustup target list --installed | grep -q x86_64-apple-darwin || { echo "ERROR: x86_64 target missing"; exit 1; }
-security find-identity -v -p codesigning | grep -q "Developer ID Application" || { echo "ERROR: No Developer ID cert in Keychain"; exit 1; }
-echo "  All checks passed."
+command -v codesign >/dev/null || { echo "ERROR: codesign not found"; exit 1; }
+command -v hdiutil >/dev/null || { echo "ERROR: hdiutil not found"; exit 1; }
 
-# --- Install Dependencies ---
-echo ""
-echo "[2/6] Installing dependencies..."
+package_version="$(node -p "require('./package.json').version")"
+tauri_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+cargo_version="$(awk -F '"' '/^version = "/ { print $2; exit }' src-tauri/Cargo.toml)"
+
+if [[ "$package_version" != "$tauri_version" || "$package_version" != "$cargo_version" ]]; then
+  echo "ERROR: version mismatch: package=$package_version tauri=$tauri_version cargo=$cargo_version"
+  exit 1
+fi
+
+echo "Black Box local DMG build · v$package_version · $(uname -m)"
+echo "This build is local/ad-hoc signed and is not uploaded anywhere."
+echo "Immutable local archive: $archive_root"
+
+# Tauri recreates the bundle output directory during a release build. Preserve
+# every existing version before that cleanup starts.
+preserve_existing_dmgs
+
 pnpm install --frozen-lockfile
 
-# --- Build aarch64 ---
+if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
+  pnpm exec vitest run
+  cargo test --manifest-path src-tauri/Cargo.toml --lib
+fi
+
+# Freeze the exact source candidate before compilation. The resulting Git tree
+# and aggregate content hash are later bound to the archived DMG, so a local
+# artifact can always be traced back to the source bytes that produced it.
+candidate_private_roots="$HOME:$project_dir"
+if [[ -n "${BLACKBOX_PRIVATE_ROOTS:-}" ]]; then
+  candidate_private_roots="$BLACKBOX_PRIVATE_ROOTS:$candidate_private_roots"
+fi
+candidate_audit_output="$(BLACKBOX_PRIVATE_ROOTS="$candidate_private_roots" node scripts/candidate-audit.mjs)"
+printf '%s\n' "$candidate_audit_output"
+candidate_audit_report="$(printf '%s' "$candidate_audit_output" | node -e '
+  const fs = require("node:fs");
+  const value = JSON.parse(fs.readFileSync(0, "utf8"));
+  if (!value.passed || !value.reportFile) process.exit(2);
+  process.stdout.write(value.reportFile);
+')"
+candidate_audit_report="$project_dir/$candidate_audit_report"
+
+# Rust panic locations otherwise retain absolute Cargo registry paths, including
+# the local account name. Remap the entire home prefix to a neutral relative
+# provenance root before release compile; this avoids both host-private paths and
+# a synthetic `/home` path that could be mistaken for another user's directory.
+encoded_separator=$'\x1f'
+remap_flag="--remap-path-prefix=$HOME=rust-src"
+if [[ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+  export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${encoded_separator}${remap_flag}"
+else
+  export CARGO_ENCODED_RUSTFLAGS="$remap_flag"
+fi
+
+pnpm tauri build --bundles app,dmg --ci
+
+app_path="src-tauri/target/release/bundle/macos/Black Box.app"
+dmg_dir="src-tauri/target/release/bundle/dmg"
+dmg_path="$(find "$dmg_dir" -maxdepth 1 -type f -name "*_${package_version}_*.dmg" -print | sort | tail -n 1)"
+
+[[ -d "$app_path" ]] || { echo "ERROR: app bundle not found: $app_path"; exit 1; }
+[[ -f "$dmg_path" ]] || { echo "ERROR: DMG not found for v$package_version"; exit 1; }
+node "$release_bundle_checker" "$app_path"
+
+codesign --verify --deep --strict --verbose=2 "$app_path"
+hdiutil verify "$dmg_path"
+bundle_version="$(defaults read "$project_dir/$app_path/Contents/Info" CFBundleShortVersionString)"
+[[ "$bundle_version" == "$package_version" ]] || {
+  echo "ERROR: bundle version mismatch: expected $package_version, got $bundle_version"
+  exit 1
+}
+
+archive_result="$(bash "$archive_helper" "$dmg_path" "$archive_root" "$package_version")"
+archived_dmg="$(printf '%s\n' "$archive_result" | sed -n '1p')"
+archived_sha="$(printf '%s\n' "$archive_result" | sed -n '2p')"
+release_manifest="$archive_root/v$package_version/RELEASE_MANIFEST.json"
+release_manifest_result="$(node "$release_manifest_helper" \
+  "$archived_dmg" \
+  "$candidate_audit_report" \
+  "$release_manifest" \
+  "$package_version")"
+
 echo ""
-echo "[3/6] Building aarch64-apple-darwin (Apple Silicon)..."
-pnpm tauri build --target aarch64-apple-darwin $TAURI_EXTRA_ARGS 2>&1 | tee /tmp/tauri-build-aarch64.log
-echo "  aarch64 build complete."
-
-# --- Build x86_64 ---
-echo ""
-echo "[4/6] Building x86_64-apple-darwin (Intel)..."
-pnpm tauri build --target x86_64-apple-darwin $TAURI_EXTRA_ARGS 2>&1 | tee /tmp/tauri-build-x86_64.log
-echo "  x86_64 build complete."
-
-# --- Collect Artifacts ---
-echo ""
-echo "[5/6] Collecting artifacts..."
-
-AARCH64_BUNDLE="src-tauri/target/aarch64-apple-darwin/release/bundle"
-X86_64_BUNDLE="src-tauri/target/x86_64-apple-darwin/release/bundle"
-STAGING="/tmp/blackbox-release-$TAG"
-rm -rf "$STAGING"
-mkdir -p "$STAGING"
-
-# DMGs
-cp "$AARCH64_BUNDLE/dmg/"*.dmg "$STAGING/" 2>/dev/null && echo "  aarch64 DMG copied" || echo "  WARN: no aarch64 DMG found"
-cp "$X86_64_BUNDLE/dmg/"*.dmg "$STAGING/" 2>/dev/null && echo "  x86_64 DMG copied" || echo "  WARN: no x86_64 DMG found"
-
-# Updater artifacts (.app.tar.gz and .sig)
-# Rename with arch suffix — both arches produce "${PRODUCT_NAME}.app.tar.gz",
-# same-name cp would silently overwrite and we'd lose one arch's updater.
-AARCH64_TARBALL="$AARCH64_BUNDLE/macos/${PRODUCT_NAME}.app.tar.gz"
-X86_64_TARBALL="$X86_64_BUNDLE/macos/${PRODUCT_NAME}.app.tar.gz"
-cp "$AARCH64_TARBALL"     "$STAGING/${PRODUCT_NAME}_aarch64.app.tar.gz"     2>/dev/null && echo "  aarch64 updater tar.gz copied" || echo "  WARN: no aarch64 tar.gz"
-cp "$AARCH64_TARBALL.sig" "$STAGING/${PRODUCT_NAME}_aarch64.app.tar.gz.sig" 2>/dev/null && echo "  aarch64 signature copied" || echo "  WARN: no aarch64 sig"
-cp "$X86_64_TARBALL"      "$STAGING/${PRODUCT_NAME}_x64.app.tar.gz"         2>/dev/null && echo "  x86_64 updater tar.gz copied" || echo "  WARN: no x86_64 tar.gz"
-cp "$X86_64_TARBALL.sig"  "$STAGING/${PRODUCT_NAME}_x64.app.tar.gz.sig"     2>/dev/null && echo "  x86_64 signature copied" || echo "  WARN: no x86_64 sig"
-
-echo ""
-echo "  Artifacts in $STAGING:"
-ls -lh "$STAGING/"
-
-# --- Upload to GitHub Release ---
-echo ""
-echo "[6/6] Uploading to GitHub Draft Release ($TAG)..."
-
-for file in "$STAGING"/*; do
-    fname=$(basename "$file")
-    echo "  Uploading: $fname"
-    gh release upload "$TAG" "$file" --clobber
-done
-
-echo ""
-echo "============================================"
-echo " Build complete!"
-echo " Draft Release: https://github.com/chenchouchou888/Black Box/releases/tag/$TAG"
-echo ""
-echo " Next steps:"
-echo "   1. Verify artifacts on the release page"
-echo "   2. Update release body"
-echo "   3. Publish the release (remove draft)"
-echo "============================================"
+echo "DMG: $project_dir/$dmg_path"
+shasum -a 256 "$dmg_path"
+echo "Archived DMG: $archived_dmg"
+echo "Archived SHA-256: $archived_sha"
+printf '%s\n' "$release_manifest_result"
+echo "Local build complete. Public distribution still requires a Developer ID certificate and notarization."

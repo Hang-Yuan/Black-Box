@@ -39,7 +39,9 @@ export function ProviderCard({
 
   const formatLabel = provider.apiFormat === 'anthropic'
     ? t('provider.formatAnthropicShort')
-    : t('provider.formatOpenaiShort');
+    : provider.apiFormat === 'gemini'
+      ? t('provider.formatGeminiShort')
+      : t('provider.formatOpenaiShort');
 
   return (
     <div
@@ -56,7 +58,7 @@ export function ProviderCard({
       {/* Active indicator dot */}
       <span className={`shrink-0 block w-2.5 h-2.5 rounded-full transition-smooth
         ${isActive
-          ? 'bg-accent shadow-[0_0_4px_rgba(var(--accent-rgb,99,102,241),0.4)]'
+          ? 'bg-accent shadow-[0_0_4px_var(--color-accent-glow)]'
           : 'border-[1.5px] border-text-tertiary'
         }`}
       />

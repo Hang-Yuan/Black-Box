@@ -1,14 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
-import { useSettingsStore } from '../../stores/settingsStore';
+import { useEffect, useState } from 'react';
+import { type SettingsTab, useSettingsStore } from '../../stores/settingsStore';
 import { useT } from '../../lib/i18n';
 import { APP_NAME } from '../../lib/edition';
-import { ChangelogModal } from '../shared/ChangelogModal';
-import { isPermissionError, isNetworkError } from './settingsUtils';
 import { GeneralTab } from './GeneralTab';
 import { ProviderTab } from './ProviderTab';
 import { CliTab } from './CliTab';
-import { McpTab } from './McpTab';
-type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp';
+import { DesktopPetSetting } from './DesktopPetSetting';
 
 const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
   general: (
@@ -30,12 +27,13 @@ const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
       <path d="M4 6l3 2.5L4 11M9 11h3" />
     </svg>
   ),
-  mcp: (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-      <rect x="1" y="3" width="14" height="4" rx="1.5" />
-      <rect x="1" y="9" width="14" height="4" rx="1.5" />
-      <circle cx="4" cy="5" r="0.75" fill="currentColor" />
-      <circle cx="4" cy="11" r="0.75" fill="currentColor" />
+  desktopPet: (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5.1 7.4C3.5 7.4 2.3 8.7 2.3 10.2c0 1.8 1.5 3.1 3.3 2.6.9-.2 1.5-.8 2.4-.8s1.5.6 2.4.8c1.8.5 3.3-.8 3.3-2.6 0-1.5-1.2-2.8-2.8-2.8-1.3 0-2.1.8-2.9 1.7-.8-.9-1.6-1.7-2.9-1.7Z" />
+      <circle cx="3.2" cy="5.1" r="1.4" />
+      <circle cx="6.4" cy="3.5" r="1.4" />
+      <circle cx="9.6" cy="3.5" r="1.4" />
+      <circle cx="12.8" cy="5.1" r="1.4" />
     </svg>
   ),
 };
@@ -44,13 +42,15 @@ const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
   { id: 'general', labelKey: 'settings.tab.general' },
   { id: 'provider', labelKey: 'settings.tab.provider' },
   { id: 'cli', labelKey: 'settings.tab.cli' },
-  { id: 'mcp', labelKey: 'settings.tab.mcp' },
+  { id: 'desktopPet', labelKey: 'settings.tab.desktopPet' },
 ];
 
 export function SettingsPanel() {
   const t = useT();
   const toggleSettings = useSettingsStore((s) => s.toggleSettings);
-  const [activeTab, setActiveTab] = useState<SettingsTab>('general');
+  const activeTab = useSettingsStore((s) => s.settingsTab);
+  const setActiveTab = useSettingsStore((s) => s.setSettingsTab);
+  const cliUpdateAvailable = useSettingsStore((s) => s.cliUpdateAvailable);
 
   // Close on Escape
   useEffect(() => {
@@ -109,7 +109,10 @@ export function SettingsPanel() {
                   }`}
               >
                 <span className="flex-shrink-0 opacity-70">{TAB_ICONS[tab.id]}</span>
-                {t(tab.labelKey)}
+                <span className="min-w-0 flex-1">{t(tab.labelKey)}</span>
+                {tab.id === 'cli' && cliUpdateAvailable && (
+                  <span className="h-2 w-2 flex-shrink-0 rounded-full bg-red-500" aria-label={t('update.available')} />
+                )}
               </button>
             ))}
           </nav>
@@ -119,34 +122,20 @@ export function SettingsPanel() {
             {activeTab === 'general' && <GeneralTab />}
             {activeTab === 'provider' && <ProviderTab />}
             {activeTab === 'cli' && <CliTab />}
-            {activeTab === 'mcp' && <McpTab />}
+            {activeTab === 'desktopPet' && <DesktopPetSetting />}
           </div>
         </div>
 
-        {/* Footer: version + update */}
+        {/* Footer: local build identity only. App updates stay disabled until
+            this fork owns a signed release channel. */}
         <SettingsFooter />
       </div>
     </div>
   );
 }
 
-/* ================================================================
-   Footer with version + update controls
-   ================================================================ */
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type UpdateHandle = any;
-type UpdateStatus = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'latest' | 'error';
-
 function SettingsFooter() {
-  const t = useT();
   const [appVersion, setAppVersion] = useState('');
-  const [status, setStatus] = useState<UpdateStatus>('idle');
-  const [updateInfo, setUpdateInfo] = useState<UpdateHandle>(null);
-  const [progress, setProgress] = useState(0);
-  const [errorMsg, setErrorMsg] = useState('');
-  const [showChangelog, setShowChangelog] = useState(false);
-  const storeUpdateVersion = useSettingsStore((s) => s.updateVersion);
 
   useEffect(() => {
     import('@tauri-apps/api/app').then(({ getVersion }) =>
@@ -154,178 +143,13 @@ function SettingsFooter() {
     );
   }, []);
 
-  // Bridge auto-check result: if store has an update version, pre-fill
-  useEffect(() => {
-    if (storeUpdateVersion && status === 'idle') {
-      import('@tauri-apps/plugin-updater').then(({ check }) =>
-        check().then((update) => {
-          if (update) {
-            setUpdateInfo(update);
-            setStatus('available');
-          }
-        }).catch(() => {})
-      );
-    }
-  }, [storeUpdateVersion]);
-
-  const handleCheck = useCallback(async () => {
-    setStatus('checking');
-    setErrorMsg('');
-    try {
-      const { check } = await import('@tauri-apps/plugin-updater');
-      const update = await check();
-      if (update) {
-        setUpdateInfo(update);
-        setStatus('available');
-      } else {
-        setStatus('latest');
-        setTimeout(() => setStatus('idle'), 3000);
-      }
-    } catch (e) {
-      setErrorMsg(String(e));
-      setStatus('error');
-    }
-  }, []);
-
-  const handleDownload = useCallback(async () => {
-    if (!updateInfo) return;
-    setStatus('downloading');
-    setProgress(0);
-    try {
-      let totalLen = 0;
-      let downloaded = 0;
-      await updateInfo.downloadAndInstall((event: { event: string; data: { contentLength?: number; chunkLength: number } }) => {
-        if (event.event === 'Started' && event.data.contentLength) {
-          totalLen = event.data.contentLength;
-        } else if (event.event === 'Progress') {
-          downloaded += event.data.chunkLength;
-          if (totalLen > 0) setProgress(Math.round((downloaded / totalLen) * 100));
-        } else if (event.event === 'Finished') {
-          setProgress(100);
-        }
-      });
-      setStatus('ready');
-    } catch (e) {
-      setErrorMsg(String(e));
-      setStatus('error');
-    }
-  }, [updateInfo]);
-
-  const handleRestart = useCallback(async () => {
-    const { relaunch } = await import('@tauri-apps/plugin-process');
-    await relaunch();
-  }, []);
-
   return (
-    <>
-      <div className="flex items-center justify-between px-6 h-10
-        border-t border-border-subtle bg-bg-secondary/30 flex-shrink-0">
-        {/* Left: version */}
-        <span className="text-xs text-text-tertiary flex items-center gap-1.5">
-          <img src="/app-logo.png" alt="" className="w-[14px] h-[14px] flex-shrink-0 rounded-sm opacity-80" />
-          {APP_NAME} {appVersion ? `v${appVersion}` : '...'}
-        </span>
-
-        {/* Right: action buttons */}
-        <div className="flex items-center gap-2">
-          {/* Changelog + update-check UI hidden for now — kept for easy restore */}
-          {false && (
-          <button
-            onClick={() => setShowChangelog(true)}
-            className="px-2.5 py-1 text-xs font-medium rounded-md
-              text-text-muted hover:bg-bg-secondary hover:text-text-primary transition-smooth"
-          >
-            {t('settings.footer.changelog')}
-          </button>
-          )}
-
-          {/* Update controls — inline in footer */}
-          {false && status === 'idle' && (
-            <button
-              onClick={handleCheck}
-              className="px-2.5 py-1 text-xs font-medium rounded-md
-                border border-border-subtle text-text-muted
-                hover:bg-bg-secondary hover:text-text-primary transition-smooth"
-            >
-              {t('settings.footer.checkUpdate')}
-            </button>
-          )}
-
-          {status === 'checking' && (
-            <span className="flex items-center gap-1.5 text-xs text-text-muted">
-              <span className="w-3 h-3 border-[1.5px] border-accent/30
-                border-t-accent rounded-full animate-spin" />
-              {t('update.checking')}
-            </span>
-          )}
-
-          {status === 'latest' && (
-            <span className="text-xs text-green-500 font-medium">
-              {t('settings.footer.upToDate')}
-            </span>
-          )}
-
-          {status === 'available' && updateInfo && (
-            <button
-              onClick={handleDownload}
-              className="px-2.5 py-1 text-xs font-medium rounded-md
-                bg-accent text-text-inverse hover:bg-accent-hover transition-smooth"
-            >
-              {t('update.install')} v{updateInfo.version}
-            </button>
-          )}
-
-          {status === 'downloading' && (
-            <span className="flex items-center gap-1.5 text-xs text-text-muted">
-              <span className="w-3 h-3 border-[1.5px] border-accent/30
-                border-t-accent rounded-full animate-spin" />
-              {t('update.downloading')} {progress}%
-            </span>
-          )}
-
-          {status === 'ready' && (
-            <button
-              onClick={handleRestart}
-              className="px-2.5 py-1 text-xs font-medium rounded-md
-                bg-accent text-text-inverse hover:bg-accent-hover transition-smooth"
-            >
-              {t('update.restart')}
-            </button>
-          )}
-
-          {status === 'error' && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-red-500" title={errorMsg}>
-                {t('update.error')}
-              </span>
-              {isPermissionError(errorMsg) && (
-                <span className="text-[10px] text-amber-500">
-                  {t('error.permissionHint')}
-                </span>
-              )}
-              {isNetworkError(errorMsg) && (
-                <span className="text-[10px] text-amber-500">
-                  {t('network.firewallHint')}
-                </span>
-              )}
-              <button
-                onClick={handleCheck}
-                className="px-2 py-0.5 text-xs text-text-muted hover:text-text-primary transition-smooth"
-              >
-                {t('cli.retry')}
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Changelog modal */}
-      {showChangelog && appVersion && (
-        <ChangelogModal
-          version={appVersion}
-          onClose={() => setShowChangelog(false)}
-        />
-      )}
-    </>
+    <div className="flex h-10 flex-shrink-0 items-center px-6
+      border-t border-border-subtle bg-bg-secondary/30">
+      <span className="flex items-center gap-1.5 text-xs text-text-tertiary">
+        <img src="/app-logo.png" alt="" className="h-[14px] w-[14px] flex-shrink-0 rounded-sm opacity-80" />
+        {APP_NAME} {appVersion ? `v${appVersion}` : '...'}
+      </span>
+    </div>
   );
 }

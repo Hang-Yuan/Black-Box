@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Black Box Dev",
+  "identifier": "com.blackbox.app.dev",
+  "build": {
+    "beforeDevCommand": "node_modules/.bin/vite"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Black Box Dev",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ]
+  }
+}

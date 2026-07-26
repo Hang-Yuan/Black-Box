@@ -6,7 +6,7 @@
 //! unbalanced quotes, backticks, `$`, parentheses, CJK under non-UTF-8
 //! code pages, percent signs inside paths, etc.
 //!
-//! Historical symptoms in Her:
+//! Historical symptoms addressed by Black Box:
 //!   - User with Chinese username → PATH injection silently fails because
 //!     the path gets re-decoded as GBK mid-pipeline.
 //!   - Paths containing `'` → we used `'{}'` with `.replace('\'', "''")`

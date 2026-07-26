@@ -253,6 +253,14 @@
         {
           "cmd": "close-settings",
           "continueOnError": true
+        },
+        {
+          "cmd": "stop",
+          "continueOnError": true
+        },
+        {
+          "cmd": "delete-session",
+          "continueOnError": true
         }
       ]
     },

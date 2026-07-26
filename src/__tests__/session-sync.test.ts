@@ -1,5 +1,5 @@
 /**
- * Tests for the Her → BLACKBOX session sync (2026-04-15).
+ * Tests for Black Box session synchronization (2026-04-15).
  *
  * Covers:
  * 1. SessionInfo type contract (stdin_id + cli_session_id)
@@ -12,17 +12,27 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // --- 1. SessionInfo type contract ---
 
 describe('SessionInfo type contract', () => {
-  it('has stdin_id and cli_session_id fields', () => {
+  it('preallocates a resumable cli_session_id for new sessions', () => {
     // Simulates what Rust returns from start_claude_session
     const info = {
       stdin_id: 'desk_abc123',
-      cli_session_id: null as string | null,
+      cli_session_id: '550e8400-e29b-41d4-a716-446655440001' as string | null,
       pid: 1234,
       cli_path: '/usr/bin/claude',
+      cli_version: '2.1.211',
+      sdk_capabilities: {
+        streamJson: true,
+        permissionPromptStdio: true,
+        includeHookEvents: true,
+        forwardSubagentText: true,
+        promptSuggestions: false,
+      },
     };
 
     expect(info.stdin_id).toBe('desk_abc123');
-    expect(info.cli_session_id).toBeNull();
+    expect(info.cli_session_id).toBe('550e8400-e29b-41d4-a716-446655440001');
+    expect(info.cli_version).toBe('2.1.211');
+    expect(info.sdk_capabilities.permissionPromptStdio).toBe(true);
     expect(info).not.toHaveProperty('session_id');
   });
 
@@ -32,6 +42,14 @@ describe('SessionInfo type contract', () => {
       cli_session_id: '550e8400-e29b-41d4-a716-446655440000',
       pid: 5678,
       cli_path: '/usr/bin/claude',
+      cli_version: '2.1.211',
+      sdk_capabilities: {
+        streamJson: true,
+        permissionPromptStdio: true,
+        includeHookEvents: true,
+        forwardSubagentText: true,
+        promptSuggestions: false,
+      },
     };
 
     expect(info.cli_session_id).toBe('550e8400-e29b-41d4-a716-446655440000');
@@ -94,6 +112,25 @@ describe('sessionStore.setCliResumeId', () => {
 
     const session = useSessionStore.getState().sessions.find(s => s.id === 'tab-2');
     expect(session?.cliResumeId).toBeNull();
+  });
+
+  it('hydrates disk sessions with their JSONL id as the authoritative resume UUID', async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const { useSessionStore } = await import('../stores/sessionStore');
+    useSessionStore.setState({ sessions: [], selectedSessionId: null });
+    vi.mocked(invoke).mockResolvedValueOnce([{
+      id: '550e8400-e29b-41d4-a716-446655440000',
+      path: '/tmp/550e8400-e29b-41d4-a716-446655440000.jsonl',
+      project: '/tmp/project',
+      projectDir: '-tmp-project',
+      modifiedAt: 1,
+      preview: 'disk task',
+    }]);
+
+    await useSessionStore.getState().fetchSessions();
+
+    expect(useSessionStore.getState().sessions[0]?.cliResumeId)
+      .toBe('550e8400-e29b-41d4-a716-446655440000');
   });
 });
 

@@ -31,6 +31,10 @@
         {"cmd": "new-session", "flags": {"cwd": "/tmp/blackbox-test"}},
         {"cmd": "check-editor", "assert": {"hasEditor": true}},
         {"cmd": "status"}
+      ],
+      "teardown": [
+        {"cmd": "stop", "continueOnError": true},
+        {"cmd": "delete-session", "continueOnError": true}
       ]
     },
     {
@@ -43,6 +47,10 @@
         {"cmd": "new-session", "flags": {"cwd": "/tmp/blackbox-test"}},
         {"cmd": "delay", "args": ["2000"]},
         {"cmd": "get-active-session"}
+      ],
+      "teardown": [
+        {"cmd": "stop", "continueOnError": true},
+        {"cmd": "delete-session", "continueOnError": true}
       ]
     },
     {
@@ -60,6 +68,10 @@
         {"cmd": "new-session", "flags": {"cwd": "/tmp/blackbox-test"}},
         {"cmd": "check-editor", "assert": {"hasEditor": true}},
         {"cmd": "get-messages", "assert": {"total_lte": 0}}
+      ],
+      "teardown": [
+        {"cmd": "stop", "continueOnError": true},
+        {"cmd": "delete-session", "continueOnError": true}
       ]
     }
   ]

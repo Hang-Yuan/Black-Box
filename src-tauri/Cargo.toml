@@ -1,6 +1,6 @@
 [package]
 name = "blackbox"
-version = "0.11.0"
+version = "0.14.14"
 description = "Black Box - A beautiful GUI for Claude Code"
 authors = ["TinyZ"]
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = ["devtools", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -26,9 +26,10 @@ dirs = "6"
 notify = "7"
 base64 = "0.22"
 serde_yaml = "0.9"
-tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 reqwest = { version = "0.12", features = ["stream", "json", "multipart"] }
+axum = "0.8"
+async-stream = "0.3"
 futures-util = "0.3"
 rand = "0.8"
 trash = "5"
@@ -36,14 +37,21 @@ flate2 = "1"
 tar = "0.4"
 zip = "2"
 sha2 = "0.10"
+hmac = "0.12"
+png = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+toml = "0.8"
 tauri-plugin-mcp = { git = "https://github.com/P3GLEG/tauri-plugin-mcp" }
-
-[dev-dependencies]
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-autostart = "2.5.1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
 cocoa = "0.26"
 objc = "0.2"

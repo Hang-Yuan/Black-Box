@@ -19,6 +19,395 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.14',
+    date: '2026-07-26',
+    highlights: {
+      zh: [
+        '移除 Black Box 自建的 Plan 与网页检索 MCP 替代层；WebSearch、WebFetch、Task/Plan 状态全部直接来自当前 Claude Code 运行时',
+        'Goal、Loop 与 Workflow 只在 Claude Code 实际公布对应命令或工具时启用，Black Box 不再维护另一套 Goal 生命周期、预算或自动编排语义',
+        '文件引用会先在完整工作区中消歧再打开；目录结构文本、截断结果和重名文件不会再被误当成可预览文件',
+        '运行时没有公布 Grep 或 Glob 时保持原样，不注入、不模拟，也不通过 MCP 强行补回',
+      ],
+      en: [
+        'Removes Black Box replacements for Plan and web retrieval; WebSearch, WebFetch, and Task/Plan state now come directly from the active Claude Code runtime',
+        'Enables Goal, Loop, and Workflow only when Claude Code advertises the matching command or tool, without a second Goal lifecycle, budget, or auto-orchestration contract',
+        'Resolves file references against the complete workspace before opening them, while rejecting directory-tree text, truncated results, and ambiguous duplicate names',
+        'Leaves Grep and Glob absent when the runtime does not advertise them instead of injecting, simulating, or restoring them through MCP',
+      ],
+    },
+  },
+  {
+    version: '0.14.13',
+    date: '2026-07-26',
+    highlights: {
+      zh: [
+        'Black Box 现在使用独立的 Claude 配置根与会话存储；首次启动只迁移已由 Black Box 跟踪的历史会话，不再与 TOKENICODE 共用运行状态',
+        '恢复 Claude Code 原生 WebSearch、WebFetch、Read 与 Agent 调度，辅助模型只使用 CLI 支持的档位别名，并按运行时实际工具清单展示能力',
+        '修复图片工具结果在 OpenAI/Gemini 兼容通道中的保真传递、文件路径预览、结构树误识别和长任务组菜单的视口自适应交互',
+        'Provider 凭据改为 Black Box 私有、仅当前用户可读的本地配置，避免 macOS 钥匙串重复授权弹窗',
+      ],
+      en: [
+        'Black Box now uses an independent Claude configuration root and session store; first launch migrates only conversations already tracked by Black Box instead of sharing runtime state with TOKENICODE',
+        'Restores native Claude Code WebSearch, WebFetch, Read, and Agent routing, constrains auxiliary models to CLI-supported tiers, and reflects the runtime tool inventory exactly',
+        'Preserves image tool results through OpenAI/Gemini-compatible providers and fixes file-path previews, structure-tree misclassification, and viewport-aware task-group menus',
+        'Stores provider credentials in a private owner-only Black Box configuration file to avoid recurring macOS Keychain authorization prompts',
+      ],
+    },
+  },
+  {
+    version: '0.14.12',
+    date: '2026-07-23',
+    highlights: {
+      zh: [
+        '补回前端 Home 目录桥接对应的原生命令，技能创建、波浪线路径解析和历史会话路径显示不再因命令缺失静默失败',
+        '与上游 v0.11.0 后续维护历史完成兼容收口，同时保留 Black Box 新的作用域感知 MCP 管理器、发布链和默认关闭的下一代架构',
+      ],
+      en: [
+        'Restores the native command behind the frontend home-directory bridge so skill creation, tilde-path resolution, and historical-session path display no longer fail on a missing command',
+        'Reconciles the post-v0.11.0 upstream maintenance history while preserving Black Box’s scope-aware MCP manager, release pipeline, and default-disabled next-generation architecture',
+      ],
+    },
+  },
+  {
+    version: '0.14.11',
+    date: '2026-07-23',
+    highlights: {
+      zh: [
+        '随应用固化下一代 Runtime、SQLite Memory、RAG 授权、PetPack 与托管模型合同的隔离架构；所有实验能力继续默认关闭，不接入现役记忆、真实模型请求或支付',
+        'Memory 隔离演练补充授权生命周期、日志时间单调性与系统时钟回拨防护，失败验证不会消耗单次授权',
+        '每次 Memory operator 日志追加都会在提交前复验完整语义链、授权绑定与 authority state，降低损坏记录进入恢复链的风险',
+      ],
+      en: [
+        'Ships the isolated next-generation Runtime, SQLite Memory, RAG consent, PetPack, and managed-provider contracts with every experimental capability still disabled by default and disconnected from live memory, model requests, and billing',
+        'Hardens isolated Memory rehearsals with bounded authorization lifetimes, journal-monotonic timestamps, and system-clock rollback protection without consuming a one-shot authorization on failed validation',
+        'Revalidates the full Memory operator semantic chain, authorization binding, and authority state before every journal append is committed',
+      ],
+    },
+  },
+  {
+    version: '0.14.10',
+    date: '2026-07-18',
+    highlights: {
+      zh: [
+        '旧客户端会话继续以只读方式增量导入，但兼容磁盘标识改为仅在运行时解码，Black Box 源码、日志、界面和正式二进制均不再携带旧产品名',
+        '修复 macOS 自带 Bash 在目标 DMG 目录为空时触发未绑定数组错误，空目录与已有安装包两种本地构建路径都可稳定进入完整校验链',
+        '九家 Provider 始终保留四个可独立选择和保存的逻辑档位；即使供应商暂时让多档共用同一个上游模型，也不会再被界面去重吞掉',
+        '本地 DMG 现在附带不可变来源清单，将安装包哈希绑定到候选源码树和全文件聚合哈希，并明确标注本地 ad-hoc 签名、未公证和不可公开分发的信任边界',
+        '候选审计现在强制配置本机私有路径哨兵，Rust 编译来源统一映射为中性相对路径，安装包会拒绝真实用户目录与旧构建伪路径',
+        '扩展中心原生验收跟随新的任务模式交互：主按钮只负责切换 Workflow、Loop、Goal，管理按钮单独打开说明；三种浮层、Agent Team 开关和 1280×800 布局全部通过复验',
+        '隔离测试清理扩大到 Claude session 元数据与 shell 快照，任何 Black Box 测试会话结束后都会连同索引和运行残留一起清零',
+      ],
+      en: [
+        'Retired-client sessions remain available through read-only incremental import, while compatibility disk identifiers are decoded only at runtime so the old product name is absent from current source, logs, UI, and release binaries',
+        'Local macOS packaging now handles an empty target DMG directory under the system Bash as reliably as one containing preserved artifacts, without an unbound-array failure',
+        'All nine providers now retain four independently selectable and persistable logical slots, even when a provider temporarily maps multiple slots to the same upstream model',
+        'Local DMGs now carry an immutable provenance manifest binding the installer hash to the candidate source tree and aggregate file hash, while explicitly recording ad-hoc signing, no notarization, and the local-only trust boundary',
+        'Candidate auditing now requires private-path sentinels, maps Rust provenance to a neutral relative root, and rejects both real user directories and the obsolete synthetic build root from the app bundle',
+        'Native extension acceptance now follows the task-mode interaction contract: primary buttons select Workflow, Loop, or Goal while separate manage buttons open explanations; all three popovers, the Agent Team switch, and the 1280×800 layout pass validation',
+        'Isolated cleanup now covers Claude session metadata and shell snapshots so every Black Box test conversation leaves with its indexes and runtime residue removed',
+      ],
+    },
+  },
+  {
+    version: '0.14.8',
+    date: '2026-07-18',
+    highlights: {
+      zh: [
+        'Workflow、Loop 与 Goal 主模式切换现在会同步收起所有旧管理浮层，保证顶部始终只有一个任务模式和一层操作界面处于活动状态',
+        '隔离 WebView 复验覆盖三种模式交叉切换、主输入框编排提示和 1280×800 布局边界，测试会话与索引在验收后立即清零',
+      ],
+      en: [
+        'Switching the primary Workflow, Loop, or Goal mode now closes every stale management popover so the header keeps exactly one active task mode and one interaction layer',
+        'Isolated WebView validation now covers cross-mode switching, main-composer orchestration guidance, and 1280×800 layout bounds, with test conversations and indexes cleared immediately after acceptance',
+      ],
+    },
+  },
+  {
+    version: '0.14.7',
+    date: '2026-07-18',
+    highlights: {
+      zh: [
+        'Workflow 默认进入自动编排：任务只需写在当前主输入框，先展示可见阶段，再按当前 CLI 实际提供的 Workflow、Plan、Task 或 Agent 能力执行；没有真实工具回执时不会伪造运行状态',
+        '斜杠命令目录改为运行时权威：Black Box 只保留自己的界面控件，Claude 命令、Skills、Workflows、插件与 MCP 能力随当前 CLI 实时更新，不再被旧静态清单截断或冒充',
+        'CLI 更新与重装失败会给出网络、会话占用、已安排任务、SDK 损坏、权限或安装渠道的处理建议，并将完整原始错误保留在可展开技术详情中',
+        '修复 Activity 空状态触发的 React 无限更新崩溃，并强化候选审计对已删除旧文件的处理，避免退休文件重新进入新版本候选包',
+      ],
+      en: [
+        'Workflow now defaults to automatic orchestration: author the task only in the current composer, see its stages first, and use only Workflow, Plan, Task, or Agent capabilities actually exposed by the active CLI; no runtime state is fabricated without a real tool receipt',
+        'The slash catalogue is now runtime-authoritative: Black Box keeps only its own UI controls while Claude commands, Skills, Workflows, plugins, and MCP capabilities update from the active CLI without stale truncation or synthetic entries',
+        'CLI update and reinstall failures now provide actionable network, session, scheduled-task, SDK-runtime, permission, or installation-owner guidance while preserving the full raw error in expandable technical details',
+        'An Activity empty-state React update loop is fixed, and candidate auditing now omits intentionally deleted legacy files so retired source cannot re-enter a new release candidate',
+      ],
+    },
+  },
+  {
+    version: '0.14.5',
+    date: '2026-07-18',
+    highlights: {
+      zh: [
+        '任务组、归档、置顶、排序与自定义名称可导出为独立组织包，并在另一台电脑安全合并；组织包不包含对话正文、API 钥匙或 CLI 配置',
+        '会话组织元数据升级为统一原子权威层，旧数据自动迁移；跨电脑导入采用本地优先合并并保留删除墓碑，避免旧备份复活已移除状态',
+        '桌面伙伴扩展为完整原生悬浮系统：20 个内置形象、自主捏制、六种任务状态、跨桌面置顶、位置恢复与独立关闭控制',
+      ],
+      en: [
+        'Task groups, archives, pins, ordering, and custom names can now be exported as a portable organization bundle and safely merged on another Mac without conversation content, API keys, or CLI configuration',
+        'Conversation organization now uses one atomic metadata authority with automatic migration; local-first imports honor deletion tombstones so stale backups cannot resurrect removed state',
+        'The desktop companion is now a complete native floating system with 20 built-in characters, a custom maker, six task states, cross-space pinning, position recovery, and independent close controls',
+      ],
+    },
+  },
+  {
+    version: '0.14.4',
+    date: '2026-07-15',
+    highlights: {
+      zh: [
+        'Goal、Workflow、Loop、Steer 与 Queue 统一回到主对话输入框，模式切换、目标状态、长链路进度和具体子智能体身份可直接查看',
+        '任务组、排序、置顶与归档进入 Black Box 原子元数据层；退休客户端历史可只读增量导入，归档按原任务组默认折叠且不显示累计数字',
+        'Hook 新建与完整扫描、内置本机时间上下文、最新斜杠命令、文件行号精确跳转、Scheduled 未读收口、CLI 更新红点与沙漏桌面伙伴同步上线',
+      ],
+      en: [
+        'Goal, Workflow, Loop, Steer, and Queue now live in the main composer, with visible mode state, durable goals, long-running progress, and concrete subagent identity',
+        'Task groups, ordering, pins, and archives now use Black Box’s atomic metadata authority; retired-client history imports incrementally and read-only, while archives retain collapsed groups without lifetime counters',
+        'Hook creation and complete discovery, built-in local time context, current slash commands, exact file-line navigation, Scheduled unread settlement, CLI update indicators, and the hourglass desktop companion now ship together',
+      ],
+    },
+  },
+  {
+    version: '0.14.3',
+    date: '2026-07-15',
+    highlights: {
+      zh: [
+        '应用内 CLI 更新会识别回合已完成但仍保持连接的对话，经确认后安全落盘并保留续接信息',
+        '正在生成、重连、等待用户回答及正在运行的已安排任务不会被更新器强行终止',
+        'CLI 更新期间暂停新对话与新定时执行，失败原因完整显示并提供中文处理提示',
+      ],
+      en: [
+        'In-app CLI updates now recognize completed conversations that still keep a warm connection, safely flush them after confirmation, and preserve resume state',
+        'Generating, reconnecting, user-awaiting, and running scheduled work is never force-stopped by the updater',
+        'New conversations and scheduled launches pause during CLI maintenance, while update failures remain fully visible with actionable guidance',
+      ],
+    },
+  },
+  {
+    version: '0.14.2',
+    date: '2026-07-15',
+    highlights: {
+      zh: [
+        '九家 Provider 统一提供具体的主对话模型与辅助任务模型选择，Agent、Agent Teams 与网页检索强制使用轻量辅助模型',
+        '扩展中心、独立 Scheduled 页面、Activity 长链进度与三项核心设置完成统一信息架构',
+        'AskUserQuestion、会话级权限、运行中 Steer、历史分支与并排对照形成完整任务交互链',
+      ],
+      en: [
+        'Nine providers now expose concrete primary and auxiliary model selectors, with Agents, Agent Teams, and web retrieval enforced onto the lighter auxiliary model',
+        'A unified information architecture now covers Extension Center, the standalone Scheduled page, long-running Activity progress, and three focused Settings sections',
+        'AskUserQuestion, session-scoped permissions, live Steer, historical forks, and side-by-side comparison complete the task interaction flow',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '模型与 Provider', en: 'Models and providers' },
+        items: {
+          zh: [
+            '固定 Claude、OpenAI、Gemini、DeepSeek、GLM、豆包、千问、MiniMax 与 Kimi 九家目录，并按各家实际模型直接展示可选档位',
+            '主对话与辅助任务在会话启动时冻结；缺失辅助模型时明确失败，不会静默回退到昂贵主模型',
+            'API 钥匙/中转站可从顶栏快速切换，凭据继续保存在系统凭据层，界面只显示脱敏信息',
+          ],
+          en: [
+            'A fixed catalog covers Claude, OpenAI, Gemini, DeepSeek, GLM, Doubao, Qwen, MiniMax, and Kimi with provider-specific concrete model choices',
+            'Primary and auxiliary models are frozen when a session starts; a missing auxiliary model fails explicitly instead of silently falling back to the expensive primary model',
+            'API providers and keys can be switched from the header while credentials remain in the system credential layer and only masked hints appear in the UI',
+          ],
+        },
+      },
+      {
+        label: { zh: '任务交互与可见性', en: 'Task interaction and visibility' },
+        items: {
+          zh: [
+            'AskUserQuestion 支持一次 1–3 问、单选、多选、Other 与跳过；会话权限只在规则完全一致时自动续用',
+            '运行中的任务可继续接收 Steer 引导；Activity 侧栏展示 Plan、Goal、Workflow、Loop、Agent Team 与 Scheduled 的真实状态',
+            '任意历史消息可安全分支到独立 Claude 会话，任意两条已完成会话可只读并排比较且不改变主任务身份',
+            '归档保留原任务组并默认折叠；深层文件树按需加载，不再在约八层后丢失文件',
+          ],
+          en: [
+            'AskUserQuestion supports one to three prompts, single and multiple choice, Other, and skip; session permissions are reused only for exactly matching rules',
+            'Running tasks accept live Steer guidance, while the Activity sidebar shows authoritative Plan, Goal, Workflow, Loop, Agent Team, and Scheduled state',
+            'Any historical message can fork into an independent Claude session, and any two completed conversations can be compared side by side without changing the primary task identity',
+            'Archives preserve their original task groups and stay collapsed by default; deep file trees load on demand without losing files beyond roughly eight levels',
+          ],
+        },
+      },
+      {
+        label: { zh: 'macOS 与可靠性', en: 'macOS and reliability' },
+        items: {
+          zh: [
+            '保持 macOS 原生红黄绿窗口控件，红叉安全收口活跃 CLI 后真实退出；运行中可按需防止系统休眠',
+            '关闭、刷新、回退和 compact 继续使用 canonical UUID/JSONL，provider/model 不兼容时保留原任务并明确失败',
+            '隔离测试退出后会话、Scheduled、MCP 与 WebKit 状态全部清零，测试对话不会进入正式会话或记忆扫描',
+          ],
+          en: [
+            'Native macOS traffic-light controls remain intact; the red close button safely settles active CLIs before exiting, and active work can keep the system awake when required',
+            'Close, reload, rewind, and compact preserve the canonical UUID and JSONL; provider or model incompatibility keeps the original task and fails explicitly',
+            'Isolated tests remove conversation, Scheduled, MCP, and WebKit state on exit so test chats cannot enter production sessions or memory scans',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.14.1',
+    date: '2026-07-12',
+    highlights: {
+      zh: [
+        '顶栏以大号具体模型开头，并可直接切换 Agent Teams、API 钥匙/中转站与权限模式',
+        'Claude Code 原生命令与 Skill 改为从 system:init 动态发现，不再受旧版静态清单限制',
+        '左侧工作区只显示末级文件夹名，移除括号上级目录与重复路径',
+      ],
+      en: [
+        'The top bar now leads with the concrete model and provides direct Agent Teams, API provider/key, and permission controls',
+        'Claude Code native commands and Skills are discovered from system:init instead of a stale compiled catalogue',
+        'The sidebar shows only the leaf workspace name, without parent-name suffixes or duplicate paths',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '命令与交互', en: 'Commands and interaction' },
+        items: {
+          zh: [
+            '原生 slash command 与 Skill 按工作目录合并，保留已有说明并标记当前运行时真实可用能力',
+            'Claude 原生 `/goal` 不再被 Black Box 截获；Codex 风格持久 Goal 保留在顶栏，并提供明确的 `/codex-goal` 别名',
+            '窄窗口下 Workflow、Loop、Goal 自动收为 W/L/G 紧凑按钮，避免与钥匙或权限选择器重叠',
+          ],
+          en: [
+            'Native slash commands and Skills merge per workspace while preserving rich local descriptions and runtime availability',
+            'Claude native `/goal` is no longer shadowed; the Codex-style persistent Goal stays in the toolbar with an explicit `/codex-goal` alias',
+            'Workflow, Loop, and Goal collapse to compact W/L/G controls in narrow windows to prevent header overlap',
+          ],
+        },
+      },
+      {
+        label: { zh: '模型与工作区', en: 'Model and workspace' },
+        items: {
+          zh: [
+            '当前 API 供应商/钥匙菜单只显示名称和脱敏末四位，并可进入完整供应商管理',
+            '当前具体模型固定在顶栏最左侧；当前文件夹从顶栏移除，工作区完整路径仍只作为内部上下文使用',
+          ],
+          en: [
+            'The API provider/key menu shows only provider names and masked last-four hints, with a direct path to provider management',
+            'The concrete model stays at the far left of the header; the current folder is removed while its full path remains internal context',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.14.0',
+    date: '2026-07-12',
+    highlights: {
+      zh: [
+        '会话续接全面加固：关闭、刷新、回退与 compact 后继续使用同一条 Claude 会话',
+        '新增持久 Goal、结构化 Plan、原生 Loop、Workflow 与五档权限模式',
+        'Scheduled、Worktree、Handoff、逐文件审查和恢复快照组成完整任务闭环',
+        '归档、任务组、深层文件树、扩展中心与顶部实际模型显示完成统一收口',
+      ],
+      en: [
+        'Hardened conversation continuity across native close, reload, rewind, and compact while preserving the same Claude session',
+        'Persistent Goal, structured Plan, native Loop, Workflow, and five explicit permission modes',
+        'A complete Scheduled and Worktree lifecycle with Handoff, file review, and recovery snapshots',
+        'Unified archive, task groups, deep file trees, Extension Center, and resolved-model visibility',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '任务与 Agent', en: 'Tasks and agents' },
+        items: {
+          zh: [
+            'Goal 支持证据完成、暂停/恢复、token 预算与重启后保守恢复；Plan 跨刷新和原生重启持久化',
+            'Loop 直接使用 Claude Code 原生 Cron 工具；Workflow 绑定真实 task、run、phase 与重载恢复',
+            'Agent Teams 作为显式实验开关，交互与 Scheduled 均保留 named teammate、共享任务和工具归属',
+            'Scheduled run 拥有可续接会话、一级收件箱、Git Worktree、Create branch 与 Local↔Worktree Handoff',
+          ],
+          en: [
+            'Goal supports evidence-backed completion, pause/resume, token budgets, and conservative restart recovery; Plan persists across reloads and native relaunches',
+            'Loop uses Claude Code native Cron tools, while Workflow binds real tasks, runs, phases, and reload recovery',
+            'Agent Teams is an explicit experimental opt-in with named teammates, shared tasks, and tool ownership in chat and Scheduled runs',
+            'Scheduled runs now have resumable sessions, a first-class inbox, Git worktrees, Create branch, and Local-to-Worktree Handoff',
+          ],
+        },
+      },
+      {
+        label: { zh: '可靠性与体验', en: 'Reliability and experience' },
+        items: {
+          zh: [
+            '红叉与 Cmd-Q 会先安全收口全部活跃 CLI 再退出；关闭应用后本地 Scheduled 不继续运行',
+            'reload、侧栏刷新、回退、manual/auto compact 与历史 compact 会话统一保持 canonical UUID 和 JSONL',
+            '归档按原任务组展示且默认折叠，不显示不断增长的累计数字；文件树可按需展开至少 12 层',
+            '顶部显示 provider 实际解析模型；Manual、Accept Edits、Plan、Auto、Bypass 可实时切换且不会混入用户正文',
+            '扩展中心统一 Plugin、Skill、MCP 与 Workflow；marketplace 和 OAuth 均保持显式用户操作，不静默改配置',
+          ],
+          en: [
+            'The red close control and Cmd-Q settle every active CLI before exit; local Scheduled tasks do not keep running after the app exits',
+            'Reload, sidebar refresh, rewind, manual/auto compact, and historical compact sessions preserve one canonical UUID and JSONL',
+            'Archived tasks retain their original groups, stay collapsed by default, and show no ever-growing total; file trees expand on demand beyond twelve levels',
+            'The top bar shows the provider-resolved model, with live Manual, Accept Edits, Plan, Auto, and Bypass controls that never leak into user text',
+            'Extension Center unifies Plugins, Skills, MCP, and Workflow while keeping marketplace and OAuth changes explicitly user-driven',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.13.0',
+    date: '2026-07-11',
+    highlights: {
+      zh: [
+        '新增 Codex 式已安排任务：定时后台执行、运行收件箱、工具轨迹与独立 Git 工作树',
+        '新增完整 MCP 与 Claude Plugin 管理，并显示 Skill、MCP 和子代理的真实调用归属',
+        '模型选择统一为 Fable、Opus、Sonnet、Haiku 四档，由当前 API 配置映射具体模型',
+        '新增 4 套背景材质与 4 套强调色，可独立组合并跟随浅色、深色或系统模式',
+      ],
+      en: [
+        'Codex-style Scheduled Tasks with background runs, an inbox, tool traces, and isolated Git worktrees',
+        'Full MCP and Claude Plugin management with visible Skill, MCP, and subagent ownership',
+        'Four stable model tiers—Fable, Opus, Sonnet, and Haiku—resolved by the active API provider',
+        'Four surfaces and four accents that combine independently across light, dark, and system modes',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: 'Agent 能力', en: 'Agent capabilities' },
+        items: {
+          zh: [
+            '已安排任务支持 Cron 独立运行与 Heartbeat 回到原会话；窗口关闭后调度器继续运行，异常退出会恢复遗留状态',
+            'Scheduled run 保存脱敏 Skill / Tool / MCP / Subagent 轨迹；无人值守执行采用精确许可与 fail-closed sandbox',
+            'MCP 支持 local / project / user scope、项目审批、stdio / HTTP / SSE / WebSocket、health 与 OAuth 委托',
+            'Plugin Manager 支持 marketplace、发现、安装、scope、启停、更新、详情和保留数据卸载',
+          ],
+          en: [
+            'Scheduled Tasks support independent Cron runs and Heartbeats back to an existing conversation; scheduling continues after the window closes and interrupted state recovers on restart',
+            'Scheduled runs retain redacted Skill, Tool, MCP, and Subagent traces with precise unattended permissions and a fail-closed sandbox',
+            'MCP supports local, project, and user scopes, project approval, stdio, HTTP, SSE, WebSocket, health checks, and delegated OAuth',
+            'Plugin Manager covers marketplaces, discovery, installation, scopes, enable/disable, updates, details, and uninstall with optional data retention',
+          ],
+        },
+      },
+      {
+        label: { zh: '体验与安全', en: 'Experience and safety' },
+        items: {
+          zh: [
+            'Claude CLI 更新会识别当前安装 owner，不再悄悄安装第二份 CLI；运行中的会话或任务会阻止升级',
+            '旧的上游 Black Box 自动更新通道已停用，避免自有版本被错误覆盖',
+            '设置页完成中英双语，主题正文、次级文字、用户气泡与交互焦点通过对比度回归',
+          ],
+          en: [
+            'Claude CLI updates follow the current installation owner instead of silently installing a second CLI, and are blocked while sessions or tasks are running',
+            'The inherited upstream Black Box updater channel is disabled so this fork cannot be overwritten by the wrong release',
+            'Settings are bilingual, with contrast regressions covering text, user bubbles, and interaction focus across the theme system',
+          ],
+        },
+      },
+    ],
+  },
+  {
     version: '0.11.0',
     date: '2026-06-10',
     highlights: {
@@ -114,12 +503,12 @@ export const CHANGELOG: ChangelogEntry[] = [
         label: { zh: '修复', en: 'Fixed' },
         items: {
           zh: [
-            '拖拽文件落点更准 — 拖拽改用 Webview API + DPR 感知坐标，高分屏下识别更准（从 Her 同步，#209）',
-            '微信分享更可靠 — 增加剪贴板 + URL scheme 兜底（从 Her 同步，#214）',
+            '拖拽文件落点更准 — 拖拽改用 Webview API + DPR 感知坐标，高分屏下识别更准',
+            '微信分享更可靠 — 增加剪贴板 + URL scheme 兜底',
           ],
           en: [
-            'More accurate file drag-and-drop — switched to the Webview drag API with DPR-aware coordinates for high-DPI displays (synced from Her, #209)',
-            'More reliable WeChat sharing — added clipboard + URL scheme fallback (synced from Her, #214)',
+            'More accurate file drag-and-drop — switched to the Webview drag API with DPR-aware coordinates for high-DPI displays',
+            'More reliable WeChat sharing — added clipboard and URL-scheme fallbacks',
           ],
         },
       },
@@ -1327,7 +1716,7 @@ export const CHANGELOG: ChangelogEntry[] = [
         '修复中文输入法偶发丢失焦点',
         '新增/导入 API 后自动生效，无需手动选择',
         'VPN 关闭后 API 自动切换直连，无需手动操作',
-        '双版本体系 — 一套代码支持 TCAlpha 内测版和 BLACKBOX 稳定版',
+        '双版本体系 — 一套代码支持 Black Box Preview 内测版和 Black Box 稳定版',
       ],
       en: [
         'Fix long conversation freeze — Streaming no longer stalls after 5+ turns, major performance improvement',
@@ -1337,7 +1726,7 @@ export const CHANGELOG: ChangelogEntry[] = [
         'Fix CJK IME occasionally losing focus',
         'New/imported API providers auto-activate',
         'Auto-switch to direct connection when VPN is off',
-        'Dual-edition system — One codebase supports TCAlpha and BLACKBOX',
+        'Dual-edition system — One codebase supports Black Box Preview and Black Box',
       ],
     },
   },

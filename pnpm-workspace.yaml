@@ -1,2 +1,8 @@
 allowBuilds:
   esbuild: true
+overrides:
+  '@tiptap/core': 3.20.0
+  '@tiptap/extension-bubble-menu': 3.20.0
+  '@tiptap/extension-floating-menu': 3.20.0
+  '@tiptap/extension-list': 3.20.0
+  '@tiptap/extensions': 3.20.0
