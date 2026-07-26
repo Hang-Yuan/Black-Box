@@ -3250,15 +3250,15 @@ async fn start_claude_session(
     // (company gateway, localhost, private IP) — these don't need a proxy.
     {
         // Determine the effective ANTHROPIC_BASE_URL: provider > shell env > process env.
-        let effective_base_url = resolved_env
-            .get("ANTHROPIC_BASE_URL")
-            .cloned()
-            .or_else(|| {
-                login_shell_anthropic_env()
-                    .get("ANTHROPIC_BASE_URL")
-                    .cloned()
-            })
-            .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
+        let effective_base_url = resolved_env.get("ANTHROPIC_BASE_URL").cloned();
+        #[cfg(not(target_os = "windows"))]
+        let effective_base_url = effective_base_url.or_else(|| {
+            login_shell_anthropic_env()
+                .get("ANTHROPIC_BASE_URL")
+                .cloned()
+        });
+        let effective_base_url =
+            effective_base_url.or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
         // Skip auto proxy when a non-public endpoint is configured.
         // localhost / private IP / corporate TLDs don't need a system proxy.
         // If the user has set a custom ANTHROPIC_BASE_URL at all, we also
@@ -11187,16 +11187,18 @@ async fn start_claude_login(app: AppHandle) -> Result<(), String> {
             .map_err(|e| format!("Failed to start login (tried '{}'): {}", claude_bin, e))?
     };
     #[cfg(not(target_os = "windows"))]
-    let mut login_command = Command::new(&claude_bin);
-    client_runtime::apply_to_tokio_command(&mut login_command)?;
-    let mut child = login_command
-        .args(["login"])
-        .env("PATH", &enriched_path)
-        .env_remove("CLAUDECODE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start login (tried '{}'): {}", claude_bin, e))?;
+    let mut child = {
+        let mut login_command = Command::new(&claude_bin);
+        client_runtime::apply_to_tokio_command(&mut login_command)?;
+        login_command
+            .args(["login"])
+            .env("PATH", &enriched_path)
+            .env_remove("CLAUDECODE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start login (tried '{}'): {}", claude_bin, e))?
+    };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -12291,6 +12293,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
+            #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
