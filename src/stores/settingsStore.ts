@@ -79,6 +79,8 @@ interface SettingsState {
   mainView: MainView;
   workingDirectory: string;
   selectedModel: ModelTier;
+  /** Custom model ID from ANTHROPIC_CUSTOM_MODEL_OPTION that overrides tier resolution. */
+  customModelId: string | null;
   /** Lightweight model slot used by every subagent and Black Box web retrieval. */
   auxiliaryModel: ModelTier;
   sessionMode: SessionMode;
@@ -185,6 +187,7 @@ export const useSettingsStore = create<SettingsState>()(
       agentPanelOpen: false,
       workingDirectory: '',
       selectedModel: 'sonnet',
+      customModelId: null,
       auxiliaryModel: 'sonnet',
       sessionMode: 'bypass',
       locale: 'zh',
@@ -259,7 +262,12 @@ export const useSettingsStore = create<SettingsState>()(
       setSelectedModel: (model) => {
         const old = get().selectedModel;
         const next = normalizeModelTier(model);
-        set(() => ({ selectedModel: next }));
+        if (typeof model === 'string' && !isModelTier(model)) {
+          // Custom model — store as override, keep tier unchanged.
+          set(() => ({ customModelId: model }));
+        } else {
+          set(() => ({ selectedModel: next, customModelId: null }));
+        }
         if (old !== next) settingsEvents.emit('model-changed', { old, next });
       },
 

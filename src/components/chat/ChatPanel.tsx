@@ -580,9 +580,10 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
 
   // Context pressure warning: threshold depends on model context window size
   // 1M models → warn at 600K; others at 120K (60% of 200K).
-  const selectedModel = useSettingsStore((s) => s.selectedModel);
-  const selectedModelResolution = resolveModelOrError(selectedModel);
-  const resolvedModel = selectedModelResolution.ok ? selectedModelResolution.model : '';
+  const _selectedModel = useSettingsStore((s) => s.selectedModel);
+  const _customModelId = useSettingsStore((s) => s.customModelId);
+  const selectedModelResolution = resolveModelOrError(_selectedModel);
+  const resolvedModel = _customModelId ?? (selectedModelResolution.ok ? selectedModelResolution.model : '');
   const is1MContextModel = isOneMillionModel(resolvedModel);
   const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
   const inputTokens = sessionMeta.inputTokens || 0;
@@ -651,7 +652,8 @@ export function ChatPanel() {
   const agentPanelOpen = useSettingsStore((s) => s.agentPanelOpen);
   const agentTeamsEnabled = useSettingsStore((s) => s.agentTeamsEnabled);
   const toggleAgentPanel = useSettingsStore((s) => s.toggleAgentPanel);
-  const selectedModel = useSettingsStore((s) => s.selectedModel);
+  const _selModel = useSettingsStore((s) => s.selectedModel);
+  const _customModel = useSettingsStore((s) => s.customModelId);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const directoryMissing = useFileStore((s) => s.directoryMissing);
   const activeProvider = useProviderStore((s) => {
@@ -659,8 +661,8 @@ export function ChatPanel() {
     return s.providers.find((p) => p.id === s.activeProviderId) ?? null;
   });
   const selectedModelResolution = useMemo(
-    () => resolveModelOrError(selectedModel),
-    [selectedModel, activeProvider],
+    () => resolveModelOrError(_selModel),
+    [_selModel, _customModel, activeProvider],
   );
   const resolvedHeaderModel = (
     (sessionStatus === 'running' || sessionStatus === 'stopping') && sessionMeta.model

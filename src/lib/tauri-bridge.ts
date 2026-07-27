@@ -1096,6 +1096,9 @@ export const bridge = {
   installNodeEnv: () =>
     invoke<void>('install_node_env'),
 
+  getNativeCustomModelOptions: () =>
+    invoke<Array<{ model_id: string; label: string; description: string }>>('get_native_custom_model_options'),
+
   startClaudeLogin: () =>
     invoke<void>('start_claude_login'),
 

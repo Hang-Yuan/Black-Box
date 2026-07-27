@@ -7,6 +7,7 @@ import {
   type ModelTier,
   type ThinkingLevel,
 } from '../stores/settingsStore';
+import { bridge } from '../lib/tauri-bridge';
 
 /**
  * Legacy/exact ids mapped to their stable logical tier. Fable is deliberately
@@ -49,13 +50,54 @@ export interface ModelDisplayOption {
 }
 
 function logicalModelDisplayOptions(): ModelDisplayOption[] {
-  return MODEL_OPTIONS.map((model) => ({
+  const base: ModelDisplayOption[] = MODEL_OPTIONS.map((model) => ({
     id: model.id,
     label: model.label,
     short: model.short,
     mapped: false,
     isExtra: false,
   }));
+  // Append native custom model options configured via ANTHROPIC_CUSTOM_MODEL_OPTION.
+  // These come from the login shell and are read once from the Rust bridge.
+  if (NATIVE_CUSTOM_MODEL_OPTIONS.length > 0) {
+    for (const opt of NATIVE_CUSTOM_MODEL_OPTIONS) {
+      base.push({
+        id: opt.model_id,
+        label: opt.label,
+        short: opt.label,
+        mapped: false,
+        isExtra: true,
+        providerModel: opt.model_id,
+        sourceTier: 'custom',
+      });
+    }
+  }
+  return base;
+}
+
+// Lazy-init cache for native custom model options from the login shell.
+let NATIVE_CUSTOM_MODEL_OPTIONS: Array<{
+  model_id: string;
+  label: string;
+  description: string;
+}> = [];
+let NATIVE_CUSTOM_MODEL_OPTIONS_LOADED = false;
+let _onNativeOptionsLoaded: (() => void) | null = null;
+
+export function initNativeCustomModelOptions(): void {
+  if (NATIVE_CUSTOM_MODEL_OPTIONS_LOADED) return;
+  NATIVE_CUSTOM_MODEL_OPTIONS_LOADED = true;
+  bridge.getNativeCustomModelOptions()
+    .then((opts) => {
+      NATIVE_CUSTOM_MODEL_OPTIONS = opts;
+      if (_onNativeOptionsLoaded) _onNativeOptionsLoaded();
+    })
+    .catch(() => {}); // Silently ignore — custom options are nice-to-have
+}
+
+/** Register a callback fired after native custom model options are loaded. */
+export function onNativeCustomModelOptionsLoaded(cb: () => void): void {
+  _onNativeOptionsLoaded = cb;
 }
 
 function formatKnownProviderModel(modelId: string): string {
@@ -304,6 +346,8 @@ function resolveModelAgainstProvider(
  */
 export function resolveModelOrError(selectedModel: string): ModelResolution {
   const provider = useProviderStore.getState().getActive();
+  const customModel = useSettingsStore.getState().customModelId;
+  if (customModel) return { ok: true, model: customModel };
   return resolveModelAgainstProvider(selectedModel, provider);
 }
 
@@ -341,8 +385,11 @@ export function captureSpawnConfiguration(): SpawnConfigurationCapture {
   const settings = useSettingsStore.getState();
   const providerId = providerState.activeProviderId ?? '';
   const provider = providerState.providers.find((entry) => entry.id === providerId) ?? null;
+  // Custom model (e.g. from ANTHROPIC_CUSTOM_MODEL_OPTION) bypasses tier resolution.
   const selectedModel = normalizeModelTier(settings.selectedModel);
-  const resolution = resolveModelAgainstProvider(selectedModel, provider);
+  const resolution: ModelResolution = settings.customModelId
+    ? { ok: true, model: settings.customModelId }
+    : resolveModelAgainstProvider(selectedModel, provider);
   if (!resolution.ok) return resolution;
   const auxiliaryModelTier = normalizeModelTier(settings.auxiliaryModel);
   const auxiliaryResolution = resolveModelAgainstProvider(auxiliaryModelTier, provider);

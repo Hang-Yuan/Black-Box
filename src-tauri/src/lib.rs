@@ -1257,6 +1257,38 @@ fn should_inject_login_shell_provider_env(provider_id: Option<&str>) -> bool {
     provider_id.is_none()
 }
 
+/// Expose native custom model option to the frontend so the model selector
+/// can show user-configured models (e.g. ANTHROPIC_CUSTOM_MODEL_OPTION) alongside
+/// the four standard tiers. Only meaningful in native mode (no provider).
+#[derive(Debug, Clone, serde::Serialize)]
+struct NativeCustomModelOption {
+    model_id: String,
+    label: String,
+    description: String,
+}
+
+#[tauri::command]
+fn get_native_custom_model_options() -> Vec<NativeCustomModelOption> {
+    let env_map = login_shell_anthropic_env();
+    let model_id = match env_map.get("ANTHROPIC_CUSTOM_MODEL_OPTION") {
+        Some(v) => v.clone(),
+        None => return vec![],
+    };
+    let label = env_map
+        .get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
+        .cloned()
+        .unwrap_or_else(|| model_id.clone());
+    let description = env_map
+        .get("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION")
+        .cloned()
+        .unwrap_or_default();
+    vec![NativeCustomModelOption {
+        model_id,
+        label,
+        description,
+    }]
+}
+
 fn legacy_provider_secret(provider: &ApiProvider) -> Option<&str> {
     provider
         .api_key
@@ -12098,6 +12130,7 @@ pub fn run() {
             kill_session,
             graceful_stop_session,
             list_active_processes,
+            get_native_custom_model_options,
             get_cli_update_blockers,
             track_session,
             delete_session,

@@ -3,12 +3,13 @@ import { useSettingsStore } from '../../stores/settingsStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useProviderStore } from '../../stores/providerStore';
-import { getModelDisplayOptions, getSelectedModelOptionId } from '../../lib/api-provider';
+import { getModelDisplayOptions, getSelectedModelOptionId, initNativeCustomModelOptions, onNativeCustomModelOptionsLoaded } from '../../lib/api-provider';
 import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
 import { useT } from '../../lib/i18n';
 
 export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
   const selectedModel = useSettingsStore((s) => s.selectedModel);
+  const customModelId = useSettingsStore((s) => s.customModelId);
   const auxiliaryModel = useSettingsStore((s) => s.auxiliaryModel);
   const setSelectedModel = useSettingsStore((s) => s.setSelectedModel);
   const setAuxiliaryModel = useSettingsStore((s) => s.setAuxiliaryModel);
@@ -16,7 +17,15 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
   const activeProviderId = useProviderStore((s) => s.activeProviderId);
   const t = useT();
   const [open, setOpen] = useState(false);
+  const [, setNativeOptionsVersion] = useState(0);
   const ref = useRef<HTMLDivElement>(null);
+
+  // Lazy-load ANTHROPIC_CUSTOM_MODEL_OPTION from the login shell so it appears
+  // as an extra model choice alongside the four standard tiers in native mode.
+  useEffect(() => {
+    onNativeCustomModelOptionsLoaded(() => setNativeOptionsVersion((v) => v + 1));
+    initNativeCustomModelOptions();
+  }, []);
 
   // Close on outside click
   useEffect(() => {
@@ -41,10 +50,18 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
 
   const activeProvider = providers.find((provider) => provider.id === activeProviderId) ?? null;
   const displayOptions = getModelDisplayOptions(activeProvider);
-  const selectedOptionId = getSelectedModelOptionId(selectedModel, displayOptions);
+  const selectedOptionId = customModelId
+    ? customModelId
+    : getSelectedModelOptionId(selectedModel, displayOptions);
   const auxiliaryOptionId = getSelectedModelOptionId(auxiliaryModel, displayOptions);
 
-  const current = displayOptions.find((m) => m.id === selectedOptionId) || displayOptions[0];
+  // Show custom model label when active; otherwise fall back to tier name.
+  const customOption = customModelId
+    ? displayOptions.find((m) => m.id === customModelId)
+    : undefined;
+  const current = customOption
+    || displayOptions.find((m) => m.id === selectedOptionId)
+    || displayOptions[0];
 
   return (
     <div ref={ref} className="relative">
