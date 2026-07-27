@@ -19,6 +19,7 @@ export function CommandProcessingCard({ message }: Props) {
   const data = message.commandData || {};
   const commandName = data.command || '';
   const isCompleted = message.commandCompleted === true;
+  const isSlow = !isCompleted && data.slow === true;
   const startTime = message.commandStartTime || message.timestamp;
   const costSummary = data.costSummary as { cost: string; duration: string; turns: string; input: string; output: string } | undefined;
 
@@ -41,6 +42,8 @@ export function CommandProcessingCard({ message }: Props) {
       <div className={`w-full max-w-md rounded-lg border overflow-hidden transition-all duration-200
         ${isCompleted
           ? 'border-border-subtle bg-bg-secondary/30'
+          : isSlow
+            ? 'border-warning/25 bg-warning/5 shadow-sm'
           : 'border-accent/20 bg-accent/5 shadow-sm'
         }`}>
         {/* Main row: icon + command + elapsed */}
@@ -69,11 +72,18 @@ export function CommandProcessingCard({ message }: Props) {
               <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium
                 ${isCompleted
                   ? 'bg-success/10 text-success'
+                  : isSlow
+                    ? 'bg-warning/10 text-warning'
                   : 'bg-accent/10 text-accent'
                 }`}>
                 {isCompleted ? t('cmd.processingDone') : t('cmd.processing')}
               </span>
             </div>
+            {isSlow && data.statusText && (
+              <div className="mt-1 text-[10px] leading-relaxed text-warning">
+                {String(data.statusText)}
+              </div>
+            )}
           </div>
 
           {/* Elapsed timer */}
@@ -84,8 +94,8 @@ export function CommandProcessingCard({ message }: Props) {
 
         {/* Indeterminate progress bar (only while processing) */}
         {!isCompleted && (
-          <div className="h-[2px] bg-accent/10 overflow-hidden">
-            <div className="h-full w-1/4 bg-accent/40 rounded-full animate-progress" />
+          <div className={`h-[2px] overflow-hidden ${isSlow ? 'bg-warning/10' : 'bg-accent/10'}`}>
+            <div className={`h-full w-1/4 rounded-full animate-progress ${isSlow ? 'bg-warning/40' : 'bg-accent/40'}`} />
           </div>
         )}
 

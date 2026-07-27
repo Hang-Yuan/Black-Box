@@ -4,6 +4,8 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { useSettingsStore, setSessionModeLocal } from '../../stores/settingsStore';
 import { useT } from '../../lib/i18n';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
+import { usePlanStore } from '../../stores/planStore';
+import { extractPlanItems } from '../../lib/plan-contract';
 
 interface Props {
   message: ChatMessage;
@@ -112,6 +114,10 @@ export function PlanReviewCard({ message, floating }: Props) {
     }
 
     if (planTabId) {
+      const items = extractPlanItems(planContent);
+      if (items.length > 0) {
+        usePlanStore.getState().setPlan(planTabId, items, undefined, 'approved_plan');
+      }
       useChatStore.getState().updateMessage(planTabId, message.id, { resolved: true, interactionState: 'resolved' });
     }
     window.dispatchEvent(new CustomEvent('blackbox:plan-execute'));

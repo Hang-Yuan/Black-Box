@@ -2,6 +2,14 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { type ChatMessage, useChatStore } from '../../stores/chatStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
+import {
+  safeSessionPermissionSuggestions,
+  summarizePermissionSuggestions,
+} from '../../lib/permission-suggestions';
+import {
+  clearSessionPermissionGrants,
+  registerSessionPermissionGrants,
+} from '../../lib/session-permission-grants';
 
 interface Props {
   message: ChatMessage;
@@ -35,7 +43,22 @@ export function PermissionCard({ message }: Props) {
 
   // Determine display values — prefer structured permissionData, fallback to legacy fields
   const toolName = permData?.toolName ?? message.permissionTool ?? '';
-  const description = permData?.description ?? '';
+  const description = permData?.description ?? permData?.decisionReason ?? '';
+  const sessionPermissionSuggestions = useMemo(
+    () => safeSessionPermissionSuggestions(permData?.permissionSuggestions),
+    [permData?.permissionSuggestions],
+  );
+  const sessionScopeLabels = useMemo(
+    () => summarizePermissionSuggestions(sessionPermissionSuggestions),
+    [sessionPermissionSuggestions],
+  );
+  const sessionScopePreview = useMemo(() => {
+    const visible = sessionScopeLabels.slice(0, 3).map((label) => (
+      label.length > 120 ? `${label.slice(0, 117)}…` : label
+    ));
+    const remainder = sessionScopeLabels.length - visible.length;
+    return remainder > 0 ? `${visible.join(' · ')} · +${remainder}` : visible.join(' · ');
+  }, [sessionScopeLabels]);
   const inputPreview = useMemo(() => {
     if (permData?.input) {
       return formatInput(permData.toolName, permData.input);
@@ -43,7 +66,10 @@ export function PermissionCard({ message }: Props) {
     return typeof message.content === 'string' ? message.content : '';
   }, [message.content, permData?.input, permData?.toolName]);
 
-  const handleRespond = useCallback(async (allow: boolean) => {
+  const handleRespond = useCallback(async (
+    allow: boolean,
+    scope: 'once' | 'session' = 'once',
+  ) => {
     const owner = resolveOwner();
     if (!owner) return;
     const { setInteractionState, setSessionStatus, setActivityStatus } = useChatStore.getState();
@@ -52,18 +78,26 @@ export function PermissionCard({ message }: Props) {
     if (permData?.requestId) {
       setInteractionState(owner.tabId, message.id, 'sending');
       try {
-        await bridge.respondPermission(
+        const response = bridge.respondPermission(
           owner.stdinId,
           permData.requestId,
           allow,
           allow ? undefined : 'User denied this operation',
           permData.toolUseId,
           allow ? permData.input : undefined,
+          allow && scope === 'session' ? sessionPermissionSuggestions : undefined,
         );
+        if (allow && scope === 'session') {
+          // Register synchronously before the CLI can emit the next matching
+          // permission request. A failed response clears the whole live scope.
+          registerSessionPermissionGrants(owner.stdinId, sessionPermissionSuggestions);
+        }
+        await response;
         setInteractionState(owner.tabId, message.id, 'resolved');
         setSessionStatus(owner.tabId, 'running');
         setActivityStatus(owner.tabId, { phase: 'thinking' });
       } catch (err) {
+        if (scope === 'session') clearSessionPermissionGrants(owner.stdinId);
         setInteractionState(owner.tabId, message.id, 'failed', String(err));
       }
     } else {
@@ -80,7 +114,7 @@ export function PermissionCard({ message }: Props) {
       }
     }
     setRetrying(false);
-  }, [message.id, permData, resolveOwner]);
+  }, [message.id, permData, resolveOwner, sessionPermissionSuggestions]);
 
   const handleRetry = useCallback(() => {
     setRetrying(true);
@@ -96,6 +130,7 @@ export function PermissionCard({ message }: Props) {
   const isSending = interactionState === 'sending';
   const isFailed = interactionState === 'failed';
   const isPending = interactionState === 'pending';
+  const isExpired = interactionState === 'expired';
 
   // Expose permission respond handler for test harness (dev only)
   useEffect(() => {
@@ -110,10 +145,10 @@ export function PermissionCard({ message }: Props) {
   }, [handleRespond, isPending]);
 
   return (
-    <div className={`ml-11 animate-scale-in ${isResolved ? 'opacity-60' : ''}`}
+    <div className={`ml-11 animate-scale-in ${isResolved || isExpired ? 'opacity-60' : ''}`}
       {...(import.meta.env.DEV && { 'data-testid': 'permission-card' })}>
       <div className={`rounded-lg border overflow-hidden transition-all duration-200
-        ${isResolved
+        ${isResolved || isExpired
           ? 'border-border-subtle bg-bg-secondary/30'
           : isFailed
             ? 'border-l-[3px] border-l-error border-r border-t border-b border-r-error/20 border-t-error/20 border-b-error/20 bg-gradient-to-r from-error/5 to-transparent shadow-sm'
@@ -129,7 +164,7 @@ export function PermissionCard({ message }: Props) {
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-semibold text-text-primary">
-                {t('msg.permissionTitle')}
+                {permData?.title || t('msg.permissionTitle')}
               </span>
               {toolName && (
                 <code className="text-[10px] px-1.5 py-0.5 rounded
@@ -154,6 +189,11 @@ export function PermissionCard({ message }: Props) {
               <span className="text-[11px] text-success font-medium">
                 {t('msg.responded')}
               </span>
+            </span>
+          )}
+          {isExpired && (
+            <span className="flex items-center gap-1 flex-shrink-0 text-[11px] text-text-tertiary font-medium">
+              {t('msg.requestCancelled')}
             </span>
           )}
           {isSending && (
@@ -190,6 +230,28 @@ export function PermissionCard({ message }: Props) {
             </div>
           </div>
         )}
+        {isExpired && message.interactionError && (
+          <div className="px-3 pb-2 text-[11px] text-text-tertiary">
+            {message.interactionError}
+          </div>
+        )}
+
+        {isPending && sessionPermissionSuggestions.length > 0 && (
+          <div
+            data-testid="permission-session-scope"
+            className="mx-3 mb-2 rounded-md border border-accent/15 bg-accent/[0.04]
+              px-2.5 py-2 text-[11px] text-text-muted"
+          >
+            <div className="font-medium text-text-secondary">
+              {t('msg.permissionSessionScopeHint')}
+            </div>
+            {sessionScopePreview && (
+              <code className="mt-1 block break-words font-mono text-[10px] text-text-tertiary">
+                {sessionScopePreview}
+              </code>
+            )}
+          </div>
+        )}
 
         {/* Action buttons */}
         {(isPending || isFailed) && (
@@ -198,7 +260,7 @@ export function PermissionCard({ message }: Props) {
             {isPending && (
               <>
                 <button
-                  onClick={() => handleRespond(true)}
+                  onClick={() => handleRespond(true, 'once')}
                   {...(import.meta.env.DEV && { 'data-testid': 'permission-allow-button' })}
                   className="px-4 py-2 rounded-md text-xs font-semibold
                     border-2 border-success/40 text-success bg-success/5
@@ -209,10 +271,21 @@ export function PermissionCard({ message }: Props) {
                     stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M2.5 6l2.5 2.5 4.5-4.5" />
                   </svg>
-                  {t('msg.permissionAllowHint')}
+                  {t('msg.permissionAllowOnce')}
                 </button>
+                {sessionPermissionSuggestions.length > 0 && (
+                  <button
+                    onClick={() => handleRespond(true, 'session')}
+                    data-testid="permission-allow-session-button"
+                    className="px-3 py-2 rounded-md text-xs font-semibold
+                      border border-accent/35 text-accent bg-accent/5
+                      hover:bg-accent/12 transition-smooth cursor-pointer"
+                  >
+                    {t('msg.permissionAllowSession')}
+                  </button>
+                )}
                 <button
-                  onClick={() => handleRespond(false)}
+                  onClick={() => handleRespond(false, 'once')}
                   {...(import.meta.env.DEV && { 'data-testid': 'permission-deny-button' })}
                   className="px-3 py-2 rounded-md text-xs font-medium
                     text-text-muted border border-border-subtle

@@ -52,5 +52,5 @@ Apache License 2.0 — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-Based on [TOKENICODE](https://github.com/yiliqi78/TOKENICODE).
+Black Box retains the copyright and license notices required by its Apache-2.0-licensed foundations.
 </div>

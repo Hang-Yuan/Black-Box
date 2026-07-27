@@ -28,13 +28,13 @@ describe('stopping submit guard regressions', () => {
   });
 
   it('disables the send button while stopping', () => {
-    expect(inputBarSource).toContain(
-      'disabled={isAwaiting || isStopping || (!input.trim() && !activePrefix)}',
-    );
+    expect(inputBarSource).toContain('disabled={isAwaiting || isStopping || isHydratingFromDisk');
+    expect(inputBarSource).toContain('|| !taskComposerReady');
+    expect(inputBarSource).toContain('|| (!input.trim() && !activePrefix)}');
   });
 
   it('passes stopping state into the editor editable guard', () => {
-    expect(inputBarSource).toContain('editable={!isStopping}');
+    expect(inputBarSource).toContain('editable={!isStopping && !isHydratingFromDisk}');
     expect(tiptapEditorSource).toContain('editable?: boolean;');
     expect(tiptapEditorSource).toContain('editor.setEditable(editable);');
   });

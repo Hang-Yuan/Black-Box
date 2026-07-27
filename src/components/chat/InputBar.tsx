@@ -1,9 +1,8 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react';
-import { useChatStore, useActiveTab, getActiveTabState, generateMessageId, isSessionBusy, registerLiveComposerSnapshotProvider, type ChatMessage } from '../../stores/chatStore';
+import { useChatStore, useActiveTab, getActiveTabState, generateMessageId, isSessionBusy, registerLiveComposerSnapshotProvider } from '../../stores/chatStore';
 import { useSettingsStore, MODEL_OPTIONS, mapSessionModeToPermissionMode, setSessionModeLocal, type ThinkingLevel } from '../../stores/settingsStore';
 import { bridge, type UnifiedCommand } from '../../lib/tauri-bridge';
 import { ModelSelector } from './ModelSelector';
-// import { ModeSelector } from './ModeSelector';
 import { FileUploadChips } from './FileUploadChips';
 import { RewindPanel } from './RewindPanel';
 import { useFileAttachments } from '../../hooks/useFileAttachments';
@@ -14,7 +13,15 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { useT } from '../../lib/i18n';
 import { SlashCommandPopover, getFilteredCommandList } from './SlashCommandPopover';
 import { useCommandStore } from '../../stores/commandStore';
-import { envFingerprint, resolveModelForProvider, resolveModelOrError, spawnConfigHash } from '../../lib/api-provider';
+import {
+  detectResumeConfigurationSwitch,
+  envFingerprint,
+  flushAndCaptureSpawnConfiguration,
+  getSpawnConfigurationErrorMessage,
+  resolveModelForProvider,
+  resolveModelOrError,
+  spawnConfigHash,
+} from '../../lib/api-provider';
 import { useProviderStore } from '../../stores/providerStore';
 import { PROVIDER_PRESETS } from '../../lib/provider-presets';
 import { stripAnsi } from '../../lib/strip-ansi';
@@ -25,6 +32,18 @@ import { QuestionCard } from './QuestionCard';
 import { TiptapEditor, type TiptapEditorHandle } from './TiptapEditor';
 import { spawnSession, teardownSession, cleanupStdinRoute, waitForStdinCleared } from '../../lib/sessionLifecycle';
 import type { FileAttachment } from '../../hooks/useFileAttachments';
+import { usePlanStore } from '../../stores/planStore';
+import { extractPlanItems, getPlanProgress } from '../../lib/plan-contract';
+import { shouldAttemptDurableResume } from '../../lib/resume-evidence';
+import { adoptCliSessionIdentity } from '../../lib/session-identity';
+import { useWorkflowStore } from '../../stores/workflowStore';
+import { TaskComposerModeBar } from './TaskComposerModeBar';
+import {
+  DEFAULT_COMPOSER_MODE_TAB,
+  getComposerModeTab,
+  useComposerModeStore,
+} from '../../stores/composerModeStore';
+import { buildTaskComposerSubmission } from '../../lib/composer-mode';
 // drag-state import removed — tree drag handled by ChatPanel
 
 /** Thinking effort level configuration data */
@@ -48,15 +67,6 @@ function buildInterruptedContinuationPrompt(interruptedAssistantText: string, ne
     '用户接下来的消息是基于这段已输出内容的后续指令：',
     cleanNext,
   ].join('\n\n');
-}
-
-function hasResumableConversationEvidence(messages: ChatMessage[]): boolean {
-  return messages.some(
-    (m) =>
-      m.role === 'assistant'
-      && (m.type === 'text' || m.type === 'tool_use' || m.type === 'thinking')
-      && m.content.trim().length > 0,
-  );
 }
 
 /** Thinking effort level selector dropdown for the toolbar */
@@ -156,13 +166,17 @@ function PlanToggleButton() {
   const hasPlanMessages = useActiveTab((t) =>
     t.messages.some((m) => m.type === 'plan_review' || m.type === 'plan' || m.planContent),
   );
+  const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
+  const plan = usePlanStore((s) => selectedSessionId ? s.plans[selectedSessionId] : undefined);
   const inPlanMode = useSettingsStore((s) => s.sessionMode) === 'plan';
 
   // Only show when in plan mode or there are plan-related messages
-  if (!inPlanMode && !hasPlanMessages) return null;
+  if (!inPlanMode && !hasPlanMessages && !plan) return null;
+  const progress = plan ? getPlanProgress(plan.items) : null;
 
   return (
     <button
+      data-testid="plan-toggle-button"
       onClick={toggle}
       className={`p-1.5 rounded-md transition-smooth flex items-center gap-1
         ${isOpen
@@ -176,6 +190,9 @@ function PlanToggleButton() {
         <path d="M3 4h10M3 8h8M3 12h5" />
       </svg>
       <span className="text-[10px]">Plan</span>
+      {progress && (
+        <span className="text-[9px] tabular-nums opacity-80">{progress.completed}/{progress.total}</span>
+      )}
     </button>
   );
 }
@@ -187,6 +204,13 @@ function PlanToggleButton() {
 export function InputBar() {
   const t = useT();
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
+  const pendingWorkflowSubmission = useWorkflowStore((state) => (
+    selectedSessionId ? state.pendingSubmissions[selectedSessionId] : undefined
+  ));
+  const workflowCatalog = useWorkflowStore((state) => state.workflows);
+  const composerModeTab = useComposerModeStore((state) => (
+    selectedSessionId ? state.tabs[selectedSessionId] || DEFAULT_COMPOSER_MODE_TAB : DEFAULT_COMPOSER_MODE_TAB
+  ));
   const inputDraft = useActiveTab((t) => t.inputDraft);
   const setInputDraftStore = useChatStore((s) => s.setInputDraft);
   // Local alias for the store-backed draft
@@ -257,6 +281,7 @@ export function InputBar() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sessionStatus = useActiveTab((t) => t.sessionStatus);
   const activityPhase = useActiveTab((t) => t.activityStatus.phase);
+  const isHydratingFromDisk = useActiveTab((t) => t.sessionMeta.hydratingFromDisk === true);
   const addMessage = useChatStore((s) => s.addMessage);
   const setSessionStatus = useChatStore((s) => s.setSessionStatus);
   const setSessionMeta = useChatStore((s) => s.setSessionMeta);
@@ -419,16 +444,32 @@ export function InputBar() {
   // Shared busy state for follow-up placeholder / stop controls / selector lock.
   // We keep a stricter editor lock for `stopping` below so the user can't
   // interleave a new message while teardown is still in flight.
-  const isRunning = isSessionBusy(sessionStatus);
+  const isRunning = isSessionBusy(sessionStatus) && !isHydratingFromDisk;
   const isStopping = sessionStatus === 'stopping';
   const isAwaiting = isRunning && activityPhase === 'awaiting';
+  const selectedWorkflowForMode = workflowCatalog.find(
+    (workflow) => workflow.name === composerModeTab.workflowName,
+  );
+  const taskComposerSubmission = composerModeTab.taskMode
+    ? buildTaskComposerSubmission(composerModeTab.taskMode, input, {
+      workflowName: composerModeTab.workflowName,
+      workflowValid: selectedWorkflowForMode?.valid === true,
+      loopInterval: composerModeTab.loopInterval,
+    })
+    : null;
+  const taskComposerReady = !taskComposerSubmission || taskComposerSubmission.ok;
+  const showBusyDeliveryChoice = isRunning && !isStopping && !isAwaiting && !floatingCard;
   const inputPlaceholder = activePrefix
     ? t('input.prefixPlaceholder')
     : isStopping
       ? t('input.stoppingPlaceholder')
       : isRunning
-        ? t('input.followUp')
-        : t('input.placeholder');
+        ? t(composerModeTab.busyDelivery === 'queue'
+          ? 'input.queuePlaceholder'
+          : 'input.steerPlaceholder')
+        : composerModeTab.taskMode
+          ? t(`composerMode.${composerModeTab.taskMode}Placeholder`)
+          : t('input.placeholder');
 
   // Whether this is a follow-up (session already has a CLI session ID)
   const hasActiveSession = sessionStatus !== 'idle';
@@ -476,6 +517,10 @@ export function InputBar() {
     const { addMessage } = useChatStore.getState();
     const tabId = useSessionStore.getState().selectedSessionId;
 
+    if (tabId && useChatStore.getState().getTab(tabId)?.sessionMeta.hydratingFromDisk) {
+      return;
+    }
+
     // Always clear the input box first
     setInputSync('');
 
@@ -506,6 +551,7 @@ export function InputBar() {
     switch (cmd) {
       // --- Mode switching ---
       case 'ask':
+      case 'manual':
         useSettingsStore.getState().setSessionMode('ask');
         feedback('mode', t('cmd.switchedToAsk'), { mode: 'ask', icon: '💬' });
         return;
@@ -516,6 +562,10 @@ export function InputBar() {
       case 'code':
         useSettingsStore.getState().setSessionMode('code');
         feedback('mode', t('cmd.switchedToCode'), { mode: 'code', icon: '⚡' });
+        return;
+      case 'auto':
+        useSettingsStore.getState().setSessionMode('auto');
+        feedback('mode', t('cmd.switchedToAuto'), { mode: 'auto', icon: '✨' });
         return;
       case 'bypass':
         useSettingsStore.getState().setSessionMode('bypass');
@@ -656,12 +706,56 @@ export function InputBar() {
         return;
       }
 
+      case 'todos': {
+        if (!tabId) return;
+        const plan = usePlanStore.getState().plans[tabId];
+        if (!plan) {
+          feedback('info', t('plan.none'), { command: '/todos', title: t('plan.title'), hasData: false });
+          return;
+        }
+        const progress = getPlanProgress(plan.items);
+        usePlanPanelStore.setState({ open: true });
+        feedback('info', t('plan.opened'), {
+          command: '/todos',
+          title: t('plan.title'),
+          rows: [
+            { label: t('plan.progress'), value: `${progress.completed}/${progress.total}` },
+            { label: t('plan.revision'), value: String(plan.revision) },
+          ],
+          hasData: true,
+        });
+        return;
+      }
+
 
       // --- All CLI commands: pass through to active session via stdin ---
       // BLACKBOX is a GUI wrapper — all slash commands are handled by Claude Code CLI.
       default: {
-        const stdinId = getActiveTabState().sessionMeta.stdinId;
+        const commandTab = getActiveTabState();
+        const stdinId = commandTab.sessionMeta.stdinId;
         if (stdinId && tabId) {
+          if (cmd === 'compact' && isSessionBusy(commandTab.sessionStatus)) {
+            const commandText = `/${cmd}${args ? ` ${args}` : ''}`;
+            const processingMsgId = generateMessageId();
+            addMessage(tabId, {
+              id: processingMsgId,
+              role: 'system',
+              type: 'text',
+              content: '',
+              commandType: 'processing',
+              commandData: { command: commandText, queued: true },
+              commandStartTime: Date.now(),
+              commandCompleted: false,
+              timestamp: Date.now(),
+            });
+            useChatStore.getState().addPendingMessage(tabId, commandText, {
+              enqueueConfigHash: spawnConfigHash(),
+              enqueueStdinId: stdinId,
+              kind: 'command',
+              commandMessageId: processingMsgId,
+            });
+            return;
+          }
           // Emit a processing card immediately so user sees feedback
           const processingMsgId = generateMessageId();
           addMessage(tabId, {
@@ -718,7 +812,17 @@ export function InputBar() {
     // Read input from store directly (not closure) so that async callers
     // like handlePlanApprove (setInput + rAF) always see the latest value.
     const rawInput = getActiveTabState().inputDraft || '';
+    if (getActiveTabState().sessionMeta.hydratingFromDisk) {
+      // Keep the user's draft intact, but never race a disk transcript load
+      // with a new --resume or an immediate slash command.
+      useChatStore.getState().setInputDraft(tabId, rawInput);
+      return;
+    }
     let text = rawInput.trim();
+    // What the user should see (and what Stop should restore) can differ from
+    // the payload sent to Claude. In particular, /manual <prompt> and the
+    // other mode aliases are Black Box UI controls, not part of the prompt.
+    let submittedUserText = rawInput.trim();
 
     // Plan approval shortcut: empty Enter triggers approve & execute flow
     const tabState = getActiveTabState();
@@ -756,6 +860,10 @@ export function InputBar() {
         setSessionModeLocal('code');
       }
       useChatStore.getState().setSessionMeta(tabId, { snapshotMode: 'code' });
+      const approvedItems = extractPlanItems(pendingPlanReview.planContent || pendingPlanReview.content || '');
+      if (approvedItems.length > 0) {
+        usePlanStore.getState().setPlan(tabId, approvedItems, undefined, 'approved_plan');
+      }
       useChatStore.getState().updateMessage(tabId, pendingPlanReview.id, {
         resolved: true,
         interactionState: 'resolved',
@@ -774,6 +882,46 @@ export function InputBar() {
 
     if (!text) return;
 
+    // Goal, Workflow, and Loop are thin entry points into capabilities exposed
+    // by the active Claude runtime. Black Box owns no parallel execution
+    // protocol for them.
+    const taskComposer = getComposerModeTab(tabId);
+    if (taskComposer.taskMode && !isSessionBusy(tabState.sessionStatus)) {
+      const selectedWorkflow = useWorkflowStore.getState().workflows.find(
+        (workflow) => workflow.name === taskComposer.workflowName,
+      );
+      const planned = buildTaskComposerSubmission(taskComposer.taskMode, rawInput, {
+        workflowName: taskComposer.workflowName,
+        workflowValid: selectedWorkflow?.valid === true,
+        loopInterval: taskComposer.loopInterval,
+      });
+      if (!planned.ok) return;
+      if (prefix) useCommandStore.getState().clearPrefix();
+      setInputSync('');
+      useComposerModeStore.getState().clearTaskMode(tabId);
+
+      if (planned.value.kind === 'goal') {
+        text = planned.value.command;
+      }
+
+      if (planned.value.kind === 'workflow' && selectedWorkflow) {
+        useWorkflowStore.getState().requestRun(tabId, selectedWorkflow);
+        useWorkflowStore.getState().queueSubmission(
+          tabId,
+          planned.value.workflowName,
+          planned.value.command,
+        );
+        return;
+      }
+
+      if (planned.value.kind === 'loop') {
+        window.dispatchEvent(new CustomEvent('blackbox:loop-submit', {
+          detail: { tabId, command: planned.value.command },
+        }));
+        return;
+      }
+    }
+
     // Intercept immediate (built-in) commands even when submitted directly
     // (e.g. user types "/help" and presses Enter without using the popover)
     if (text.startsWith('/')) {
@@ -781,21 +929,56 @@ export function InputBar() {
       const cmdPart = parts[0].toLowerCase();
       const restText = parts.slice(1).join(' ').trim();
 
-      // Mode-switching commands: /ask, /plan, /code, /bypass
+      // Mode-switching commands: /manual (/ask alias), /plan, /code, /auto, /bypass
       // If followed by text, switch mode then submit the text normally
-      const modeMap: Record<string, 'ask' | 'plan' | 'code' | 'bypass'> = {
-        '/ask': 'ask', '/plan': 'plan', '/code': 'code', '/bypass': 'bypass',
+      const modeMap: Record<string, 'ask' | 'plan' | 'code' | 'auto' | 'bypass'> = {
+        '/ask': 'ask', '/manual': 'ask', '/plan': 'plan', '/code': 'code',
+        '/auto': 'auto', '/bypass': 'bypass',
       };
       if (modeMap[cmdPart]) {
-        useSettingsStore.getState().setSessionMode(modeMap[cmdPart]);
+        const nextMode = modeMap[cmdPart];
         if (restText) {
-          // Directly apply the mode prefix and continue with submission
-          text = `${cmdPart} ${restText}`;
+          const previousMode = useSettingsStore.getState().sessionMode;
+          const activeStdinId = getActiveTabState().sessionMeta.stdinId;
+          if (activeStdinId) {
+            // A slash command and its payload are one transaction: apply the
+            // control request before sending the payload, and fail closed if
+            // the live CLI rejects it. Never forward /manual or /auto as text;
+            // stream-json would treat those UI aliases as unknown skills.
+            setSessionModeLocal(nextMode);
+            try {
+              await bridge.setPermissionMode(
+                activeStdinId,
+                mapSessionModeToPermissionMode(nextMode),
+              );
+            } catch (err) {
+              console.error('[BLACKBOX] Slash mode switch failed:', err);
+              setSessionModeLocal(previousMode);
+              setInputSync(rawInput);
+              addMessage(tabId, {
+                id: generateMessageId(),
+                role: 'system',
+                type: 'text',
+                content: t('cmd.modeSwitchFailed'),
+                commandType: 'error',
+                commandData: { mode: nextMode },
+                timestamp: Date.now(),
+              });
+              return;
+            }
+          } else {
+            useSettingsStore.getState().setSessionMode(nextMode);
+          }
+          text = restText;
+          submittedUserText = restText;
         } else {
+          useSettingsStore.getState().setSessionMode(nextMode);
           setInputSync('');
-          const modeVal = modeMap[cmdPart];
+          const modeVal = nextMode;
           const modeKey = `cmd.switchedTo${modeVal.charAt(0).toUpperCase() + modeVal.slice(1)}` as any;
-          const iconMap: Record<string, string> = { ask: '💬', plan: '📋', code: '⚡' };
+          const iconMap: Record<string, string> = {
+            ask: '💬', plan: '📋', code: '⚡', auto: '✨', bypass: '🔓',
+          };
           addMessage(tabId, {
             id: generateMessageId(),
             role: 'system',
@@ -827,12 +1010,9 @@ export function InputBar() {
       text = `${text}\n\n${t('input.attachedFiles')}\n${filePaths}`;
     }
 
-    // Gate: queue follow-up messages while AI is actively processing (#142).
-    // IMPORTANT: when queueing, do NOT addMessage to messages[] — ChatPanel
-    // renders pendingUserMessages separately AFTER the partialText bubble so
-    // the queued items visually appear behind the streaming reply.
-    // The flush logic in useStreamProcessor will addMessage at send time.
-    //
+    // Live steering: plain user input sent while Claude is running is written
+    // immediately to the same persistent stream-json process. The Agent SDK
+    // applies it at the next safe loop boundary without creating a new session.
     // This check runs BEFORE clearFiles/setInputSync so that the blocking
     // return path (unresolved interaction card) does not lose attachments.
     const currentTabState = getActiveTabState();
@@ -861,13 +1041,70 @@ export function InputBar() {
         useChatStore.getState().setInputDraft(tabId, rawInput);
         return;
       }
-      // Queueing path: clear prefix, input and files, then enqueue.
+
+      const busyDeliveryMode = getComposerModeTab(tabId).busyDelivery;
+      // Do not reset turn timers, Goal accounting, agent cards, or partial
+      // output. A steer modifies the active turn instead of starting another.
+      const canSteerNow = busyDeliveryMode === 'steer'
+        && currentStatus === 'running'
+        && currentTabState.sessionMeta.stdinReady === true
+        && !currentTabState.sessionMeta.pendingCommandMsgId;
+      if (canSteerNow) {
+        const savedFiles = [...files];
+        const steerAttachments = files.length > 0
+          ? files.map((f) => ({ name: f.name, path: f.path, isImage: f.isImage, preview: f.preview }))
+          : undefined;
+        const steerMessageId = generateMessageId();
+        if (prefix) useCommandStore.getState().clearPrefix();
+        setInputSync('');
+        clearFiles();
+        addMessage(tabId, {
+          id: steerMessageId,
+          role: 'user',
+          type: 'text',
+          content: submittedUserText,
+          attachments: steerAttachments,
+          isSteer: true,
+          steerState: 'sending',
+          timestamp: Date.now(),
+        });
+        try {
+          await bridge.sendStdin(existingStdinId, text);
+          useChatStore.getState().updateMessage(tabId, steerMessageId, { steerState: 'sent' });
+          useChatStore.getState().setSessionMeta(tabId, { lastProgressAt: Date.now() });
+        } catch (error) {
+          console.error('[BLACKBOX] Live steer failed:', error);
+          useChatStore.getState().removeMessage(tabId, steerMessageId);
+          useChatStore.getState().setInputDraft(tabId, rawInput);
+          setInputSync(rawInput);
+          if (savedFiles.length > 0) setFiles(savedFiles);
+          addMessage(tabId, {
+            id: generateMessageId(),
+            role: 'system',
+            type: 'text',
+            content: t('input.steerFailed'),
+            commandType: 'error',
+            timestamp: Date.now(),
+          });
+        }
+        return;
+      }
+
+      // If the process is only waiting for system:init, retain steer semantics
+      // and flush it as soon as this exact stdin route becomes ready. Control
+      // commands, reconnecting, and stopping keep the serialized queue path.
       if (prefix) useCommandStore.getState().clearPrefix();
       setInputSync('');
       clearFiles();
       useChatStore.getState().addPendingMessage(tabId, text, {
         enqueueConfigHash: spawnConfigHash(),
         enqueueStdinId: existingStdinId,
+        kind: busyDeliveryMode === 'steer'
+          && currentStatus === 'running'
+          && currentTabState.sessionMeta.stdinReady !== true
+          && !currentTabState.sessionMeta.pendingCommandMsgId
+          ? 'steer'
+          : 'user',
       });
       return;
     }
@@ -900,28 +1137,23 @@ export function InputBar() {
         id: pendingTurnMessageId,
         role: 'user',
         type: 'text',
-        content: rawInput.trim(),
+        content: submittedUserText,
         timestamp: Date.now(),
         attachments: userMsgAttachments,
       });
       pendingTurnMeta = {
         pendingTurnMessageId,
-        pendingTurnInput: rawInput.trim(),
+        pendingTurnInput: submittedUserText,
         pendingTurnAttachments: savedFiles,
       };
     }
 
     // Initialize agent tracking — clear previous turn's agents (they may be from a
     // different project/session) and create a fresh main agent for this turn.
-    useAgentStore.getState().clearAgents();
-    useAgentStore.getState().upsertAgent({
-      id: 'main',
-      parentId: null,
-      description: rawInput.trim(),
-      phase: 'spawning',
-      startTime: Date.now(),
-      isMain: true,
-    });
+    useAgentStore.getState().resetForTurn(
+      submittedUserText,
+      useSettingsStore.getState().agentTeamsEnabled,
+    );
 
     try {
       if (!workingDirectory) {
@@ -944,8 +1176,14 @@ export function InputBar() {
         return;
       }
 
+      // Rust resolves provider credentials and mappings from providers.json.
+      // Settle any quick-switch or form edit before comparing this live
+      // process with current configuration, otherwise an immediate send can
+      // reuse a process that still owns the previous key.
+      await useProviderStore.getState().flushSave();
+
       // Check model mapping before sending — block if provider has no mapping for selected tier
-      const modelResolution = resolveModelOrError(selectedModel);
+      const modelResolution = resolveModelOrError(useSettingsStore.getState().selectedModel);
       if (!modelResolution.ok) {
         const msg = t('provider.noModelMapping')
           .replace('{provider}', modelResolution.providerName)
@@ -1043,7 +1281,7 @@ export function InputBar() {
         } else {
           // Check if model changed since this process was spawned.
           // If so, kill the stale process and fall through to spawn a new one with --resume.
-          const currentModel = resolveModelForProvider(selectedModel);
+          const currentModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
           const spawnedModel = getActiveTabState().sessionMeta.spawnedModel;
           if (spawnedModel && currentModel !== spawnedModel) {
             const oldShort = MODEL_OPTIONS.find((m) => m.id === spawnedModel)?.short ?? spawnedModel;
@@ -1083,12 +1321,13 @@ export function InputBar() {
                 return;
               }
               try {
+                const stdinModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
                 markTurnThinking();
                 await bridge.sendStdin(stdinId, text);
                 sentViaStdin = true;
                 // Defensive: ensure spawnedModel is always recorded after first successful stdin send
                 if (!getActiveTabState().sessionMeta.spawnedModel) {
-                  setSessionMeta(tabId, { spawnedModel: resolveModelForProvider(selectedModel) });
+                  setSessionMeta(tabId, { spawnedModel: stdinModel });
                 }
               } catch (stdinErr) {
                 // stdin write failed (broken pipe — process already exited).
@@ -1120,13 +1359,18 @@ export function InputBar() {
         // established a real conversation that the next send should continue.
         const resumeTab = useChatStore.getState().getTab(tabId);
         const tabMessages = resumeTab?.messages ?? [];
-        const hasResumableEvidence = hasResumableConversationEvidence(tabMessages)
-          || resumeTab?.sessionMeta.turnAcceptedForResume === true;
+        const sessionItem = useSessionStore.getState().sessions.find((s) => s.id === tabId);
+        const hasResumableEvidence = shouldAttemptDurableResume({
+          messages: tabMessages,
+          turnAcceptedForResume: resumeTab?.sessionMeta.turnAcceptedForResume,
+          sessionPath: sessionItem?.path,
+        });
         const fallbackResumeId = resumeTab?.sessionMeta.sessionId;
-        const existingSessionId = hasResumableEvidence
-          ? (useSessionStore.getState().sessions.find((s) => s.id === tabId)?.cliResumeId
+        const forkSourceId = resumeTab?.sessionMeta.forkSourceId;
+        const existingSessionId = forkSourceId || (hasResumableEvidence
+          ? (sessionItem?.cliResumeId
             ?? (fallbackResumeId && !fallbackResumeId.startsWith('desk_') ? fallbackResumeId : undefined))
-          : undefined;
+          : undefined);
 
         // Clean up old stdinId listener if any (via lifecycle module)
         const oldStdinId = getActiveTabState().sessionMeta.stdinId;
@@ -1139,25 +1383,70 @@ export function InputBar() {
 
         // Generate the desk-side session ID
         const preGeneratedId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
         // Reset guards for the new session
         exitPlanModeSeenRef.current = false;
+
+        // Capture the entire provider/model/thinking configuration once before
+        // any spawn await. Every argument and every metadata field below must
+        // use this same object so a UI change during startup cannot produce a
+        // process launched with one model but labelled as another.
+        const spawnConfig = await flushAndCaptureSpawnConfiguration();
+        if (!spawnConfig.ok) {
+          throw new Error(getSpawnConfigurationErrorMessage(spawnConfig, t));
+        }
+
+        // A stopped session has no stdinId, so the live-process drift checks
+        // above cannot observe a provider/model change made after Stop. Compare
+        // the durable spawn snapshot before --resume and request thinking-block
+        // sanitization when the old JSONL belongs to another provider/model.
+        const resumeMeta = getActiveTabState().sessionMeta;
+        const previousProviderId = resumeMeta.configSnapshot
+          ? resumeMeta.configSnapshot.providerId
+          : resumeMeta.snapshotProviderId;
+        const previousModel = resumeMeta.configSnapshot?.model
+          ?? resumeMeta.spawnedModel
+          ?? resumeMeta.snapshotModel;
+        const stoppedResumeSwitch = existingSessionId && !forkSourceId
+          ? detectResumeConfigurationSwitch(
+            {
+              providerId: previousProviderId,
+              model: previousModel,
+              envFingerprint: resumeMeta.envFingerprint,
+            },
+            {
+              providerId: spawnConfig.providerId,
+              model: spawnConfig.model,
+              envFingerprint: spawnConfig.envFingerprint,
+            },
+          )
+          : { providerSwitched: false, modelSwitched: false };
+        if (stoppedResumeSwitch.providerSwitched || stoppedResumeSwitch.modelSwitched) {
+          console.warn('[BLACKBOX] stopped-session resume config changed; sanitizing old thinking blocks');
+          setSessionMeta(tabId, {
+            ...(stoppedResumeSwitch.providerSwitched
+              ? { providerSwitched: true, providerSwitchPendingText: text }
+              : {}),
+            ...(stoppedResumeSwitch.modelSwitched
+              ? { modelSwitched: true, modelSwitchPendingText: text }
+              : {}),
+          });
+        }
 
         // Read sessionMode from store (not closure) so plan-approve → code
         // mode switch is visible even when called via rAF.
         const liveSessionMode = useSettingsStore.getState().sessionMode;
-        const didSwitchModel = getActiveTabState().sessionMeta.modelSwitched || getActiveTabState().sessionMeta.providerSwitched;
-        // Phase 2 §2.1: capture the spawn-time config hash BEFORE the async
-        // spawn so it reflects the config that was actually used, not whatever
-        // the user might change while the spawn is in flight.
-        const preSpawnConfigHash = spawnConfigHash();
-        const preEnvFingerprint = envFingerprint();
+        const didSwitchModel = Boolean(
+          resumeMeta.modelSwitched
+          || resumeMeta.providerSwitched
+          || stoppedResumeSwitch.modelSwitched
+          || stoppedResumeSwitch.providerSwitched,
+        );
         setSessionMeta(tabId, {
           stdinReady: false,
           pendingReadyMessage: undefined,
         });
 
-        console.log('[BLACKBOX:session] starting session', { cwd, stdinId: preGeneratedId, mode: liveSessionMode, provider: useProviderStore.getState().activeProviderId, modelSwitch: !!didSwitchModel, resumeSessionId: existingSessionId });
+        console.log('[BLACKBOX:session] starting session', { cwd, stdinId: preGeneratedId, mode: liveSessionMode, provider: spawnConfig.providerId, modelSwitch: !!didSwitchModel, resumeSessionId: existingSessionId });
 
         // Use lifecycle module for unified spawn
         const spawnResult = await spawnSession({
@@ -1165,23 +1454,35 @@ export function InputBar() {
           stdinId: preGeneratedId,
           cwdSnapshot: cwd,
           configSnapshot: {
-            model: resolveModelForProvider(selectedModel),
-            providerId: useProviderStore.getState().activeProviderId || '',
-            thinkingLevel: useSettingsStore.getState().thinkingLevel,
+            model: spawnConfig.model,
+            auxiliaryModel: spawnConfig.auxiliaryModel,
+            providerId: spawnConfig.providerId,
+            thinkingLevel: spawnConfig.thinkingLevel,
             permissionMode: mapSessionModeToPermissionMode(liveSessionMode),
+            agentTeamsEnabled: spawnConfig.agentTeamsEnabled,
           },
           sessionModeSnapshot: liveSessionMode,
           sessionParams: {
+            // The stream-json SDK accepts native slash commands as its first
+            // stdin message and expands them after its own init handshake.
+            // Waiting for system:init first deadlocks because this CLI emits
+            // init only after it receives the first message.
             prompt: text,
             cwd,
-            model: resolveModelForProvider(selectedModel),
+            model: spawnConfig.model,
+            auxiliary_model: spawnConfig.auxiliaryModel,
+            auxiliary_model_tier: spawnConfig.auxiliaryModelTier,
             session_id: preGeneratedId,
             resume_session_id: existingSessionId || undefined,
-            thinking_level: useSettingsStore.getState().thinkingLevel,
+            fork_session: forkSourceId ? true : undefined,
+            thinking_level: spawnConfig.thinkingLevel,
             session_mode: (liveSessionMode === 'ask' || liveSessionMode === 'plan') ? liveSessionMode : undefined,
-            provider_id: useProviderStore.getState().activeProviderId || undefined,
+            provider_id: spawnConfig.providerId || undefined,
             permission_mode: mapSessionModeToPermissionMode(liveSessionMode),
-            model_switch: didSwitchModel ? true : undefined,
+            // Never strip/modify the parent JSONL for a fork. Claude Code's
+            // native --fork-session owns context cloning into the new UUID.
+            model_switch: didSwitchModel && !forkSourceId ? true : undefined,
+            agent_teams_enabled: spawnConfig.agentTeamsEnabled,
           },
           onStream: handleStreamMessage,
           onStderr: (line: string) => handleStderrLine(line, preGeneratedId),
@@ -1196,21 +1497,26 @@ export function InputBar() {
 
         // Write additional meta to the current stdin owner. A draft can be
         // promoted to the real CLI session id before startSession resolves.
-        const spawnOwnerTabId = useSessionStore.getState().getTabForStdin(preGeneratedId) ?? tabId;
+        const ownerBeforeAdoption = useSessionStore.getState().getTabForStdin(preGeneratedId) ?? tabId;
+        const spawnOwnerTabId = spawnResult.sessionInfo.cli_session_id
+          ? adoptCliSessionIdentity(
+            ownerBeforeAdoption,
+            spawnResult.sessionInfo.cli_session_id,
+            preGeneratedId,
+          )
+          : ownerBeforeAdoption;
         const existingOwnerSessionId = useChatStore.getState().getTab(spawnOwnerTabId)?.sessionMeta.sessionId;
         const nextSessionId = spawnResult.sessionInfo.cli_session_id
           ?? (spawnOwnerTabId !== tabId ? existingOwnerSessionId : undefined);
         setSessionMeta(spawnOwnerTabId, {
           sessionId: nextSessionId,
-          envFingerprint: preEnvFingerprint,
-          spawnedModel: resolveModelForProvider(selectedModel),
-          stdinReady: false,
-          pendingReadyMessage: undefined,
+          envFingerprint: spawnConfig.envFingerprint,
+          spawnedModel: spawnConfig.model,
           // Phase 2 §2.1: lock in the spawn-time config hash for later
           // mismatch detection in handleSubmit and the drain paths.
           // Uses pre-computed value captured before async spawn to avoid
           // race with user config changes during the spawn window.
-          spawnConfigHash: preSpawnConfigHash,
+          spawnConfigHash: spawnConfig.configHash,
           modelSwitched: false,
           providerSwitched: false,
           modelSwitchPendingText: undefined,
@@ -1244,6 +1550,62 @@ export function InputBar() {
 
   // Keep ref in sync so executeImmediateCommand can call latest handleSubmit
   handleSubmitRef.current = handleSubmit;
+
+  // Toolbar Loop actions must use the exact same send/resume/queue pipeline as
+  // typed messages. They are never optimistic: the Loop control becomes active
+  // only after a native CronCreate tool receipt appears in this thread.
+  useEffect(() => {
+    const onLoopSubmit = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId: string; command: string }>).detail;
+      if (!detail || useSessionStore.getState().selectedSessionId !== detail.tabId) return;
+      const currentDraft = getActiveTabState().inputDraft.trim();
+      if (currentDraft) {
+        useChatStore.getState().addMessage(detail.tabId, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: t('loop.composerBusy'),
+          commandType: 'error',
+          timestamp: Date.now(),
+        });
+        return;
+      }
+      setInputSync(detail.command);
+      // Zustand updates synchronously; use a microtask instead of rAF so a
+      // backgrounded/locked WebView cannot indefinitely strand the command in
+      // the composer while animation frames are throttled.
+      queueMicrotask(() => handleSubmitRef.current());
+    };
+    window.addEventListener('blackbox:loop-submit', onLoopSubmit);
+    return () => window.removeEventListener('blackbox:loop-submit', onLoopSubmit);
+  }, [setInputSync, t]);
+
+  // Native Workflow launches use the same guarded send/resume/queue path as a
+  // typed turn. The toolbar does not pretend a run exists: WorkflowControl's
+  // requested state is bound to the real Workflow tool_use and task receipts
+  // by useStreamProcessor.
+  useEffect(() => {
+    if (!selectedSessionId || !pendingWorkflowSubmission) return;
+    useWorkflowStore.getState().consumeSubmission(selectedSessionId);
+    const submitPendingWorkflow = () => {
+      const currentDraft = getActiveTabState().inputDraft.trim();
+      if (currentDraft) {
+        useChatStore.getState().addMessage(selectedSessionId, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: t('workflow.composerBusy'),
+          commandType: 'error',
+          timestamp: Date.now(),
+        });
+        useWorkflowStore.getState().applyStreamEvent(selectedSessionId, { type: 'result' });
+        return;
+      }
+      setInputSync(pendingWorkflowSubmission.command);
+      queueMicrotask(() => handleSubmitRef.current());
+    };
+    submitPendingWorkflow();
+  }, [pendingWorkflowSubmission, selectedSessionId, setInputSync, t]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -1490,6 +1852,10 @@ export function InputBar() {
           </div>
         )}
 
+        {selectedSessionId && composerModeTab.taskMode && !isRunning && !floatingCard && (
+          <TaskComposerModeBar tabId={selectedSessionId} mode={composerModeTab.taskMode} />
+        )}
+
         {/* File upload chips */}
         {(files.length > 0 || isProcessing) && (
           <div className="mb-2">
@@ -1548,7 +1914,7 @@ export function InputBar() {
             <TiptapEditor
               ref={textareaRef}
               data-chat-input
-              editable={!isStopping}
+              editable={!isStopping && !isHydratingFromDisk}
               onUpdate={(text) => {
                 setInput(text);
                 detectSlashCommand(text);
@@ -1576,6 +1942,29 @@ export function InputBar() {
               self-center mr-1">
               {t('input.shortcutHint')}
             </span>
+          )}
+          {showBusyDeliveryChoice && selectedSessionId && (
+            <div
+              data-testid="busy-delivery-selector"
+              className="flex flex-shrink-0 self-center items-center rounded-lg border
+                border-border-subtle bg-bg-secondary/70 p-0.5"
+            >
+              {(['steer', 'queue'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  data-testid={`busy-delivery-${mode}`}
+                  data-active={composerModeTab.busyDelivery === mode ? 'true' : 'false'}
+                  onClick={() => useComposerModeStore.getState().setBusyDelivery(selectedSessionId, mode)}
+                  className={`rounded-md px-2 py-1 text-[10px] font-medium transition-smooth
+                    ${composerModeTab.busyDelivery === mode
+                      ? 'bg-accent/15 text-accent'
+                      : 'text-text-tertiary hover:text-text-primary'}`}
+                >
+                  {t(`input.${mode}Mode`)}
+                </button>
+              ))}
+            </div>
           )}
           {/* Stop button — visible only while running */}
           {isRunning && (
@@ -1613,7 +2002,8 @@ export function InputBar() {
           <button
             data-testid="send-button"
             onClick={handleSubmit}
-            disabled={isAwaiting || isStopping || (!input.trim() && !activePrefix)}
+            disabled={isAwaiting || isStopping || isHydratingFromDisk || !taskComposerReady
+              || (!input.trim() && !activePrefix)}
             className={`flex-shrink-0 self-end w-8 h-8 rounded-[10px]
               flex items-center justify-center transition-smooth
               disabled:opacity-30 disabled:cursor-not-allowed
@@ -1621,7 +2011,13 @@ export function InputBar() {
                 ? 'bg-warning/15 text-warning cursor-not-allowed'
                 : 'bg-accent hover:bg-accent-hover text-text-inverse hover:shadow-glow cursor-pointer'
               }`}
-            title={isAwaiting ? t('input.awaitingInteraction') : undefined}
+            title={isAwaiting
+              ? t('input.awaitingInteraction')
+              : isRunning
+                ? t(composerModeTab.busyDelivery === 'queue'
+                  ? 'input.queueSend'
+                  : 'input.steerSend')
+                : undefined}
           >
             <svg width="16" height="16" viewBox="0 0 16 16"
               fill="none" stroke="currentColor" strokeWidth="2"
@@ -1655,15 +2051,13 @@ export function InputBar() {
             onChange={handleFileSelect}
           />
 
-          {/* Mode selector — hidden, use /ask /plan /code /bypass slash commands */}
-          {/* <ModeSelector disabled={isRunning} /> */}
-
           {/* Think toggle */}
           <ThinkLevelSelector disabled={isRunning} />
 
           {/* Rewind button */}
           {showRewind && (
             <button
+              data-testid="rewind-button"
               onClick={() => { if (canRewind) setShowRewindPanel(!showRewindPanel); }}
               disabled={!canRewind}
               className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs transition-smooth

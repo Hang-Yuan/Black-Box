@@ -2,18 +2,20 @@
  * RewindPanel — two-phase popover for conversation rewind.
  * Matches Claude Code CLI's rewind behavior:
  *   Phase 1: Turn list (oldest first, newest at bottom), ↑↓ navigate, Enter select
- *   Phase 2: 5 action options, ↑↓ or 1-5 navigate, Enter confirm
+ *   Phase 2: 6 action options, ↑↓ or 1-6 navigate, Enter confirm
  *   Esc: back (phase 2→1) or close (phase 1→dismiss)
  *
- * All 5 options are functional:
+ * All 6 options are functional:
  *   1. Restore code and conversation
  *   2. Restore conversation only
  *   3. Restore code only
  *   4. Summarize from here
- *   5. Cancel
+ *   5. Fork from this point (source conversation remains unchanged)
+ *   6. Cancel
  */
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useRewind, type RewindAction } from '../../hooks/useRewind';
+import { useHistoricalFork } from '../../hooks/useHistoricalFork';
 import { shortFilePath, relativeTime, type Turn } from '../../lib/turns';
 import { useT } from '../../lib/i18n';
 
@@ -24,6 +26,8 @@ interface RewindPanelProps {
 export function RewindPanel({ onClose }: RewindPanelProps) {
   const t = useT();
   const { turns, executeRewind } = useRewind();
+  const { forkFromTurn, isForking } = useHistoricalFork();
+  const [forkError, setForkError] = useState('');
   const [selectedTurn, setSelectedTurn] = useState<Turn | null>(null);
   // Start focused on the newest turn (last item in chronological list)
   const [focusedIndex, setFocusedIndex] = useState(Math.max(turns.length - 1, 0));
@@ -63,26 +67,43 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
 
   // --- Action definitions ---
   const hasCheckpoint = !!selectedTurn?.checkpointUuid;
-  const actions: { label: string; action: RewindAction | 'cancel'; disabled?: boolean; hint?: string }[] = [
+  const actions: { label: string; action: RewindAction | 'fork' | 'cancel'; disabled?: boolean; hint?: string }[] = [
     { label: t('rewind.restoreAll'), action: 'restore_all', disabled: !hasCheckpoint, hint: !hasCheckpoint ? t('rewind.noCheckpoint') : undefined },
     { label: t('rewind.restoreConversation'), action: 'restore_conversation' },
     { label: t('rewind.restoreCode'), action: 'restore_code', disabled: !hasCheckpoint, hint: !hasCheckpoint ? t('rewind.noCheckpoint') : undefined },
     { label: t('rewind.summarize'), action: 'summarize' },
+    {
+      label: isForking ? t('rewind.forking') : t('rewind.forkFromHere'),
+      action: 'fork',
+      disabled: !hasCheckpoint,
+      hint: !hasCheckpoint ? t('rewind.forkNoCheckpoint') : t('rewind.forkHint'),
+    },
     { label: t('rewind.cancel'), action: 'cancel' },
   ];
 
   // --- Execute action by index ---
-  const doAction = useCallback((idx: number) => {
+  const doAction = useCallback(async (idx: number) => {
     if (!selectedTurn) return;
     const a = actions[idx];
-    if (!a || a.disabled) return;
+    if (!a || a.disabled || isForking) return;
 
-    // Close panel immediately for snappy UX, then run rewind async
+    if (a.action === 'fork') {
+      setForkError('');
+      try {
+        await forkFromTurn(selectedTurn);
+        onClose();
+      } catch (error) {
+        setForkError(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+
+    // Existing rewind actions close immediately for a snappy UI.
     onClose();
     if (a.action !== 'cancel') {
       executeRewind(selectedTurn, a.action);
     }
-  }, [selectedTurn, executeRewind, onClose]);
+  }, [selectedTurn, actions, executeRewind, forkFromTurn, isForking, onClose]);
 
   // --- Keyboard navigation (capture phase to intercept before InputBar) ---
   useEffect(() => {
@@ -139,7 +160,7 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
           e.preventDefault();
           setHoveredActionIdx(-1);
           setActionIndex((i) => Math.max(i - 1, 0));
-        } else if (e.key >= '1' && e.key <= '5') {
+        } else if (e.key >= '1' && e.key <= '6') {
           e.preventDefault();
           const idx = parseInt(e.key, 10) - 1;
           setActionIndex(idx);
@@ -167,6 +188,7 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
   if (selectedTurn) {
     return (
       <div ref={panelRef}
+        data-testid="rewind-panel-actions"
         className="absolute bottom-full left-0 right-0 mb-2 mx-auto max-w-3xl
           rounded-lg border border-border-subtle bg-bg-card shadow-xl
           overflow-hidden animate-in slide-in-from-bottom-2 duration-200 z-50">
@@ -225,11 +247,12 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
                 : actionIndex === i;
               const isCancel = a.action === 'cancel';
               const isPrimary = i === 1; // "Restore conversation" is highlighted
-              const isDisabled = !!a.disabled;
+              const isDisabled = !!a.disabled || isForking;
 
               return (
                 <button
                   key={i}
+                  data-testid={`rewind-action-${a.action}`}
                   onClick={() => !isDisabled && doAction(i)}
                   onMouseEnter={() => setHoveredActionIdx(i)}
                   disabled={isDisabled}
@@ -265,6 +288,11 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
               );
             })}
           </div>
+          {forkError && (
+            <p data-testid="historical-fork-error" className="mt-3 text-[10px] text-red-400">
+              {forkError}
+            </p>
+          )}
         </div>
       </div>
     );
@@ -273,6 +301,7 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
   // ==================== Phase 1: Turn list ====================
   return (
     <div ref={panelRef}
+      data-testid="rewind-panel-turns"
       className="absolute bottom-full left-0 right-0 mb-2 mx-auto max-w-3xl
         rounded-lg border border-border-subtle bg-bg-card shadow-xl
         max-h-72 overflow-hidden animate-in slide-in-from-bottom-2 duration-200 z-50
@@ -324,6 +353,7 @@ export function RewindPanel({ onClose }: RewindPanelProps) {
             <button
               key={turn.userMessageId}
               data-turn-idx={i}
+              data-testid={`rewind-turn-${i}`}
               onClick={() => {
                 setSelectedTurn(turn);
                 setActionIndex(1); // default to option 2

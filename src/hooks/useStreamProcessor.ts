@@ -1,14 +1,34 @@
 import { useCallback, useRef, type MutableRefObject } from 'react';
 import { APP_NAME } from '../lib/edition';
 import { useChatStore, generateMessageId, type ChatMessage } from '../stores/chatStore';
-import { useSettingsStore, mapSessionModeToPermissionMode, getEffectiveMode, getEffectiveThinking } from '../stores/settingsStore';
+import { useSettingsStore, getEffectiveMode, getEffectiveThinking } from '../stores/settingsStore';
 import { useSessionStore, setOrphanDrainCallback } from '../stores/sessionStore';
-import { useAgentStore, resolveAgentId, getAgentDepth } from '../stores/agentStore';
-import { useCommandStore } from '../stores/commandStore';
+import {
+  useAgentStore,
+  resolveAgentId,
+  getAgentDepth,
+  upsertCachedAgent,
+  updateCachedAgentPhase,
+  settleCachedAgent,
+  settleCachedTurn,
+  registerCachedTeamTask,
+  resolveCachedTeamTask,
+  updateCachedTeamTask,
+} from '../stores/agentStore';
+import type { TeamTask } from '../stores/agentStore';
+import { runtimeInventoryFromMessage, useCommandStore } from '../stores/commandStore';
 import { useFileStore } from '../stores/fileStore';
+import { useMcpStore } from '../stores/mcpStore';
+import { usePlanStore } from '../stores/planStore';
+import { useWorkflowStore } from '../stores/workflowStore';
+import { adoptCliSessionIdentity } from '../lib/session-identity';
 import { bridge } from '../lib/tauri-bridge';
-import { envFingerprint, resolveModelForProvider, spawnConfigHash, getAutoCompactThreshold } from '../lib/api-provider';
+import { spawnConfigHash, getAutoCompactThreshold } from '../lib/api-provider';
 import { buildApiRetryStatus } from '../lib/api-retry';
+import {
+  sanitizeAssistantTextForDisplay,
+  sanitizeToolResultForDisplay,
+} from '../lib/presentation-sanitizer';
 import { useProviderStore } from '../stores/providerStore';
 import { t } from '../lib/i18n';
 import {
@@ -20,13 +40,137 @@ import {
   checkOwnership,
   handleProcessExitFinalize,
   cleanupStdinRoute,
-  spawnSession,
   teardownSession,
   waitForStdinCleared,
   hasAutoCompactFired,
   markAutoCompactFired,
   getRecentlyFinalizedStdin,
 } from '../lib/sessionLifecycle';
+import { matchingSessionPermissionGrants } from '../lib/session-permission-grants';
+import { recordLoopToolReceipt } from '../stores/loopStore';
+
+function syncNativeTaskPlan(tabId: string, tasks: Iterable<TeamTask>): void {
+  const items = Array.from(tasks)
+    .filter((task) => task.status !== 'deleted')
+    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+    .map((task) => ({
+      step: task.subject,
+      status: task.status,
+      ...(task.activeForm ? { activeForm: task.activeForm } : {}),
+    }));
+  if (items.length > 0) {
+    usePlanStore.getState().setPlan(tabId, items, undefined, 'native_tasks');
+  } else if (usePlanStore.getState().plans[tabId]?.source === 'native_tasks') {
+    usePlanStore.getState().clearPlan(tabId);
+  }
+}
+
+function recordNativeLoopReceipt(
+  tabId: string,
+  parentMessage: ChatMessage | undefined,
+  resultText: string,
+  fallbackToolName?: string,
+): void {
+  recordLoopToolReceipt({
+    threadId: tabId,
+    toolName: parentMessage?.toolName || fallbackToolName,
+    toolInput: parentMessage?.toolInput,
+    resultText,
+    occurredAt: parentMessage?.timestamp,
+  });
+}
+
+function addRegularPermissionCard(tabId: string, msg: any, ownerStdinId?: string): void {
+  const store = useChatStore.getState();
+  const existing = store.getTab(tabId)?.messages.find(
+    (message) => message.type === 'permission'
+      && message.permissionData?.requestId === msg.request_id
+      && message.interactionState !== 'failed',
+  );
+  if (existing) return;
+  store.addMessage(tabId, {
+    id: generateMessageId(),
+    role: 'assistant',
+    type: 'permission',
+    content: msg.title || msg.description || `${msg.tool_name} wants to execute`,
+    permissionTool: msg.tool_name,
+    permissionDescription: msg.description || msg.decision_reason || '',
+    timestamp: Date.now(),
+    interactionState: 'pending',
+    permissionData: {
+      requestId: msg.request_id,
+      toolName: msg.tool_name,
+      input: msg.input,
+      description: msg.description,
+      toolUseId: msg.tool_use_id,
+      permissionSuggestions: msg.permission_suggestions,
+      blockedPath: msg.blocked_path,
+      decisionReason: msg.decision_reason,
+      decisionReasonType: msg.decision_reason_type,
+      classifierApprovable: msg.classifier_approvable,
+      title: msg.title,
+      displayName: msg.display_name,
+      requiresUserInteraction: msg.requires_user_interaction,
+    },
+    owner: ownerStdinId ? { tabId, stdinId: ownerStdinId } : undefined,
+  });
+  store.setActivityStatus(tabId, { phase: 'awaiting' });
+}
+
+function expireSdkControlRequest(tabId: string, msg: any): void {
+  const requestId = typeof msg.request_id === 'string' ? msg.request_id : '';
+  if (!requestId) return;
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  const reason = typeof msg.reason === 'string' && msg.reason.trim()
+    ? msg.reason.trim()
+    : t('msg.requestCancelled');
+  for (const message of tab?.messages ?? []) {
+    if (message.permissionData?.requestId !== requestId || message.resolved) continue;
+    store.updateMessage(tabId, message.id, {
+      resolved: true,
+      interactionState: 'expired',
+      interactionError: reason,
+    });
+  }
+  store.setActivityStatus(tabId, { phase: 'thinking' });
+}
+
+function autoAllowRegisteredSessionPermission(
+  tabId: string,
+  msg: any,
+  ownerStdinId?: string,
+): boolean {
+  if (!ownerStdinId) return false;
+  const updates = matchingSessionPermissionGrants(ownerStdinId, msg.permission_suggestions);
+  if (updates.length === 0) return false;
+  void bridge.respondPermission(
+    ownerStdinId,
+    msg.request_id,
+    true,
+    undefined,
+    msg.tool_use_id,
+    msg.input,
+    updates,
+  ).then(() => {
+    const store = useChatStore.getState();
+    store.setSessionStatus(tabId, 'running');
+    store.setActivityStatus(tabId, { phase: 'thinking' });
+  }).catch((error) => {
+    console.warn('[BLACKBOX:permission] Session grant response failed:', error);
+    addRegularPermissionCard(tabId, msg, ownerStdinId);
+  });
+  return true;
+}
+
+async function generateSessionTitleWithPersistedProvider(
+  userMessage: string,
+  assistantMessage: string,
+) {
+  await useProviderStore.getState().flushSave();
+  const providerId = useProviderStore.getState().activeProviderId || undefined;
+  return bridge.generateSessionTitle(userMessage, assistantMessage, providerId);
+}
 
 // --- Error classification for user-facing messages ---
 // Each pattern maps to a friendly i18n key. Matched errors show the friendly
@@ -121,6 +265,19 @@ export const __orphanTesting = {
 // orphaned buffers without creating a circular import dependency.
 setOrphanDrainCallback(drainOrphanBuffer);
 
+function captureCliSessionIdentity(tabId: string, msg: any, stdinId?: string): string {
+  const cliSessionId = msg.session_id || msg.sessionId;
+  if (typeof cliSessionId !== 'string' || !cliSessionId.trim()) return tabId;
+  const currentResumeId = useSessionStore.getState().sessions
+    .find((session) => session.id === tabId)?.cliResumeId;
+  if (currentResumeId === cliSessionId && !tabId.startsWith('draft_')) return tabId;
+
+  const adoptedTabId = adoptCliSessionIdentity(tabId, cliSessionId, stdinId);
+  bridge.trackSession(cliSessionId).catch(() => {});
+  useSessionStore.getState().fetchSessions();
+  return adoptedTabId;
+}
+
 // --- Shared pendingCommand completion helper (#27) ---
 // Both foreground and background handlers must clear pendingCommandMsgId when
 // a result or assistant event arrives. Without this, slash commands like /compact
@@ -146,6 +303,171 @@ export function completePendingCommand(tabId: string, opts: CompletePendingComma
     },
   });
   store.setSessionMeta(tabId, { pendingCommandMsgId: undefined });
+}
+
+/** Mark a long-running command without releasing its busy/ownership gates. */
+export function markPendingCommandSlow(tabId: string, commandId: string, statusText: string): boolean {
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  if (tab?.sessionMeta.pendingCommandMsgId !== commandId) return false;
+  const command = (tab.messages ?? []).find((message) => message.id === commandId);
+  store.updateMessage(tabId, commandId, {
+    commandCompleted: false,
+    commandData: {
+      ...command?.commandData,
+      slow: true,
+      statusText,
+      slowSince: Date.now(),
+    },
+  });
+  return true;
+}
+
+interface DrainPendingQueueOptions {
+  tabId: string;
+  stdinId: string | undefined;
+  wasStopping: boolean;
+  onDraftRestored?: (draft: string) => void;
+  retryRestoredDraft?: () => void;
+  onUserBatchSent?: (text: string) => void;
+}
+
+/**
+ * Drain exactly one FIFO item after a result settles. User follow-ups and
+ * slash commands each own a separate turn/card; a later result advances the
+ * queue by one more item.
+ */
+export function drainPendingQueueAfterSettlement({
+  tabId,
+  stdinId,
+  wasStopping,
+  onDraftRestored,
+  retryRestoredDraft,
+  onUserBatchSent,
+}: DrainPendingQueueOptions): boolean {
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  const allPending = tab?.pendingUserMessages ?? [];
+  if (allPending.length === 0 || !stdinId || wasStopping) return false;
+
+  const firstPending = allPending[0];
+  if (!firstPending) return false;
+  const firstIsCommand = firstPending.kind === 'command';
+  const stage = [firstPending];
+
+  const currentHash = spawnConfigHash();
+  const hashMismatch = stage.some(
+    (item) => item.enqueueConfigHash !== undefined && item.enqueueConfigHash !== currentHash,
+  );
+  const sessionHashMismatch = tab?.sessionMeta.spawnConfigHash !== undefined
+    && tab.sessionMeta.spawnConfigHash !== currentHash;
+  const stdinMismatch = stage.some(
+    (item) => item.enqueueStdinId !== undefined && item.enqueueStdinId !== stdinId,
+  );
+  if (hashMismatch || sessionHashMismatch || stdinMismatch) {
+    for (const item of allPending) {
+      if (item.kind === 'command' && item.commandMessageId) {
+        const command = store.getTab(tabId)?.messages.find(
+          (message) => message.id === item.commandMessageId,
+        );
+        store.updateMessage(tabId, item.commandMessageId, {
+          commandCompleted: true,
+          commandData: {
+            ...command?.commandData,
+            queued: false,
+            cancelled: true,
+            completedAt: Date.now(),
+          },
+        });
+      }
+    }
+    store.restorePendingQueueToDraft(tabId);
+    const restoredDraft = store.getTab(tabId)?.inputDraft ?? '';
+    onDraftRestored?.(restoredDraft);
+    retryRestoredDraft?.();
+    console.warn('[BLACKBOX] Pending queue restored because process/config ownership changed');
+    return false;
+  }
+
+  if (firstIsCommand) {
+    const command = store.shiftPendingMessage(tabId)!;
+    const commandMessageId = command.commandMessageId || generateMessageId();
+    if (!command.commandMessageId) {
+      store.addMessage(tabId, {
+        id: commandMessageId,
+        role: 'system',
+        type: 'text',
+        content: '',
+        commandType: 'processing',
+        commandData: { command: command.text },
+        commandStartTime: Date.now(),
+        commandCompleted: false,
+        timestamp: Date.now(),
+      });
+    } else {
+      const existing = store.getTab(tabId)?.messages.find(
+        (message) => message.id === commandMessageId,
+      );
+      store.updateMessage(tabId, commandMessageId, {
+        commandStartTime: Date.now(),
+        commandCompleted: false,
+        commandData: { ...existing?.commandData, queued: false, startedAt: Date.now() },
+      });
+    }
+    store.setSessionMeta(tabId, {
+      pendingCommandMsgId: commandMessageId,
+      turnStartTime: Date.now(),
+      lastProgressAt: Date.now(),
+      inputTokens: 0,
+      outputTokens: 0,
+    });
+    store.setSessionStatus(tabId, 'running');
+    store.setActivityStatus(tabId, { phase: 'thinking' });
+    bridge.sendStdin(stdinId, command.text).catch((error) => {
+      console.error('[BLACKBOX] Failed to send queued command:', error);
+      completePendingCommand(tabId, { output: 'Command failed to start' });
+      if (store.getTab(tabId)?.sessionStatus === 'running') {
+        store.setSessionStatus(tabId, 'error');
+      }
+    });
+    return true;
+  }
+
+  store.shiftPendingMessage(tabId);
+  const queuedText = stage[0].text;
+  const pendingTurnMessageId = generateMessageId();
+  store.addMessage(tabId, {
+    id: pendingTurnMessageId,
+    role: 'user',
+    type: 'text',
+    content: queuedText,
+    timestamp: Date.now(),
+  });
+  store.setSessionStatus(tabId, 'running');
+  store.setSessionMeta(tabId, {
+    pendingTurnMessageId,
+    pendingTurnInput: queuedText,
+    turnAcceptedForResume: false,
+    turnStartTime: Date.now(),
+    lastProgressAt: Date.now(),
+    inputTokens: 0,
+    outputTokens: 0,
+  });
+  store.setActivityStatus(tabId, { phase: 'thinking' });
+  onUserBatchSent?.(queuedText);
+  bridge.sendStdin(stdinId, queuedText).catch((error) => {
+    console.error('[BLACKBOX] Failed to send pending messages:', error);
+    const draft = store.getTab(tabId)?.inputDraft ?? '';
+    store.setInputDraft(tabId, draft ? `${draft}\n\n${queuedText}` : queuedText);
+    cleanupStdinRoute(stdinId);
+    store.setSessionMeta(tabId, {
+      stdinId: undefined,
+      stdinReady: false,
+      pendingReadyMessage: undefined,
+    });
+    store.setSessionStatus(tabId, 'error');
+  });
+  return true;
 }
 
 function markStdinReady(tabId: string, stdinId: string | undefined, model: string | undefined) {
@@ -174,30 +496,63 @@ function markStdinReady(tabId: string, stdinId: string | undefined, model: strin
     });
   }
 
-  if (stdinId && pendingReady?.stdinId === stdinId) {
-    bridge.sendStdin(stdinId, pendingReady.text).catch((err) => {
-      console.error('[BLACKBOX] Failed to flush ready-gated message:', err);
-      cleanupStdinRoute(stdinId);
-      store.setSessionMeta(tabId, {
-        stdinId: undefined,
-        stdinReady: false,
-        pendingReadyMessage: undefined,
-        pendingTurnMessageId: undefined,
-        pendingTurnInput: undefined,
-        pendingTurnAttachments: undefined,
-        turnStartTime: undefined,
-        lastProgressAt: undefined,
-        apiRetry: undefined,
-      });
-      store.setSessionStatus(tabId, 'error');
-      store.addMessage(tabId, {
-        id: generateMessageId(),
-        role: 'system',
-        type: 'text',
-        content: '预热会话就绪后发送首条消息失败，请重发一次。',
-        timestamp: Date.now(),
-      });
-    });
+  if (stdinId) {
+    const queuedSteers = store.takePendingSteers(tabId, stdinId);
+    if (pendingReady?.stdinId === stdinId || queuedSteers.length > 0) {
+      void (async () => {
+        let deliveredSteers = 0;
+        try {
+          // Preserve ordering: the initial ready-gated prompt enters the
+          // agent loop before guidance typed while the process was starting.
+          if (pendingReady?.stdinId === stdinId) {
+            await bridge.sendStdin(stdinId, pendingReady.text);
+          }
+          for (const steer of queuedSteers) {
+            await bridge.sendStdin(stdinId, steer.text);
+            store.addMessage(tabId, {
+              id: generateMessageId(),
+              role: 'user',
+              type: 'text',
+              content: steer.text,
+              isSteer: true,
+              steerState: 'sent',
+              timestamp: steer.enqueueAt ?? Date.now(),
+            });
+            deliveredSteers += 1;
+          }
+          if (queuedSteers.length > 0) {
+            store.setSessionMeta(tabId, { lastProgressAt: Date.now() });
+          }
+        } catch (err) {
+          console.error('[BLACKBOX] Failed to flush ready-gated input:', err);
+          const unsent = queuedSteers.slice(deliveredSteers).map((item) => item.text).join('\n\n');
+          if (unsent) {
+            const draft = store.getTab(tabId)?.inputDraft.trim() || '';
+            store.setInputDraft(tabId, draft ? `${draft}\n\n${unsent}` : unsent);
+          }
+          cleanupStdinRoute(stdinId);
+          store.setSessionMeta(tabId, {
+            stdinId: undefined,
+            stdinReady: false,
+            pendingReadyMessage: undefined,
+            pendingTurnMessageId: undefined,
+            pendingTurnInput: undefined,
+            pendingTurnAttachments: undefined,
+            turnStartTime: undefined,
+            lastProgressAt: undefined,
+            apiRetry: undefined,
+          });
+          store.setSessionStatus(tabId, 'error');
+          store.addMessage(tabId, {
+            id: generateMessageId(),
+            role: 'system',
+            type: 'text',
+            content: '预热会话就绪后发送消息失败，请重发一次。',
+            timestamp: Date.now(),
+          });
+        }
+      })();
+    }
   }
 }
 
@@ -298,6 +653,38 @@ function shouldCreateStreamingToolPlaceholder(toolName: string | undefined) {
       && toolName !== 'SendMessage'
       && toolName !== 'AskUserQuestion',
   );
+}
+
+/** Claude's Agent/SendMessage launch results contain internal agent ids and
+ * private task-output paths that the CLI explicitly marks as non-user-facing.
+ * Keep the completion state on the card, but never render that metadata. */
+function agentToolIdentity(block: any): {
+  kind: 'subagent' | 'teammate';
+  name?: string;
+  model?: string;
+  description: string;
+} {
+  const teammateName = typeof block?.input?.name === 'string'
+    ? block.input.name.trim()
+    : '';
+  const subagentType = [
+    block?.input?.subagent_type,
+    block?.input?.subagentType,
+    block?.input?.agent_type,
+    block?.input?.agentType,
+  ].find((value) => typeof value === 'string' && value.trim())?.trim() || '';
+  const model = typeof block?.input?.model === 'string'
+    ? block.input.model.trim()
+    : '';
+  const description = teammateName
+    || (typeof block?.input?.description === 'string' ? block.input.description : '')
+    || (typeof block?.input?.prompt === 'string' ? block.input.prompt : '');
+  return {
+    kind: teammateName ? 'teammate' : 'subagent',
+    name: teammateName || subagentType || undefined,
+    model: model || undefined,
+    description,
+  };
 }
 
 function shouldRenderThinkingForTab(tabId: string) {
@@ -586,6 +973,11 @@ export const __streamRetryTesting = {
   shouldClearApiRetryForEvent,
 };
 
+export const __streamAgentTeamsTesting = {
+  agentToolIdentity,
+  sanitizeToolResultContent: sanitizeToolResultForDisplay,
+};
+
 // --- File tree auto-refresh on file-mutating tool completions ---
 // Tools that may create/modify/delete files in the working directory.
 const FILE_MUTATING_TOOLS = new Set([
@@ -652,6 +1044,23 @@ function shouldClearApiRetryForEvent(msg: any): boolean {
     || msg.type === 'process_exit'
     || msg.type === 'blackbox_permission_request'
     || msg.type === 'tool_result';
+}
+
+/**
+ * Claude Code publishes the authoritative slash-command and skill inventory in
+ * `system:init`, then may replace it with `commands_changed`. Keep the UI
+ * catalogue tied to that live runtime instead of a compiled command allowlist.
+ */
+function recordRuntimeCommandInventory(msg: any, sessionCwd?: string): void {
+  const state = useCommandStore.getState();
+  const rawCwd = typeof msg.cwd === 'string' ? msg.cwd : sessionCwd || state.activeCwd;
+  const cwd = rawCwd === '/' ? rawCwd : rawCwd.replace(/\/+$/, '');
+  const inventory = runtimeInventoryFromMessage(
+    msg,
+    cwd,
+    state.runtimeByCwd[cwd],
+  );
+  if (inventory) state.recordRuntimeInventory(inventory);
 }
 
 function recordApiRetry(tabId: string, msg: any): void {
@@ -738,8 +1147,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
     // Update progress for stall detection without writing Zustand state for every token.
     markStreamProgress(tabId, msg);
+    useWorkflowStore.getState().applyStreamEvent(tabId, msg);
 
     switch (msg.type) {
+      case 'blackbox_control_request_cancelled': {
+        expireSdkControlRequest(tabId, msg);
+        return;
+      }
       case 'blackbox_permission_request': {
         // ExitPlanMode: auto-approve in non-plan modes; add plan_review card in plan mode
         if (msg.tool_name === 'ExitPlanMode') {
@@ -830,39 +1244,27 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           store.setActivityStatus(tabId, { phase: 'awaiting' });
           return;
         }
-        // Regular permission: add permission card to tab
+        // Regular permission: exact rules approved for this same live stdin can
+        // continue without another card. Manual mode still asks for every
+        // unrelated rule.
         const bgTab = store.getTab(tabId);
-        const existingPerm = bgTab?.messages.find(
-          (m) => m.type === 'permission'
-            && m.permissionData?.requestId === msg.request_id
-            && m.interactionState !== 'failed'
-        );
-        if (existingPerm) return;
-        store.addMessage(tabId, {
-          id: generateMessageId(),
-          role: 'assistant', type: 'permission',
-          content: msg.description || `${msg.tool_name} wants to execute`,
-          permissionTool: msg.tool_name,
-          permissionDescription: msg.description || '',
-          timestamp: Date.now(),
-          interactionState: 'pending',
-          permissionData: {
-            requestId: msg.request_id,
-            toolName: msg.tool_name,
-            input: msg.input,
-            description: msg.description,
-            toolUseId: msg.tool_use_id,
-          },
-        });
-        store.setActivityStatus(tabId, { phase: 'awaiting' });
+        const ownerStdinId = (msg.__stdinId as string | undefined)
+          ?? bgTab?.sessionMeta.stdinId;
+        if (autoAllowRegisteredSessionPermission(tabId, msg, ownerStdinId)) return;
+        addRegularPermissionCard(tabId, msg, ownerStdinId);
         break;
       }
       case 'stream_event': {
         const evt = msg.event;
         if (!evt) break;
+        const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+        const bgAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
         if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           const text = evt.delta.text || '';
-          if (text) store.updatePartialMessage(tabId, text);
+          if (text) {
+            store.updatePartialMessage(tabId, text);
+            updateCachedAgentPhase(tabId, bgAgentId, 'writing');
+          }
         } else if (evt.type === 'content_block_delta' && evt.delta?.type === 'thinking_delta') {
           // F1 (#57): background tabs must handle thinking_delta too,
           // otherwise thinking content is silently lost on tab switch.
@@ -872,6 +1274,22 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           } else if (msg.__stdinId) {
             streamController.clearThinking(msg.__stdinId as string);
           }
+        }
+        if (evt.type === 'content_block_start'
+            && evt.content_block?.type === 'tool_use'
+            && (evt.content_block?.name === 'Task' || evt.content_block?.name === 'Agent')) {
+          const identity = agentToolIdentity(evt.content_block);
+          upsertCachedAgent(tabId, {
+            id: evt.content_block.id || `task_${Date.now()}`,
+            parentId: bgAgentId,
+            description: identity.description,
+            phase: 'spawning',
+            startTime: Date.now(),
+            isMain: false,
+            kind: identity.kind,
+            name: identity.name,
+            model: identity.model,
+          });
         }
         // Early detection: create plan_review card for background tab (Plan mode only).
         // Bypass auto-approves via Rust backend — no UI card needed.
@@ -937,6 +1355,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         const bgShouldMaterializeThinking = bgShouldRenderThinking
           && shouldMaterializeThinkingSnapshot(content, bgHasTextBlock);
         const bgTab = store.getTab(tabId);
+        const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+        const bgAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
+        const bgAgentDepth = getAgentDepth(bgAgentId, bgAgents);
         const bgStdinId = msg.__stdinId as string | undefined;
         const bgBufferedThinking = bgStdinId
           ? streamController.peekBufferedThinking(bgStdinId)
@@ -983,14 +1404,48 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             store.addMessage(tabId, {
               id: textId,
               role: 'assistant', type: 'text',
-              content: block.text, timestamp: Date.now(),
+              content: block.text, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
             });
+            updateCachedAgentPhase(tabId, bgAgentId, 'writing');
           } else if (block.type === 'tool_use') {
             // Code mode: suppress EnterPlanMode/ExitPlanMode (transparent to user)
             if (getEffectiveMode(store.getTab(tabId)?.sessionMeta) === 'code'
                 && (block.name === 'EnterPlanMode' || block.name === 'ExitPlanMode')) {
               if (block.name === 'ExitPlanMode') exitPlanModeSeenRef.current = true;
               continue;
+            }
+            if (block.name === 'Agent' || block.name === 'Task') {
+              const identity = agentToolIdentity(block);
+              upsertCachedAgent(tabId, {
+                id: block.id || generateMessageId(),
+                parentId: bgAgentId,
+                description: identity.description,
+                phase: 'spawning',
+                startTime: Date.now(),
+                isMain: false,
+                kind: identity.kind,
+                name: identity.name,
+                model: identity.model,
+              });
+            } else {
+              updateCachedAgentPhase(tabId, bgAgentId, 'tool', block.name);
+              if (block.name === 'TaskCreate' && block.id) {
+                registerCachedTeamTask(tabId, block.id, block.input || {});
+              } else if (block.name === 'TaskUpdate') {
+                updateCachedTeamTask(tabId, block.input || {});
+              }
+            }
+            if (
+              bgAgentDepth === 0
+              && !msg.parent_tool_use_id
+              && (block.name === 'TaskCreate' || block.name === 'TaskUpdate')
+            ) {
+              const tasks = useAgentStore.getState().teamTaskCache.get(tabId) ?? new Map();
+              try {
+                syncNativeTaskPlan(tabId, tasks.values());
+              } catch (error) {
+                console.warn('[BLACKBOX Plan] Ignored invalid native Task state:', error);
+              }
             }
             if (block.name === 'AskUserQuestion') {
               const questions = block.input?.questions;
@@ -1010,17 +1465,24 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 content: '', toolName: block.name,
                 toolInput: block.input,
                 questions: Array.isArray(questions) ? questions : [],
-                resolved: false, timestamp: Date.now(),
+                resolved: false, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
                 owner: bgOwnerStdinId ? { tabId, stdinId: bgOwnerStdinId } : undefined,
               });
             } else if (block.name === 'TodoWrite' && block.input?.todos) {
+              if (bgAgentDepth === 0 && !msg.parent_tool_use_id) {
+                try {
+                  usePlanStore.getState().setPlan(tabId, block.input.todos, undefined, 'todo');
+                } catch (error) {
+                  console.warn('[BLACKBOX Plan] Ignored invalid TodoWrite plan:', error);
+                }
+              }
               store.addMessage(tabId, {
                 id: block.id || generateMessageId(),
                 role: 'assistant', type: 'todo',
                 content: '', toolName: block.name,
                 toolInput: block.input,
                 todoItems: block.input.todos,
-                timestamp: Date.now(),
+                subAgentDepth: bgAgentDepth, timestamp: Date.now(),
               });
             } else if (block.name === 'ExitPlanMode') {
               // Show as regular tool_use in plan/bypass modes
@@ -1028,7 +1490,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 id: block.id || generateMessageId(),
                 role: 'assistant', type: 'tool_use',
                 content: '', toolName: block.name,
-                toolInput: block.input, timestamp: Date.now(),
+                toolInput: block.input, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
               });
               // Only create plan_review card in Plan mode.
               // Bypass auto-approves via Rust backend — no UI card needed.
@@ -1065,7 +1527,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 id: block.id || generateMessageId(),
                 role: 'assistant', type: 'tool_use',
                 content: '', toolName: block.name,
-                toolInput: block.input, timestamp: Date.now(),
+                toolInput: block.input, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
               });
             }
           } else if (block.type === 'thinking') {
@@ -1109,9 +1571,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 undefined,
               );
               if (targetId) {
+                const parentMsg = store.getTab(tabId)?.messages.find((m) => m.id === targetId);
+                if (parentMsg?.toolName === 'TaskCreate') {
+                  resolveCachedTeamTask(tabId, block.tool_use_id, resultText);
+                }
+                recordNativeLoopReceipt(tabId, parentMsg, resultText);
+                const safeResult = sanitizeToolResultForDisplay(parentMsg?.toolName, resultText);
                 store.updateMessage(tabId, targetId, {
                   toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
+                  ...(safeResult ? { toolResultContent: safeResult } : {}),
                 });
               }
             }
@@ -1132,9 +1600,14 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           // Backfill AskUserQuestion type/questions in background tab
           const bgTab = store.getTab(tabId);
           const parentMsg = bgTab?.messages.find((m) => m.id === targetId);
+          if (parentMsg?.toolName === 'TaskCreate') {
+            resolveCachedTeamTask(tabId, msg.tool_use_id, resultContent);
+          }
+          recordNativeLoopReceipt(tabId, parentMsg, resultContent, msg.tool_name);
+          const safeResult = sanitizeToolResultForDisplay(parentMsg?.toolName ?? msg.tool_name, resultContent);
           const bgUpdates: Partial<ChatMessage> = {
             toolCompleted: true,
-            ...(resultContent ? { toolResultContent: resultContent } : {}),
+            ...(safeResult ? { toolResultContent: safeResult } : {}),
           };
           if (parentMsg?.toolName === 'AskUserQuestion') {
             if (parentMsg.type !== 'question') {
@@ -1155,6 +1628,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
+        if (msg.parent_tool_use_id) {
+          const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          settleCachedAgent(
+            tabId,
+            resolveAgentId(msg.parent_tool_use_id, bgAgents),
+            msg.subtype !== 'success',
+          );
+          break;
+        }
         // Capture stopping state BEFORE status update — needed for drain guard below
         const bgWasStopping = store.getTab(tabId)?.sessionStatus === 'stopping';
         const bgResultTab = store.getTab(tabId);
@@ -1204,6 +1686,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           } : undefined,
         });
         store.setSessionStatus(tabId, msg.subtype === 'success' ? 'completed' : 'error');
+        settleCachedTurn(
+          tabId,
+          msg.subtype !== 'success',
+          msg.subtype === 'success' && useSettingsStore.getState().agentTeamsEnabled,
+        );
         {
           const bgTab = store.getTab(tabId);
           const prevMeta = bgTab?.sessionMeta;
@@ -1224,104 +1711,67 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             apiRetry: undefined,
           });
         }
-        if (typeof msg.result === 'string' && msg.result && !isCliPlaceholder(msg.result)) {
+        const bgResultDisplayText = typeof msg.result === 'string'
+          ? sanitizeAssistantTextForDisplay(msg.result)
+          : '';
+        if (bgResultDisplayText && !isCliPlaceholder(bgResultDisplayText)) {
           // Only add if not already delivered via 'assistant' event
           const bgTab = store.getTab(tabId);
           const bgIsDuplicate = bgTab?.messages.some(
             (m) => m.role === 'assistant' && m.type === 'text'
-              && m.content === msg.result,
+              && m.content === bgResultDisplayText,
           );
           if (!bgIsDuplicate) {
             store.addMessage(tabId, {
               id: msg.uuid || generateMessageId(),
               role: 'assistant', type: 'text',
-              content: msg.result, timestamp: Date.now(),
+              content: bgResultDisplayText, timestamp: Date.now(),
             });
           }
         }
-        // BATCH drain for background tabs: same as foreground — combine
-        // ALL pending messages into a single user turn.
-        // Decision 5: stopping state blocks drain pending.
-        // Use bgWasStopping (captured BEFORE setSessionStatus above) because the
-        // status was already overwritten to completed/error by the time we get here.
-        //
-        // Phase 2 §6: before sending, verify the config hash captured at enqueue
-        // time still matches the current spawnConfigHash. If not, the user
-        // changed provider / model / thinking mid-turn and the queued text
-        // would be processed on a stale process — backfill to inputDraft instead.
-        {
-          const bgDrainTab = store.getTab(tabId);
-          const bgAllPending = bgDrainTab?.pendingUserMessages ?? [];
-          const bgFlushStdinId = bgDrainTab?.sessionMeta.stdinId;
-          if (bgAllPending.length > 0 && bgFlushStdinId && !bgWasStopping) {
-            const bgCurrentHash = spawnConfigHash();
-            const bgHashMismatch = bgAllPending.some(
-              (p) => p.enqueueConfigHash !== undefined && p.enqueueConfigHash !== bgCurrentHash,
-            );
-            // Also detect stdinId drift: if the process was restarted since
-            // enqueue, the stdinId will differ and the queued text should not
-            // be sent to the new process.
-            const bgStdinMismatch = bgAllPending.some(
-              (p) => p.enqueueStdinId !== undefined && p.enqueueStdinId !== bgFlushStdinId,
-            );
-            if (bgHashMismatch || bgStdinMismatch) {
-              store.restorePendingQueueToDraft(tabId);
-              if (useSessionStore.getState().selectedSessionId === tabId) {
-                setInputSync(store.getTab(tabId)?.inputDraft ?? '');
-              }
-              console.warn('[TC:bg] Config changed mid-queue — pending messages restored to draft');
-            } else {
-              const bgCombined = bgAllPending.map((p) => p.text).join('\n\n');
-              store.clearPendingMessages(tabId);
-              store.addMessage(tabId, {
-                id: generateMessageId(),
-                role: 'user',
-                type: 'text',
-                content: bgCombined,
-                timestamp: Date.now(),
-              });
-              store.setSessionStatus(tabId, 'running');
-              store.setSessionMeta(tabId, { turnStartTime: Date.now(), lastProgressAt: Date.now(), inputTokens: 0, outputTokens: 0 });
-              store.setActivityStatus(tabId, { phase: 'thinking' });
-              bridge.sendStdin(bgFlushStdinId, bgCombined).catch((err) => {
-                console.error('[TC:bg] Failed to send pending messages:', err);
-                const bgDraft = store.getTab(tabId)?.inputDraft ?? '';
-                store.setInputDraft(tabId, bgDraft ? `${bgDraft}\n\n${bgCombined}` : bgCombined);
-                cleanupStdinRoute(bgFlushStdinId);
-                store.setSessionMeta(tabId, {
-                  stdinId: undefined,
-                  stdinReady: false,
-                  pendingReadyMessage: undefined,
-                });
-                store.setSessionStatus(tabId, 'error');
-              });
-            }
-          }
-        }
-
-        useSessionStore.getState().fetchSessions();
-
-        // S13 fix: Auto-compact for background tabs (same as foreground)
+        // Auto-compact must outrank pending follow-ups on background tabs just
+        // as it does on the foreground path. The compact result will re-enter
+        // this handler and only then drain the next queued stage.
+        let bgAutoCompactTriggered = false;
         {
           const bgCompactTab = store.getTab(tabId);
           const bgResultInputTokens = msg.usage?.input_tokens || 0;
           const bgCompactStdinId = bgCompactTab?.sessionMeta.stdinId;
           const bgCompactThreshold = getAutoCompactThreshold(bgCompactTab?.sessionMeta.spawnedModel);
           if (bgResultInputTokens > bgCompactThreshold && !hasAutoCompactFired(tabId) && bgCompactStdinId && msg.subtype === 'success') {
+            bgAutoCompactTriggered = true;
             markAutoCompactFired(tabId);
             console.log('[BLACKBOX] Background tab auto-compact triggered:', tabId, 'inputTokens =', bgResultInputTokens);
-            const bgCompactMsgId = generateMessageId();
+            const queuedCompact = bgCompactTab?.pendingUserMessages.find(
+              (item) => item.kind === 'command' && item.text.trim().toLowerCase() === '/compact',
+            );
+            const bgCompactMsgId = queuedCompact?.commandMessageId || generateMessageId();
+            if (queuedCompact?.commandMessageId) {
+              store.removePendingCommand(tabId, queuedCompact.commandMessageId);
+            }
             const bgCompactStartedAt = Date.now();
-            store.addMessage(tabId, {
-              id: bgCompactMsgId,
-              role: 'system',
-              type: 'text',
-              content: t('chat.autoCompacting'),
-              commandType: 'processing',
-              commandData: { command: '/compact' },
-              commandStartTime: bgCompactStartedAt,
-              timestamp: Date.now(),
-            });
+            if (queuedCompact?.commandMessageId) {
+              const existing = store.getTab(tabId)?.messages.find(
+                (message) => message.id === bgCompactMsgId,
+              );
+              store.updateMessage(tabId, bgCompactMsgId, {
+                content: t('chat.autoCompacting'),
+                commandStartTime: bgCompactStartedAt,
+                commandCompleted: false,
+                commandData: { ...existing?.commandData, queued: false, automatic: true },
+              });
+            } else {
+              store.addMessage(tabId, {
+                id: bgCompactMsgId,
+                role: 'system',
+                type: 'text',
+                content: t('chat.autoCompacting'),
+                commandType: 'processing',
+                commandData: { command: '/compact', automatic: true },
+                commandStartTime: bgCompactStartedAt,
+                timestamp: Date.now(),
+              });
+            }
             store.setSessionMeta(tabId, { pendingCommandMsgId: bgCompactMsgId });
             store.setSessionStatus(tabId, 'running');
             store.setSessionMeta(tabId, {
@@ -1341,14 +1791,25 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             setTimeout(() => {
               const meta = store.getTab(tabId)?.sessionMeta ?? {};
               if (meta.pendingCommandMsgId === bgCompactMsgId) {
-                completePendingCommand(tabId, { output: 'Compact timed out' });
-                if (store.getTab(tabId)?.sessionStatus === 'running') {
-                  store.setSessionStatus(tabId, 'idle');
-                }
+                markPendingCommandSlow(tabId, bgCompactMsgId, t('chat.compactStillRunning'));
               }
             }, 15_000);
           }
         }
+
+        if (!bgAutoCompactTriggered) {
+          const bgDrainTab = store.getTab(tabId);
+          drainPendingQueueAfterSettlement({
+            tabId,
+            stdinId: bgDrainTab?.sessionMeta.stdinId,
+            wasStopping: bgWasStopping,
+            onDraftRestored: useSessionStore.getState().selectedSessionId === tabId
+              ? setInputSync
+              : undefined,
+          });
+        }
+
+        useSessionStore.getState().fetchSessions();
 
         // AI Title Generation for background tabs (same 3rd-turn logic)
         if (msg.subtype === 'success') {
@@ -1364,7 +1825,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             if (bgUserMsgs.length >= 3 && bgAssistantMsgs.length >= 3) {
               const userMsg = bgUserMsgs.map((m) => m.content).join('\n').slice(0, 500);
               const assistantMsg = bgAssistantMsgs.map((m) => m.content).join('\n').slice(0, 500);
-              bridge.generateSessionTitle(userMsg, assistantMsg, useProviderStore.getState().activeProviderId || undefined)
+              generateSessionTitleWithPersistedProvider(userMsg, assistantMsg)
                 .then((title) => {
                   if (title) {
                     useSessionStore.getState().setCustomPreview(tabId, title);
@@ -1401,6 +1862,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       }
       case 'process_exit': {
         const bgStdinId = msg.__stdinId;
+        settleCachedTurn(tabId, false, false);
 
         // Ownership guard for background exit
         if (bgStdinId) {
@@ -1433,6 +1895,22 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       case 'system':
         if (msg.subtype === 'init') {
           markStdinReady(tabId, msg.__stdinId, msg.model);
+          recordRuntimeCommandInventory(
+            msg,
+            store.getTab(tabId)?.sessionMeta.cwdSnapshot,
+          );
+          useMcpStore.getState().recordRuntimeServers(
+            Array.isArray(msg.mcp_servers) ? msg.mcp_servers : [],
+            Array.isArray(msg.tools) ? msg.tools : [],
+          );
+        } else if (msg.subtype === 'commands_changed') {
+          // Claude sends the complete current command set. Replace the prior
+          // runtime inventory so nested skills/plugins disappearing mid-session
+          // cannot linger as callable UI entries.
+          recordRuntimeCommandInventory(
+            msg,
+            store.getTab(tabId)?.sessionMeta.cwdSnapshot,
+          );
         } else if (msg.subtype === 'error') {
           // FI-3: Surface system errors in background tabs too
           store.addMessage(tabId, {
@@ -1444,6 +1922,30 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           });
         } else if (msg.subtype === 'api_retry') {
           recordApiRetry(tabId, msg);
+        } else if (msg.subtype === 'task_started') {
+          const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
+          const cachedAgent = toolUseId
+            ? useAgentStore.getState().agentCache.get(tabId)?.get(toolUseId)
+            : undefined;
+          if (toolUseId && cachedAgent) {
+            upsertCachedAgent(tabId, {
+              id: toolUseId,
+              taskId: typeof msg.task_id === 'string' ? msg.task_id : undefined,
+              phase: 'thinking',
+            });
+          }
+        } else if (msg.subtype === 'task_progress') {
+          if (typeof msg.tool_use_id === 'string') {
+            updateCachedAgentPhase(tabId, msg.tool_use_id, 'thinking');
+          }
+        } else if (msg.subtype === 'task_notification') {
+          if (typeof msg.tool_use_id === 'string') {
+            settleCachedAgent(
+              tabId,
+              msg.tool_use_id,
+              String(msg.status || '').toLowerCase() === 'failed',
+            );
+          }
         }
         break;
       default:
@@ -1476,7 +1978,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
     // Diagnostic: log first message and unrecognized types
     const KNOWN_TYPES = new Set([
-      'blackbox_permission_request', 'stream_event', 'system', 'assistant',
+      'blackbox_permission_request', 'blackbox_control_request_cancelled',
+      'stream_event', 'system', 'assistant',
       'user', 'human', 'tool_result', 'tool_use_summary', 'result', 'process_exit',
       'content_block_delta', 'rate_limit_event',
     ]);
@@ -1510,13 +2013,19 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       }
       return;
     }
-    const ownerTabId = directOwnerTabId;
+    let ownerTabId = directOwnerTabId;
+    if (ownerTabId) {
+      // Identity adoption must happen before foreground/background branching.
+      // Otherwise a system:init arriving after a tab switch leaves draft_* as
+      // the UI key while Claude persists the same conversation under its UUID.
+      ownerTabId = captureCliSessionIdentity(ownerTabId, msg, msgStdinId);
+    }
     const activeTabId = useSessionStore.getState().selectedSessionId;
 
-    const isBackground = ownerTabId && ownerTabId !== activeTabId;
+    const isBackground = Boolean(ownerTabId && ownerTabId !== activeTabId);
 
     // If stream belongs to a background tab, route key events to cache and return
-    if (isBackground) {
+    if (isBackground && ownerTabId) {
       // Diagnostic: log background routing for non-trivial message types
       if (msg.type !== 'stream_event') {
         console.log('[BLACKBOX:route] background:', msg.type, 'owner:', ownerTabId, 'active:', activeTabId);
@@ -1548,6 +2057,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
     // Update progress for stall detection without writing Zustand state for every token.
     markStreamProgress(tabId, msg);
+    useWorkflowStore.getState().applyStreamEvent(tabId, msg);
+
+    if (msg.type === 'blackbox_control_request_cancelled') {
+      expireSdkControlRequest(tabId, msg);
+      return;
+    }
 
     // --- SDK Permission Request (routed through stream channel for reliability) ---
     if (msg.type === 'blackbox_permission_request') {
@@ -1661,35 +2176,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         return;
       }
 
-      // Dedup: skip if we already have a non-failed PermissionCard for this request_id
-      const chatStore = useChatStore.getState();
-      const messages = chatStore.getTab(tabId)?.messages ?? [];
-      const existingPerm = messages.find(
-        (m) => m.type === 'permission'
-          && m.permissionData?.requestId === msg.request_id
-          && m.interactionState !== 'failed'
-      );
-      if (existingPerm) {
-        return;
-      }
-      chatStore.addMessage(tabId, {
-        id: generateMessageId(),
-        role: 'assistant',
-        type: 'permission',
-        content: msg.description || `${msg.tool_name} wants to execute`,
-        permissionTool: msg.tool_name,
-        permissionDescription: msg.description || '',
-        timestamp: Date.now(),
-        interactionState: 'pending',
-        permissionData: {
-          requestId: msg.request_id,
-          toolName: msg.tool_name,
-          input: msg.input,
-          description: msg.description,
-          toolUseId: msg.tool_use_id,
-        },
-      });
-      chatStore.setActivityStatus(tabId, { phase: 'awaiting' });
+      const ownerStdinId = (msg.__stdinId as string | undefined)
+        ?? useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
+      if (autoAllowRegisteredSessionPermission(tabId, msg, ownerStdinId)) return;
+      addRegularPermissionCard(tabId, msg, ownerStdinId);
       return;
     }
 
@@ -1703,37 +2193,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
     const agentDepth = getAgentDepth(agentId, agentActions.agents);
 
     // Capture the CLI's own session ID from stream events (used for --resume)
-    const cliSessionId = msg.session_id || msg.sessionId;
-    if (cliSessionId) {
-      // Write to cliResumeId (the primary resume credential) in sessionStore
-      const currentResumeId = useSessionStore.getState().sessions.find((s) => s.id === tabId)?.cliResumeId;
-      if (currentResumeId !== cliSessionId) {
-        // Also write to sessionMeta.sessionId for backward compat
-        setSessionMeta({ sessionId: cliSessionId });
-        // Also store in sessionStore for hadRealExchange-guarded resume
-        useSessionStore.getState().setCliResumeId(tabId, cliSessionId);
-        bridge.trackSession(cliSessionId).catch(() => {});
-
-        // Promote draft tabs to the real CLI session ID so they merge with
-        // disk sessions. Non-draft tabs are never physically deleted here:
-        // resume evidence, not heuristic deletion, preserves continuity.
-        if (tabId.startsWith('draft_')) {
-          // Migrate tab data under old key to new real key
-          const chatState = useChatStore.getState();
-          const tabData = chatState.getTab(tabId);
-          if (tabData) {
-            const newTabs = new Map(chatState.tabs);
-            newTabs.set(cliSessionId, { ...tabData, tabId: cliSessionId });
-            newTabs.delete(tabId);
-            useChatStore.setState({ tabs: newTabs, sessionCache: newTabs });
-          }
-          useSessionStore.getState().promoteDraft(tabId, cliSessionId);
-          tabId = cliSessionId;
-        }
-
-        useSessionStore.getState().fetchSessions();
-      }
-    }
+    tabId = captureCliSessionIdentity(tabId, msg, msgStdinId);
 
     // Helper: clear accumulated partial text for THIS tab only.
     // B1: flush must be scoped to msgStdinId — calling flushStreamBuffer() with
@@ -1827,28 +2287,17 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (evt.type === 'content_block_start'
             && evt.content_block?.type === 'tool_use'
             && (evt.content_block?.name === 'Task' || evt.content_block?.name === 'Agent')) {
+          const identity = agentToolIdentity(evt.content_block);
           agentActions.upsertAgent({
             id: evt.content_block.id || `task_${Date.now()}`,
             parentId: agentId,
-            description: '',
+            description: identity.description,
             phase: 'spawning',
             startTime: Date.now(),
             isMain: false,
-          });
-        }
-        // Agent Team tools (TaskCreate, SendMessage): register as visible agents
-        // so the agent panel shows team activity. These run in separate CLI processes
-        // so we won't get real-time progress, but visibility is the goal.
-        if (evt.type === 'content_block_start'
-            && evt.content_block?.type === 'tool_use'
-            && (evt.content_block?.name === 'TaskCreate' || evt.content_block?.name === 'SendMessage')) {
-          agentActions.upsertAgent({
-            id: evt.content_block.id || `team_${Date.now()}`,
-            parentId: agentId,
-            description: '',
-            phase: 'tool',
-            startTime: Date.now(),
-            isMain: false,
+            kind: identity.kind,
+            name: identity.name,
+            model: identity.model,
           });
         }
         // Early detection: create plan_review card ONLY in explicit Plan mode.
@@ -1911,6 +2360,19 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       case 'system':
         if (msg.subtype === 'init') {
           markStdinReady(tabId, msg.__stdinId, msg.model);
+          recordRuntimeCommandInventory(
+            msg,
+            useChatStore.getState().getTab(tabId)?.sessionMeta.cwdSnapshot,
+          );
+          useMcpStore.getState().recordRuntimeServers(
+            Array.isArray(msg.mcp_servers) ? msg.mcp_servers : [],
+            Array.isArray(msg.tools) ? msg.tools : [],
+          );
+        } else if (msg.subtype === 'commands_changed') {
+          recordRuntimeCommandInventory(
+            msg,
+            useChatStore.getState().getTab(tabId)?.sessionMeta.cwdSnapshot,
+          );
         } else if (msg.subtype === 'error') {
           // FI-3: Surface system-level errors instead of silently dropping them
           const rawError = msg.message || msg.error || 'System error';
@@ -1923,6 +2385,27 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           });
         } else if (msg.subtype === 'api_retry') {
           recordApiRetry(tabId, msg);
+        } else if (msg.subtype === 'task_started') {
+          const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
+          if (toolUseId && useAgentStore.getState().agents.has(toolUseId)) {
+            agentActions.upsertAgent({
+              id: toolUseId,
+              taskId: typeof msg.task_id === 'string' ? msg.task_id : undefined,
+              phase: 'thinking',
+            });
+          }
+        } else if (msg.subtype === 'task_progress') {
+          const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
+          if (toolUseId) agentActions.updatePhase(toolUseId, 'thinking');
+        } else if (msg.subtype === 'task_notification') {
+          const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
+          if (toolUseId) {
+            if (String(msg.status || '').toLowerCase() === 'failed') {
+              agentActions.completeAgent(toolUseId, 'error');
+            } else {
+              agentActions.setAgentIdle(toolUseId);
+            }
+          }
         } else if (
           msg.subtype === 'hook_started' ||
           msg.subtype === 'hook_progress' ||
@@ -2035,28 +2518,37 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             }
             setActivityStatus({ phase: 'tool', toolName: block.name });
             if (block.name === 'Task' || block.name === 'Agent') {
+              const identity = agentToolIdentity(block);
               agentActions.upsertAgent({
                 id: block.id || generateMessageId(),
                 parentId: agentId,
-                description: block.input?.description || block.input?.prompt || '',
+                description: identity.description,
                 phase: 'spawning',
                 startTime: Date.now(),
                 isMain: false,
-              });
-            } else if (block.name === 'TaskCreate' || block.name === 'SendMessage') {
-              // Agent Team tasks/messages: register as visible agents in the tree.
-              // These run in separate CLI processes so we won't get progress events,
-              // but showing them makes the team activity visible in the agent panel.
-              agentActions.upsertAgent({
-                id: block.id || `team_${Date.now()}`,
-                parentId: agentId,
-                description: block.input?.subject || block.input?.description || block.input?.recipient || '',
-                phase: 'tool',
-                startTime: Date.now(),
-                isMain: false,
+                kind: identity.kind,
+                name: identity.name,
+                model: identity.model,
               });
             } else {
               agentActions.updatePhase(agentId, 'tool', block.name);
+              if (block.name === 'TaskCreate' && block.id) {
+                agentActions.registerTeamTask(block.id, block.input || {});
+              } else if (block.name === 'TaskUpdate') {
+                agentActions.updateTeamTask(block.input || {});
+              }
+            }
+
+            if (
+              agentDepth === 0
+              && !msg.parent_tool_use_id
+              && (block.name === 'TaskCreate' || block.name === 'TaskUpdate')
+            ) {
+              try {
+                syncNativeTaskPlan(tabId, useAgentStore.getState().teamTasks.values());
+              } catch (error) {
+                console.warn('[BLACKBOX Plan] Ignored invalid native Task state:', error);
+              }
             }
 
             if (block.name === 'AskUserQuestion') {
@@ -2101,6 +2593,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               // Mark as awaiting user input (consistent with ExitPlanMode)
               setActivityStatus({ phase: 'awaiting' });
             } else if (block.name === 'TodoWrite' && block.input?.todos) {
+              if (agentDepth === 0 && !msg.parent_tool_use_id) {
+                try {
+                  usePlanStore.getState().setPlan(tabId, block.input.todos, undefined, 'todo');
+                } catch (error) {
+                  console.warn('[BLACKBOX Plan] Ignored invalid TodoWrite plan:', error);
+                }
+              }
               addMessage({
                 id: block.id || generateMessageId(),
                 role: 'assistant',
@@ -2248,9 +2747,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 undefined,
               );
               if (targetId) {
+                const parentMsg = useChatStore.getState().getTab(tabId)?.messages.find((m) => m.id === targetId);
+                if (parentMsg?.toolName === 'TaskCreate') {
+                  agentActions.resolveTeamTask(block.tool_use_id, resultText);
+                }
+                recordNativeLoopReceipt(tabId, parentMsg, resultText);
+                const safeResult = sanitizeToolResultForDisplay(parentMsg?.toolName, resultText);
                 useChatStore.getState().updateMessage(tabId, targetId, {
                   toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
+                  ...(safeResult ? { toolResultContent: safeResult } : {}),
                 });
               }
             }
@@ -2272,9 +2777,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 undefined,
               );
               if (targetId) {
+                const parentMsg = useChatStore.getState().getTab(tabId)?.messages.find((m) => m.id === targetId);
+                if (parentMsg?.toolName === 'TaskCreate') {
+                  agentActions.resolveTeamTask(block.tool_use_id, resultText);
+                }
+                recordNativeLoopReceipt(tabId, parentMsg, resultText);
+                const safeResult = sanitizeToolResultForDisplay(parentMsg?.toolName, resultText);
                 useChatStore.getState().updateMessage(tabId, targetId, {
                   toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
+                  ...(safeResult ? { toolResultContent: safeResult } : {}),
                 });
               }
             }
@@ -2303,9 +2814,14 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const currentMessages = useChatStore.getState().getTab(tabId)?.messages ?? [];
           const parentMsg = currentMessages.find((m) => m.id === targetId);
           if (parentMsg) {
+            if (parentMsg.toolName === 'TaskCreate') {
+              agentActions.resolveTeamTask(toolUseId, resultContent);
+            }
+            recordNativeLoopReceipt(tabId, parentMsg, resultContent, msg.tool_name);
+            const safeResult = sanitizeToolResultForDisplay(parentMsg.toolName ?? msg.tool_name, resultContent);
             const updates: Partial<ChatMessage> = {
               toolCompleted: true,
-              ...(resultContent ? { toolResultContent: resultContent } : {}),
+              ...(safeResult ? { toolResultContent: safeResult } : {}),
             };
 
             // Backfill: if parent is AskUserQuestion created with empty questions
@@ -2371,10 +2887,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // session. Without this guard, the first parallel sub-agent to complete would
         // call setSessionStatus('completed') and freeze the UI mid-run.
         if (msg.parent_tool_use_id) {
-          agentActions.completeAgent(
-            resolveAgentId(msg.parent_tool_use_id, agentActions.agents),
-            msg.subtype === 'success' ? 'completed' : 'error',
-          );
+          const completedAgentId = resolveAgentId(msg.parent_tool_use_id, agentActions.agents);
+          if (msg.subtype === 'success') agentActions.setAgentIdle(completedAgentId);
+          else agentActions.completeAgent(completedAgentId, 'error');
           break;
         }
 
@@ -2407,10 +2922,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // Clear any remaining partial text before marking turn complete
         clearPartial();
 
-        // --- TK-303: Auto-retry on thinking signature error after provider/model switch ---
-        // When user switches API provider or model mid-conversation, we attempt to resume
-        // the session. If the new provider/model rejects the old thinking block signatures,
-        // we automatically retry without resume to preserve UX continuity.
+        // A provider/model switch can reject old cryptographic thinking
+        // signatures. Never "recover" by clearing the durable resume UUID and
+        // silently opening a fresh thread: that makes the UI look successful
+        // while discarding the exact context the user meant to continue.
+        // Fail closed, preserve the thread identity, and return the unsent text
+        // to the composer so the user can switch back and retry deliberately.
         if (msg.subtype !== 'success') {
           const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
           // Build a combined error string from all possible error fields
@@ -2426,19 +2943,18 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const retryCandidate = pendingText || (typeof lastUserMsg === 'string' ? lastUserMsg : undefined);
           if (isThinkingSignatureError && retryCandidate) {
             const switchType = switchedFlag ? (meta.modelSwitched ? '模型' : 'API 配置') : '会话';
-            console.warn(`[BLACKBOX] Thinking signature error after ${switchType} switch — auto-retrying without resume`);
+            console.warn(`[BLACKBOX] Thinking signature error after ${switchType} switch — preserving the original resume target`);
             const retryText = retryCandidate;
 
-            // Kill the current (failed) process + clean up listeners via lifecycle module
+            // Stop only the failed process route. `sessionId` and the
+            // sessionStore `cliResumeId` deliberately remain untouched.
             const failedStdinId = meta.stdinId;
             if (failedStdinId) {
               bridge.killSession(failedStdinId).catch(() => {});
               cleanupStdinRoute(failedStdinId);
             }
 
-            // Clear sessionId (abandon resume) and switch flags
             setSessionMeta({
-              sessionId: undefined,
               stdinId: undefined,
               stdinReady: false,
               pendingReadyMessage: undefined,
@@ -2447,106 +2963,25 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               modelSwitched: false,
               modelSwitchPendingText: undefined,
             });
-            // Also clear cliResumeId in sessionStore
-            // NEW-F fix: use owning tabId from stdinToTab mapping, NOT selectedSessionId
-            const retryTabId = tabId;
-            useSessionStore.getState().setCliResumeId(retryTabId, null);
-
-            // Show system notice
+            const currentDraft = useChatStore.getState().getTab(tabId)?.inputDraft.trim() || '';
+            useChatStore.getState().setInputDraft(
+              tabId,
+              currentDraft ? `${currentDraft}\n\n${retryText}` : retryText,
+            );
+            if (useSessionStore.getState().selectedSessionId === tabId) {
+              setInputSync(currentDraft ? `${currentDraft}\n\n${retryText}` : retryText);
+            }
+            setSessionStatus('error');
+            setActivityStatus({ phase: 'error' });
             addMessage({
               id: generateMessageId(),
               role: 'system',
               type: 'text',
-              content: `已切换${switchType}，正在重新发送…`,
-              commandType: 'info',
+              content: t('error.resumeSignatureMismatch').replace('{switch}', switchType),
+              commandType: 'error',
               timestamp: Date.now(),
             });
-
-            // Re-send: spawn a fresh process without resume_session_id
-            // Use lifecycle module — ensures proper stdinTab registration,
-            // listener setup, rollback on failure, and ownership tracking.
-            (async () => {
-              const retryId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-              try {
-                const cwd = useSettingsStore.getState().workingDirectory;
-                if (!cwd) return;
-                const selectedModel = useSettingsStore.getState().selectedModel;
-                const sessionMode = useSettingsStore.getState().sessionMode;
-                const model = resolveModelForProvider(selectedModel);
-                const providerId = useProviderStore.getState().activeProviderId || '';
-                const permissionMode = mapSessionModeToPermissionMode(sessionMode);
-
-                setSessionStatus('running');
-                setSessionMeta({
-                  turnStartTime: undefined,
-                  lastProgressAt: undefined,
-                  apiRetry: undefined,
-                  inputTokens: 0,
-                  outputTokens: 0,
-                  stdinReady: false,
-                  pendingReadyMessage: undefined,
-                });
-                setActivityStatus({ phase: 'idle' });
-                agentActions.clearAgents();
-                agentActions.upsertAgent({
-                  id: 'main', parentId: null,
-                  description: retryText.slice(0, 100),
-                  phase: 'spawning', startTime: Date.now(), isMain: true,
-                });
-
-                // Phase 2 §2.1: capture spawn-time values BEFORE async spawn
-                // to avoid race with user config changes during the spawn window.
-                const preEnvFingerprint = envFingerprint();
-                const preSpawnConfigHash = spawnConfigHash();
-
-                // NEW-F fix: use owning tabId (retryTabId), not selectedSessionId
-                const spawnResult = await spawnSession({
-                  tabId: retryTabId,
-                  stdinId: retryId,
-                  cwdSnapshot: cwd,
-                  configSnapshot: {
-                    model,
-                    providerId,
-                    thinkingLevel: useSettingsStore.getState().thinkingLevel,
-                    permissionMode,
-                  },
-                  sessionModeSnapshot: sessionMode,
-                  sessionParams: {
-                    prompt: retryText,
-                    cwd,
-                    model,
-                    session_id: retryId,
-                    // No resume_session_id — fresh start to avoid thinking signature issue
-                    thinking_level: useSettingsStore.getState().thinkingLevel,
-                    session_mode: (sessionMode === 'ask' || sessionMode === 'plan') ? sessionMode : undefined,
-                    provider_id: providerId || undefined,
-                    permission_mode: permissionMode,
-                  },
-                  onStream: handleStreamMessage,
-                  onStderr: (line: string) => handleStderrLineRef.current(line, retryId),
-                });
-
-                setSessionMeta({
-                  sessionId: spawnResult.sessionInfo.cli_session_id ?? undefined,
-                  envFingerprint: preEnvFingerprint,
-                  spawnedModel: model,
-                  spawnConfigHash: preSpawnConfigHash,
-                  stdinReady: false,
-                  pendingReadyMessage: undefined,
-                });
-              } catch (retryErr) {
-                console.error('[BLACKBOX] Provider-switch auto-retry failed:', retryErr);
-                // spawnSession handles its own rollback — no manual listener cleanup needed
-                setSessionStatus('error');
-                addMessage({
-                  id: generateMessageId(),
-                  role: 'system', type: 'text',
-                  content: `重试失败: ${retryErr}`,
-                  timestamp: Date.now(),
-                });
-              }
-            })();
-            break; // Exit the result case — retry flow takes over
+            break;
           }
         }
 
@@ -2596,9 +3031,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // Extract result text for display (e.g., slash command output)
         let resultDisplayText = '';
         if (typeof msg.result === 'string' && msg.result) {
-          resultDisplayText = msg.result;
+          resultDisplayText = sanitizeAssistantTextForDisplay(msg.result);
         } else if (typeof msg.content === 'string' && msg.content) {
-          resultDisplayText = msg.content;
+          resultDisplayText = sanitizeAssistantTextForDisplay(msg.content);
         }
 
         // If we have cost metadata AND a pending slash command (e.g., /compact, /cost),
@@ -2705,7 +3140,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           });
         }
         agentActions.completeAll(
-          msg.subtype === 'success' ? 'completed' : 'error'
+          msg.subtype === 'success' ? 'completed' : 'error',
+          msg.subtype === 'success' && useSettingsStore.getState().agentTeamsEnabled,
         );
         useSessionStore.getState().fetchSessions();
         setTimeout(() => useSessionStore.getState().fetchSessions(), 1000);
@@ -2729,7 +3165,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 if (assistantTextMsgs.length >= 3) {
                   const userMsg = userTextMsgs.map((m) => m.content).join('\n').slice(0, 500);
                   const assistantMsg = assistantTextMsgs.map((m) => m.content).join('\n').slice(0, 500);
-                  bridge.generateSessionTitle(userMsg, assistantMsg, useProviderStore.getState().activeProviderId || undefined)
+                  generateSessionTitleWithPersistedProvider(userMsg, assistantMsg)
                     .then((title) => {
                       if (title) {
                         useSessionStore.getState().setCustomPreview(sessionId, title);
@@ -2754,139 +3190,84 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (resultInputTokens > fgCompactThreshold && !hasAutoCompactFired(tabId) && compactStdinId && msg.subtype === 'success') {
           markAutoCompactFired(tabId);
           console.log('[BLACKBOX] Auto-compact triggered: inputTokens =', resultInputTokens);
-          const compactMsgId = generateMessageId();
-          addMessage({
-            id: compactMsgId,
-            role: 'system',
-            type: 'text',
-            content: t('chat.autoCompacting'),
-            commandType: 'processing',
-            commandData: { command: '/compact' },
-            commandStartTime: Date.now(),
-            commandCompleted: false,
-            timestamp: Date.now(),
-          });
+          const compactTab = useChatStore.getState().getTab(tabId);
+          const queuedCompact = compactTab?.pendingUserMessages.find(
+            (item) => item.kind === 'command' && item.text.trim().toLowerCase() === '/compact',
+          );
+          const compactMsgId = queuedCompact?.commandMessageId || generateMessageId();
+          if (queuedCompact?.commandMessageId) {
+            useChatStore.getState().removePendingCommand(tabId, queuedCompact.commandMessageId);
+            const existing = useChatStore.getState().getTab(tabId)?.messages.find(
+              (message) => message.id === compactMsgId,
+            );
+            useChatStore.getState().updateMessage(tabId, compactMsgId, {
+              content: t('chat.autoCompacting'),
+              commandStartTime: Date.now(),
+              commandCompleted: false,
+              commandData: { ...existing?.commandData, queued: false, automatic: true },
+            });
+          } else {
+            addMessage({
+              id: compactMsgId,
+              role: 'system',
+              type: 'text',
+              content: t('chat.autoCompacting'),
+              commandType: 'processing',
+              commandData: { command: '/compact', automatic: true },
+              commandStartTime: Date.now(),
+              commandCompleted: false,
+              timestamp: Date.now(),
+            });
+          }
           // FI-4: Register pendingCommandMsgId so result handler can mark it completed
           setSessionMeta({ pendingCommandMsgId: compactMsgId });
           setSessionStatus('running');
           setActivityStatus({ phase: 'thinking' });
           bridge.sendStdin(compactStdinId, '/compact').catch((err) => {
             console.error('[BLACKBOX] Auto-compact failed:', err);
+            completePendingCommand(tabId, { output: 'Compact failed to start' });
+            if (useChatStore.getState().getTab(tabId)?.sessionStatus === 'running') {
+              useChatStore.getState().setSessionStatus(tabId, 'error');
+            }
           });
-          // FI-4: Timeout fallback — if compact doesn't complete within 90s, auto-complete
+          // A large compact may legitimately take longer than 15 seconds. Keep
+          // the session busy and its stdin owned until a real assistant/result
+          // or process_exit settles it; otherwise a concurrent send/reload can
+          // race the CLI while it is rewriting context.
           setTimeout(() => {
             const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
             if (meta.pendingCommandMsgId === compactMsgId) {
-              useChatStore.getState().updateMessage(tabId, compactMsgId, {
-                commandCompleted: true,
-                commandData: {
-                  ...(useChatStore.getState().getTab(tabId)?.messages ?? []).find((m) => m.id === compactMsgId)?.commandData,
-                  output: 'Compact timed out',
-                  completedAt: Date.now(),
-                },
-              });
-              useChatStore.getState().setSessionMeta(tabId, { pendingCommandMsgId: undefined });
-              if (useChatStore.getState().getTab(tabId)?.sessionStatus === 'running') {
-                useChatStore.getState().setSessionStatus(tabId, 'idle');
-              }
+              markPendingCommandSlow(tabId, compactMsgId, t('chat.compactStillRunning'));
             }
-          }, 15_000); // Bug C fix (#27): reduced from 90s to 15s
+          }, 15_000);
           break; // Skip pending message flush — compact takes priority
         }
 
-        // BATCH drain: combine ALL pending messages into a single user turn
-        // and send at once. The user's mental model is "I'm adding more
-        // context to the current task" — sending them one-by-one would
-        // make the AI handle each separately, which is rarely what the
-        // user wants. Combine them so the AI processes everything in one go.
-        // Decision 5: stopping state blocks drain pending.
-        // Use fgWasStopping (captured at result case entry) because setSessionStatus
-        // on line ~1751 already changed the status to completed/error.
         {
           const drainTab = useChatStore.getState().getTab(tabId);
-          const allPending = drainTab?.pendingUserMessages ?? [];
-          const flushStdinId = drainTab?.sessionMeta.stdinId;
-          if (allPending.length > 0 && flushStdinId && !fgWasStopping) {
-            // Phase 2 §6: verify queued config hashes still match current before sending.
-            const currentHash = spawnConfigHash();
-            const hashMismatch = allPending.some(
-              (p) => p.enqueueConfigHash !== undefined && p.enqueueConfigHash !== currentHash,
-            );
-            // Also detect stdinId drift: if the process was restarted since
-            // enqueue, the stdinId will differ and the queued text should not
-            // be sent to the new process.
-            const stdinMismatch = allPending.some(
-              (p) => p.enqueueStdinId !== undefined && p.enqueueStdinId !== flushStdinId,
-            );
-            if (hashMismatch || stdinMismatch) {
-              const draftBeforeRestore = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
-              const attachmentsBeforeRestore = useChatStore.getState().getTab(tabId)?.pendingAttachments ?? [];
-              const prefixBeforeRestore = useCommandStore.getState().activePrefix;
-              useChatStore.getState().restorePendingQueueToDraft(tabId);
-              const restoredDraft = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
-              if (useSessionStore.getState().selectedSessionId === tabId) {
-                setInputSync(restoredDraft);
-                if (
-                  draftBeforeRestore.trim().length === 0
-                  && attachmentsBeforeRestore.length === 0
-                  && !prefixBeforeRestore
-                  && restoredDraft.trim().length > 0
-                ) {
-                  requestAnimationFrame(() => handleSubmitRef.current());
-                }
-              }
-              console.warn('[TC] Config changed mid-queue — pending messages retried under current config');
-            } else {
-              const nextMsg = allPending.map((p) => p.text).join('\n\n');
-              useChatStore.getState().clearPendingMessages(tabId);
-              const pendingTurnMessageId = generateMessageId();
-
-              // Add as a single user message — InputBar deliberately did NOT
-              // addMessage when enqueueing, because ChatPanel renders pending
-              // messages after the streaming bubble. Now they merge into one turn.
-              addMessage({
-                id: pendingTurnMessageId,
-                role: 'user',
-                type: 'text',
-                content: nextMsg,
-                timestamp: Date.now(),
-              });
-              const nextTurnStartedAt = Date.now();
-              setSessionStatus('running');
-              setSessionMeta({
-                turnStartTime: nextTurnStartedAt,
-                lastProgressAt: nextTurnStartedAt,
-                inputTokens: 0,
-                outputTokens: 0,
-                teardownReason: undefined,
-                pendingTurnMessageId,
-                pendingTurnInput: nextMsg,
-                pendingTurnAttachments: undefined,
-              });
-              setActivityStatus({ phase: 'thinking' });
-              agentActions.clearAgents();
-              agentActions.upsertAgent({
-                id: 'main',
-                parentId: null,
-                description: nextMsg.slice(0, 100),
-                phase: 'spawning',
-                startTime: Date.now(),
-                isMain: true,
-              });
-              bridge.sendStdin(flushStdinId, nextMsg).catch((err) => {
-                console.error('[TC] Failed to send pending messages:', err);
-                const draft = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
-                useChatStore.getState().setInputDraft(tabId, draft ? `${draft}\n\n${nextMsg}` : nextMsg);
-                cleanupStdinRoute(flushStdinId);
-                useChatStore.getState().setSessionMeta(tabId, {
-                  stdinId: undefined,
-                  stdinReady: false,
-                  pendingReadyMessage: undefined,
-                });
-                setSessionStatus('error');
-              });
-            }
-          }
+          const draftBeforeRestore = drainTab?.inputDraft ?? '';
+          const attachmentsBeforeRestore = drainTab?.pendingAttachments ?? [];
+          const prefixBeforeRestore = useCommandStore.getState().activePrefix;
+          drainPendingQueueAfterSettlement({
+            tabId,
+            stdinId: drainTab?.sessionMeta.stdinId,
+            wasStopping: fgWasStopping,
+            onDraftRestored: useSessionStore.getState().selectedSessionId === tabId
+              ? setInputSync
+              : undefined,
+            retryRestoredDraft: (
+              useSessionStore.getState().selectedSessionId === tabId
+              && draftBeforeRestore.trim().length === 0
+              && attachmentsBeforeRestore.length === 0
+              && !prefixBeforeRestore
+            )
+              ? () => requestAnimationFrame(() => handleSubmitRef.current())
+              : undefined,
+            onUserBatchSent: (text) => agentActions.resetForTurn(
+              text.slice(0, 100),
+              useSettingsStore.getState().agentTeamsEnabled,
+            ),
+          });
         }
 
         break;

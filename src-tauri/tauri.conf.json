@@ -1,15 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Black Box",
-  "version": "0.11.0",
+  "version": "0.14.14",
   "identifier": "com.blackbox.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Black Box",
@@ -35,13 +36,15 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "resources": {
       "resources/en.lproj": "en.lproj",
-      "resources/zh-Hans.lproj": "zh-Hans.lproj"
+      "resources/zh-Hans.lproj": "zh-Hans.lproj",
+      "resources/blackbox-schedule": "blackbox-schedule"
     },
     "macOS": {
       "entitlements": "entitlements.plist",
+      "signingIdentity": "-",
       "minimumSystemVersion": "10.13"
     },
     "windows": {
@@ -50,12 +53,5 @@
       }
     }
   },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBRENERjc5RTkyQTUzNTEKUldSUlV5cnBlZC9jK2hJR2t0L1RSb0gwS0V0QlQ4NkFsU1ZUeTIrc3d3Zk9oUWtVdlpIR2d5RmkK",
-      "endpoints": [
-        "https://github.com/chenchouchou888/blackbox/releases/latest/download/latest.json"
-      ]
-    }
-  }
+  "plugins": {}
 }

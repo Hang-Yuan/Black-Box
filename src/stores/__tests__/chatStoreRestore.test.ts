@@ -327,6 +327,35 @@ describe('chatStore · B11 — stale-running demotion on restoreFromCache', () =
     );
   });
 
+  it('same-value composer writes preserve store identity and emit no notification', () => {
+    const store = useChatStore.getState();
+    store.ensureTab('composer-stable');
+    const attachment = {
+      id: 'file-stable',
+      name: 'stable.png',
+      path: '/tmp/stable.png',
+      size: 1,
+      type: 'image/png',
+      isImage: true,
+    };
+    store.setInputDraft('composer-stable', 'same draft');
+    store.setPendingAttachments('composer-stable', [attachment]);
+
+    const before = useChatStore.getState();
+    let notifications = 0;
+    const unsubscribe = useChatStore.subscribe(() => { notifications += 1; });
+
+    useChatStore.getState().setInputDraft('composer-stable', 'same draft');
+    useChatStore.getState().setPendingAttachments('composer-stable', [{ ...attachment }]);
+
+    unsubscribe();
+    const after = useChatStore.getState();
+    expect(notifications).toBe(0);
+    expect(after).toBe(before);
+    expect(after.tabs).toBe(before.tabs);
+    expect(after.sessionCache).toBe(before.sessionCache);
+  });
+
   it('cached "idle" is never upgraded or touched', () => {
     const store = useChatStore.getState();
     store.ensureTab('done');

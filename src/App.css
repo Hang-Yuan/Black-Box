@@ -2,43 +2,47 @@
 @plugin "@tailwindcss/typography";
 
 /* ================================================================
-   Light mode — Linear/Vercel-style neutral, single blue accent
+   Appearance system
+
+   Mode (light/dark/system), surface, and accent are independent.
+   Graphite + neutral accent are the safe defaults; the other surfaces alter
+   only canvas hierarchy, while accents alter actions, focus, and user bubbles.
    ================================================================ */
 @theme {
-  --color-bg-primary: #FAFAFB;
-  --color-bg-secondary: #F2F3F5;
-  --color-bg-tertiary: #E7E9EC;
-  --color-bg-chat: #FFFFFF;
-  --color-bg-sidebar: #F5F6F8;
+  --color-bg-primary: #F4F5F7;
+  --color-bg-secondary: #ECEEF1;
+  --color-bg-tertiary: #E1E4E8;
+  --color-bg-chat: #FAFBFC;
+  --color-bg-sidebar: #EFF1F4;
   --color-bg-input: #FFFFFF;
-  --color-bg-user-msg: #3B6FE0;
-  --color-bg-assistant-msg: #F5F6F8;
-  --color-bg-tool: #F0F1F3;
-  --color-bg-thinking: #F2F3F5;
+  --color-bg-user-msg: #303238;
+  --color-bg-assistant-msg: #F1F2F4;
+  --color-bg-tool: #EDEFF2;
+  --color-bg-thinking: #ECEEF1;
   --color-bg-card: #FFFFFF;
-  --color-bg-nav-active: rgba(59, 111, 224, 0.06);
+  --color-bg-nav-active: rgba(30, 32, 36, 0.055);
 
-  --color-text-primary: #1A1C20;
-  --color-text-secondary: #52565E;
-  --color-text-tertiary: #85888F;
+  --color-text-primary: #17191D;
+  --color-text-secondary: #4C5058;
+  --color-text-tertiary: #858A94;
   --color-text-inverse: #FFFFFF;
-  --color-text-muted: #6E7178;
+  --color-text-muted: #686D76;
 
-  --color-border: #E4E5E9;
-  --color-border-subtle: #ECEDF0;
-  --color-border-focus: #3B6FE0;
+  --color-border: #DDE0E5;
+  --color-border-subtle: #E7E9ED;
+  --color-border-focus: #303238;
 
-  --color-accent: #3B6FE0;
-  --color-accent-light: #5C8AF0;
-  --color-accent-hover: #2E5AC4;
-  --color-accent-glow: rgba(59, 111, 224, 0.10);
+  --color-accent: #303238;
+  --color-accent-light: #555861;
+  --color-accent-hover: #191B1F;
+  --color-accent-glow: rgba(28, 30, 34, 0.10);
   --color-success: #10b981;
   --color-error: #ef4444;
   --color-warning: #f59e0b;
 
-  --color-gradient-start: #3B6FE0;
-  --color-gradient-mid: #4C7DEB;
-  --color-gradient-end: #5C8AF0;
+  --color-gradient-start: #303238;
+  --color-gradient-mid: #464951;
+  --color-gradient-end: #5C606A;
 
   /* Syntax highlighting — decoupled from semantic colors */
   --color-syntax-keyword:  #7C3AED;
@@ -57,7 +61,7 @@
     0 2px 4px rgba(0, 0, 0, 0.03);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08),
     0 4px 8px rgba(0, 0, 0, 0.04);
-  --shadow-glow: 0 0 20px rgba(59, 111, 224, 0.10);
+  --shadow-glow: 0 0 20px rgba(30, 32, 36, 0.08);
 
   /* Icon slash color — contrasts against accent-colored icon backgrounds */
   --color-icon-slash: white;
@@ -65,41 +69,39 @@
 
 @variant dark (&:where(.dark, .dark *));
 
-/* ================================================================
-   Dark mode (default) — Linear-style layered dark grey, single blue accent
-   ================================================================ */
+/* Graphite surface — dark mode */
 .dark {
-  --color-bg-primary: #0B0C0E;
-  --color-bg-secondary: #131417;
-  --color-bg-tertiary: #1C1D21;
-  --color-bg-chat: #0B0C0E;
-  --color-bg-sidebar: #101114;
-  --color-bg-input: #16171B;
-  --color-bg-user-msg: #2B5CD9;
-  --color-bg-assistant-msg: #141519;
-  --color-bg-tool: #17181C;
-  --color-bg-thinking: #141519;
-  --color-bg-card: #17181C;
-  --color-bg-nav-active: rgba(59, 111, 224, 0.08);
+  --color-bg-primary: #090A0C;
+  --color-bg-secondary: #121419;
+  --color-bg-tertiary: #1B1E24;
+  --color-bg-chat: #0C0D10;
+  --color-bg-sidebar: #101217;
+  --color-bg-input: #17191F;
+  --color-bg-user-msg: #D6D8DC;
+  --color-bg-assistant-msg: #14161B;
+  --color-bg-tool: #17191F;
+  --color-bg-thinking: #14161B;
+  --color-bg-card: #17191F;
+  --color-bg-nav-active: rgba(255, 255, 255, 0.055);
 
-  --color-text-primary: #EDEEF0;
-  --color-text-secondary: #A0A3AA;
-  --color-text-tertiary: #6E7178;
-  --color-text-inverse: #FFFFFF;
-  --color-text-muted: #85888F;
+  --color-text-primary: #EDEEF1;
+  --color-text-secondary: #A5A9B2;
+  --color-text-tertiary: #6F747F;
+  --color-text-inverse: #101216;
+  --color-text-muted: #888D97;
 
-  --color-border: #23252B;
-  --color-border-subtle: #1B1C21;
-  --color-border-focus: #3B6FE0;
+  --color-border: #282B33;
+  --color-border-subtle: #202229;
+  --color-border-focus: #D6D8DC;
 
-  --color-accent: #3B6FE0;
-  --color-accent-light: #5C8AF0;
-  --color-accent-hover: #4C7DEB;
-  --color-accent-glow: rgba(59, 111, 224, 0.16);
+  --color-accent: #D6D8DC;
+  --color-accent-light: #ECEDEF;
+  --color-accent-hover: #FFFFFF;
+  --color-accent-glow: rgba(255, 255, 255, 0.10);
 
-  --color-gradient-start: #3B6FE0;
-  --color-gradient-mid: #4C7DEB;
-  --color-gradient-end: #5C8AF0;
+  --color-gradient-start: #BFC2C8;
+  --color-gradient-mid: #D6D8DC;
+  --color-gradient-end: #ECEDEF;
 
   /* Syntax highlighting — dark mode */
   --color-syntax-keyword:  #A78BFA;
@@ -115,24 +117,348 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 10px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 8px 20px rgba(0, 0, 0, 0.5);
-  --shadow-glow: 0 0 16px rgba(59, 111, 224, 0.18);
+  --shadow-glow: 0 0 16px rgba(255, 255, 255, 0.08);
 
   /* Icon slash color — contrasts against accent-colored icon backgrounds */
   --color-icon-slash: black;
 }
 
-/* ================================================================
-   Solid backgrounds
-   ================================================================ */
-
-/* Light mode */
-.gradient-bg {
-  background: #F5F6F8;
+/* Surface atmospheres are intentionally subtle: they create depth without
+   turning chat content into a decorative wallpaper. */
+:root,
+.surface-graphite {
+  color-scheme: light;
+  --surface-atmosphere:
+    radial-gradient(90% 70% at 15% 0%, rgba(119, 126, 140, 0.09), transparent 58%),
+    linear-gradient(135deg, #EFF1F4 0%, #F7F8F9 55%, #ECEEF2 100%);
+  --surface-main-overlay:
+    radial-gradient(70% 48% at 75% 0%, rgba(104, 110, 124, 0.045), transparent 66%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.38), transparent 32%);
 }
 
-/* Dark mode */
-.dark .gradient-bg {
-  background: #131417;
+.dark,
+.dark.surface-graphite {
+  color-scheme: dark;
+  --surface-atmosphere:
+    radial-gradient(95% 75% at 12% 0%, rgba(116, 123, 140, 0.12), transparent 58%),
+    linear-gradient(135deg, #0B0C0F 0%, #101217 55%, #08090B 100%);
+  --surface-main-overlay:
+    radial-gradient(75% 52% at 78% 0%, rgba(124, 130, 146, 0.055), transparent 68%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 35%);
+}
+
+/* Midnight — cool navy canvas */
+.surface-midnight {
+  --color-bg-primary: #EEF3FA;
+  --color-bg-secondary: #E4EBF5;
+  --color-bg-tertiary: #D7E1EF;
+  --color-bg-chat: #F8FAFE;
+  --color-bg-sidebar: #EAF0F8;
+  --color-bg-input: #FFFFFF;
+  --color-bg-assistant-msg: #EDF2F9;
+  --color-bg-tool: #E8EEF7;
+  --color-bg-thinking: #E9EFF7;
+  --color-bg-card: #FBFCFF;
+  --color-text-primary: #172033;
+  --color-text-secondary: #4A5870;
+  --color-text-tertiary: #7A879B;
+  --color-text-muted: #65738A;
+  --color-border: #D6DFEC;
+  --color-border-subtle: #E1E7F0;
+  --surface-atmosphere:
+    radial-gradient(85% 80% at 8% 0%, rgba(74, 112, 176, 0.18), transparent 60%),
+    linear-gradient(140deg, #E8EEF8 0%, #F5F8FD 52%, #E7EDF7 100%);
+  --surface-main-overlay:
+    radial-gradient(72% 52% at 78% 0%, rgba(69, 107, 174, 0.075), transparent 66%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.5), transparent 38%);
+}
+
+.dark.surface-midnight {
+  --color-bg-primary: #070C15;
+  --color-bg-secondary: #0D1522;
+  --color-bg-tertiary: #162235;
+  --color-bg-chat: #09101B;
+  --color-bg-sidebar: #0C1421;
+  --color-bg-input: #111C2C;
+  --color-bg-assistant-msg: #0F1928;
+  --color-bg-tool: #121D2D;
+  --color-bg-thinking: #0F1928;
+  --color-bg-card: #111C2B;
+  --color-text-primary: #EEF4FC;
+  --color-text-secondary: #A8B7CC;
+  --color-text-tertiary: #687A92;
+  --color-text-muted: #8595AA;
+  --color-border: #1D2C41;
+  --color-border-subtle: #152338;
+  --surface-atmosphere:
+    radial-gradient(90% 80% at 8% 0%, rgba(58, 104, 181, 0.23), transparent 58%),
+    linear-gradient(140deg, #070C15 0%, #0B1422 55%, #060A11 100%);
+  --surface-main-overlay:
+    radial-gradient(72% 52% at 80% 0%, rgba(76, 126, 209, 0.10), transparent 68%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(107, 153, 226, 0.055), transparent 38%);
+}
+
+/* Paper — warm, low-contrast reading surface */
+.surface-paper {
+  --color-bg-primary: #F3EEE4;
+  --color-bg-secondary: #EAE2D4;
+  --color-bg-tertiary: #DED3C2;
+  --color-bg-chat: #FCFAF5;
+  --color-bg-sidebar: #EEE7DB;
+  --color-bg-input: #FFFCF6;
+  --color-bg-assistant-msg: #F3EDE2;
+  --color-bg-tool: #EEE6D9;
+  --color-bg-thinking: #F0E8DC;
+  --color-bg-card: #FFFCF7;
+  --color-text-primary: #29231D;
+  --color-text-secondary: #5E5347;
+  --color-text-tertiary: #948677;
+  --color-text-muted: #796D60;
+  --color-border: #DED4C5;
+  --color-border-subtle: #E9E1D6;
+  --surface-atmosphere:
+    radial-gradient(80% 75% at 8% 0%, rgba(171, 132, 82, 0.14), transparent 62%),
+    linear-gradient(140deg, #EFE7DA 0%, #F8F4EC 50%, #EDE4D7 100%);
+  --surface-main-overlay:
+    radial-gradient(70% 50% at 78% 0%, rgba(168, 126, 72, 0.065), transparent 68%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.42), transparent 36%);
+}
+
+.dark.surface-paper {
+  --color-bg-primary: #15110E;
+  --color-bg-secondary: #1D1814;
+  --color-bg-tertiary: #2A231D;
+  --color-bg-chat: #17130F;
+  --color-bg-sidebar: #1B1612;
+  --color-bg-input: #241E19;
+  --color-bg-assistant-msg: #201A16;
+  --color-bg-tool: #251F1A;
+  --color-bg-thinking: #201A16;
+  --color-bg-card: #251F1A;
+  --color-text-primary: #F1EAE1;
+  --color-text-secondary: #BDAFA0;
+  --color-text-tertiary: #786B60;
+  --color-text-muted: #988B7E;
+  --color-border: #342B24;
+  --color-border-subtle: #2A231D;
+  --surface-atmosphere:
+    radial-gradient(86% 78% at 8% 0%, rgba(166, 112, 60, 0.16), transparent 62%),
+    linear-gradient(140deg, #140F0C 0%, #1A1511 52%, #100D0A 100%);
+  --surface-main-overlay:
+    radial-gradient(70% 50% at 78% 0%, rgba(188, 128, 67, 0.075), transparent 68%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(220, 174, 118, 0.035), transparent 38%);
+}
+
+/* Forest — muted green canvas */
+.surface-forest {
+  --color-bg-primary: #EEF4EF;
+  --color-bg-secondary: #E3ECE5;
+  --color-bg-tertiary: #D5E1D8;
+  --color-bg-chat: #F8FBF8;
+  --color-bg-sidebar: #E8F0E9;
+  --color-bg-input: #FCFEFC;
+  --color-bg-assistant-msg: #EDF3EE;
+  --color-bg-tool: #E7EFE9;
+  --color-bg-thinking: #E9F0EA;
+  --color-bg-card: #FAFCFA;
+  --color-text-primary: #17241C;
+  --color-text-secondary: #4B6153;
+  --color-text-tertiary: #7B8E81;
+  --color-text-muted: #65786C;
+  --color-border: #D4E0D6;
+  --color-border-subtle: #E0E9E2;
+  --surface-atmosphere:
+    radial-gradient(84% 76% at 8% 0%, rgba(70, 129, 89, 0.16), transparent 62%),
+    linear-gradient(140deg, #E7EFE9 0%, #F5F9F5 52%, #E5EEE7 100%);
+  --surface-main-overlay:
+    radial-gradient(72% 52% at 78% 0%, rgba(64, 128, 86, 0.07), transparent 68%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.46), transparent 38%);
+}
+
+.dark.surface-forest {
+  --color-bg-primary: #09110D;
+  --color-bg-secondary: #101A14;
+  --color-bg-tertiary: #19271E;
+  --color-bg-chat: #0B1510;
+  --color-bg-sidebar: #0E1913;
+  --color-bg-input: #15231A;
+  --color-bg-assistant-msg: #121E17;
+  --color-bg-tool: #15221A;
+  --color-bg-thinking: #121E17;
+  --color-bg-card: #15221A;
+  --color-text-primary: #ECF4EE;
+  --color-text-secondary: #A6B9AA;
+  --color-text-tertiary: #687D6D;
+  --color-text-muted: #839689;
+  --color-border: #213326;
+  --color-border-subtle: #192A1F;
+  --surface-atmosphere:
+    radial-gradient(88% 80% at 8% 0%, rgba(45, 119, 69, 0.20), transparent 62%),
+    linear-gradient(140deg, #08100C 0%, #0D1812 52%, #070D0A 100%);
+  --surface-main-overlay:
+    radial-gradient(72% 52% at 78% 0%, rgba(54, 137, 82, 0.085), transparent 68%);
+  --surface-sidebar-overlay:
+    linear-gradient(180deg, rgba(84, 158, 104, 0.045), transparent 38%);
+}
+
+/* Accent palettes */
+.accent-black {
+  --color-bg-user-msg: #303238;
+  --color-bg-nav-active: rgba(30, 32, 36, 0.055);
+  --color-border-focus: #303238;
+  --color-accent: #303238;
+  --color-accent-light: #555861;
+  --color-accent-hover: #191B1F;
+  --color-accent-glow: rgba(28, 30, 34, 0.10);
+  --color-gradient-start: #303238;
+  --color-gradient-mid: #464951;
+  --color-gradient-end: #5C606A;
+  --color-text-inverse: #FFFFFF;
+  --shadow-glow: 0 0 20px rgba(30, 32, 36, 0.08);
+  --color-icon-slash: white;
+}
+
+.dark.accent-black {
+  --color-bg-user-msg: #D6D8DC;
+  --color-bg-nav-active: rgba(255, 255, 255, 0.055);
+  --color-border-focus: #D6D8DC;
+  --color-accent: #D6D8DC;
+  --color-accent-light: #ECEDEF;
+  --color-accent-hover: #FFFFFF;
+  --color-accent-glow: rgba(255, 255, 255, 0.10);
+  --color-gradient-start: #BFC2C8;
+  --color-gradient-mid: #D6D8DC;
+  --color-gradient-end: #ECEDEF;
+  --color-text-inverse: #101216;
+  --color-icon-slash: black;
+}
+
+.accent-blue {
+  --color-bg-user-msg: #416FC5;
+  --color-bg-nav-active: rgba(65, 111, 197, 0.075);
+  --color-border-focus: #416FC5;
+  --color-accent: #416FC5;
+  --color-accent-light: #6489D1;
+  --color-accent-hover: #315AA6;
+  --color-accent-glow: rgba(65, 111, 197, 0.14);
+  --color-gradient-start: #416FC5;
+  --color-gradient-mid: #557FCB;
+  --color-gradient-end: #6A91D6;
+  --color-syntax-function: #0891B2;
+  --color-text-inverse: #FFFFFF;
+  --shadow-glow: 0 0 20px rgba(65, 111, 197, 0.12);
+  --color-icon-slash: var(--color-accent);
+}
+
+.dark.accent-blue {
+  --color-bg-user-msg: #78A3F3;
+  --color-bg-nav-active: rgba(120, 163, 243, 0.09);
+  --color-border-focus: #78A3F3;
+  --color-accent: #78A3F3;
+  --color-accent-light: #9AB9F5;
+  --color-accent-hover: #5C8DE8;
+  --color-accent-glow: rgba(120, 163, 243, 0.17);
+  --color-gradient-start: #5F8FEC;
+  --color-gradient-mid: #78A3F3;
+  --color-gradient-end: #9AB9F5;
+  --color-syntax-function: #22D3EE;
+  --color-text-inverse: #0C1420;
+}
+
+.accent-purple {
+  --color-bg-user-msg: #7B5AA6;
+  --color-bg-nav-active: rgba(123, 90, 166, 0.075);
+  --color-border-focus: #7B5AA6;
+  --color-accent: #7B5AA6;
+  --color-accent-light: #9676BC;
+  --color-accent-hover: #65478E;
+  --color-accent-glow: rgba(123, 90, 166, 0.14);
+  --color-gradient-start: #76539F;
+  --color-gradient-mid: #8967AE;
+  --color-gradient-end: #A080C2;
+  --color-syntax-keyword: #2563EB;
+  --color-text-inverse: #FFFFFF;
+  --shadow-glow: 0 0 20px rgba(123, 90, 166, 0.12);
+  --color-icon-slash: var(--color-accent);
+}
+
+.dark.accent-purple {
+  --color-bg-user-msg: #B493D5;
+  --color-bg-nav-active: rgba(180, 147, 213, 0.09);
+  --color-border-focus: #B493D5;
+  --color-accent: #B493D5;
+  --color-accent-light: #CFB2E8;
+  --color-accent-hover: #9E78C5;
+  --color-accent-glow: rgba(180, 147, 213, 0.17);
+  --color-gradient-start: #9872C2;
+  --color-gradient-mid: #B493D5;
+  --color-gradient-end: #CFB2E8;
+  --color-syntax-keyword: #60A5FA;
+  --color-text-inverse: #17101E;
+}
+
+.accent-green {
+  --color-bg-user-msg: #467E57;
+  --color-bg-nav-active: rgba(70, 126, 87, 0.075);
+  --color-border-focus: #467E57;
+  --color-accent: #467E57;
+  --color-accent-light: #639B72;
+  --color-accent-hover: #356844;
+  --color-accent-glow: rgba(70, 126, 87, 0.14);
+  --color-gradient-start: #467E57;
+  --color-gradient-mid: #568E66;
+  --color-gradient-end: #70A77E;
+  --color-syntax-string: #2563EB;
+  --color-text-inverse: #FFFFFF;
+  --shadow-glow: 0 0 20px rgba(70, 126, 87, 0.12);
+  --color-icon-slash: var(--color-accent);
+}
+
+.dark.accent-green {
+  --color-bg-user-msg: #80C985;
+  --color-bg-nav-active: rgba(128, 201, 133, 0.09);
+  --color-border-focus: #80C985;
+  --color-accent: #80C985;
+  --color-accent-light: #A3DEA7;
+  --color-accent-hover: #65B86C;
+  --color-accent-glow: rgba(128, 201, 133, 0.17);
+  --color-gradient-start: #65B86C;
+  --color-gradient-mid: #80C985;
+  --color-gradient-end: #A3DEA7;
+  --color-syntax-string: #7BA6FF;
+  --color-text-inverse: #0C1A10;
+}
+
+/* Layered app backgrounds */
+.gradient-bg {
+  background-color: var(--color-bg-primary);
+  background-image: var(--surface-atmosphere);
+  background-size: cover;
+}
+
+.app-main-surface {
+  background-color: var(--color-bg-chat);
+  background-image: var(--surface-main-overlay);
+  background-size: cover;
+}
+
+.app-sidebar-surface {
+  background-color: var(--color-bg-sidebar);
+  background-image: var(--surface-sidebar-overlay);
+  background-size: cover;
+}
+
+.gradient-bg,
+.app-main-surface,
+.app-sidebar-surface {
+  transition: background-color 180ms ease, border-color 180ms ease;
 }
 
 /* ================================================================
@@ -192,6 +518,15 @@ body {
   /* Disable text selection and context menu globally for native app feel */
   user-select: none;
   -webkit-user-select: none;
+}
+
+button:focus {
+  outline: none;
+}
+
+button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 72%, transparent);
+  outline-offset: 2px;
 }
 
 /* Allow text selection only in input areas and message content */

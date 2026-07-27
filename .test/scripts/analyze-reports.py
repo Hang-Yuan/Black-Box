@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Summarize TOKENICODE E2E reports.
+Summarize Black Box E2E reports.
 
 Supported inputs:
   - New run directories from .test/scripts/run-e2e.sh:
@@ -224,7 +224,7 @@ def analyze(base: str) -> int:
             stats["error_patterns"][categorize_error(error)] += 1
 
     print("=" * 72)
-    print("  TOKENICODE E2E Summary")
+    print("  Black Box E2E Summary")
     print("=" * 72)
     print()
 

@@ -10,8 +10,6 @@ interface AddProviderMenuProps {
   anchorRef: React.RefObject<HTMLElement | null>;
   providers: ApiProvider[];
   onAddFromPreset: (preset: PresetProvider) => void;
-  onAddCustom: () => void;
-  onImport: () => void;
 }
 
 export function AddProviderMenu({
@@ -20,8 +18,6 @@ export function AddProviderMenu({
   anchorRef,
   providers,
   onAddFromPreset,
-  onAddCustom,
-  onImport,
 }: AddProviderMenuProps) {
   const t = useT();
   const menuRef = useRef<HTMLDivElement>(null);
@@ -102,34 +98,6 @@ export function AddProviderMenu({
         </div>
       </div>
 
-      {/* Divider */}
-      <div className="border-t border-border-subtle" />
-
-      {/* Custom + Import */}
-      <div className="space-y-0.5">
-        <button
-          onClick={() => { onAddCustom(); onClose(); }}
-          className="w-full flex items-center gap-2 px-2.5 py-2 rounded-md text-[13px]
-            text-text-muted hover:bg-bg-secondary transition-smooth"
-        >
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-            <path d="M8 3v10M3 8h10" />
-          </svg>
-          {t('provider.customConfig')}
-        </button>
-        <button
-          onClick={() => { onImport(); onClose(); }}
-          className="w-full flex items-center gap-2 px-2.5 py-2 rounded-md text-[13px]
-            text-text-muted hover:bg-bg-secondary transition-smooth"
-        >
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-            <path d="M2 10v3a1 1 0 001 1h10a1 1 0 001-1v-3M8 2v8M5 7l3 3 3-3" />
-          </svg>
-          {t('provider.importFile')}
-        </button>
-      </div>
     </div>,
     document.body,
   );

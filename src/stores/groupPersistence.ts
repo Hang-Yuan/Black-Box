@@ -2,15 +2,17 @@ import { bridge } from '../lib/tauri-bridge';
 import { useGroupStore, type SessionGroup } from './groupStore';
 
 let saveSubscribed = false;
+let groupSaveQueue: Promise<void> = Promise.resolve();
 
 /**
- * Load groups from disk into the store, then keep the disk copy in sync on every
- * change. Mirrors the pinned/archived persistence pattern
- * (bridge → Tauri command → ~/.blackbox/groups.json). Call once on app startup.
+ * Hydrate the task-group projection from Black Box's unified session metadata
+ * authority, then keep that authority in sync on every change. Group order,
+ * member order, and in-group pins are written atomically together with the
+ * tombstones that protect user removals from stale legacy imports.
  */
 export async function initGroupPersistence(): Promise<void> {
   const data = await bridge.loadSessionGroups();
-  if (Array.isArray(data) && data.length > 0) {
+  if (Array.isArray(data)) {
     useGroupStore.setState({ groups: data as SessionGroup[] });
   }
 
@@ -19,7 +21,14 @@ export async function initGroupPersistence(): Promise<void> {
   if (!saveSubscribed) {
     saveSubscribed = true;
     useGroupStore.subscribe((state) => {
-      bridge.saveSessionGroups(state.groups);
+      const snapshot = state.groups;
+      // Tauri commands may execute concurrently. Serialize complete group
+      // snapshots so an older create/rename cannot land after a newer reorder.
+      groupSaveQueue = groupSaveQueue
+        .then(() => bridge.saveSessionGroups(snapshot))
+        .catch((error) => {
+          console.error('[BLACKBOX Metadata] Failed to persist session groups:', error);
+        });
     });
   }
 }

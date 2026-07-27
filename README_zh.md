@@ -52,4 +52,4 @@ Apache License 2.0 — 见 [LICENSE](LICENSE)。
 
 ## 致谢
 
-基于 [TOKENICODE](https://github.com/yiliqi78/TOKENICODE) 开发。
+Black Box 保留其 Apache-2.0 开源基础所要求的版权与许可证声明。

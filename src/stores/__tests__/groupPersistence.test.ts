@@ -28,6 +28,11 @@ describe('groupPersistence', () => {
   });
 
   it('tolerates an empty / missing groups file', async () => {
+    useGroupStore.setState({
+      groups: [
+        { id: 'stale', label: '旧缓存', workspace: '~/ws', sessionIds: ['s1'], pinnedInGroup: [] },
+      ],
+    });
     (bridge.loadSessionGroups as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     await initGroupPersistence();
     expect(useGroupStore.getState().groups).toEqual([]);
@@ -38,6 +43,6 @@ describe('groupPersistence', () => {
     await initGroupPersistence();
     (bridge.saveSessionGroups as ReturnType<typeof vi.fn>).mockClear();
     useGroupStore.getState().createGroup('~/ws', '新组');
-    expect(bridge.saveSessionGroups).toHaveBeenCalled();
+    await vi.waitFor(() => expect(bridge.saveSessionGroups).toHaveBeenCalled());
   });
 });

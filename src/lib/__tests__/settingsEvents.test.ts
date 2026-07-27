@@ -107,9 +107,9 @@ describe('settingsStore setters · emit on change', () => {
     const h = vi.fn();
     settingsEvents.on('model-changed', h);
     const initial = useSettingsStore.getState().selectedModel;
-    useSettingsStore.getState().setSelectedModel('claude-haiku-4-5-20251001');
+    useSettingsStore.getState().setSelectedModel('haiku');
     expect(h).toHaveBeenCalledTimes(1);
-    expect(h).toHaveBeenCalledWith({ old: initial, next: 'claude-haiku-4-5-20251001' });
+    expect(h).toHaveBeenCalledWith({ old: initial, next: 'haiku' });
     // Restore
     useSettingsStore.getState().setSelectedModel(initial);
   });
@@ -120,6 +120,16 @@ describe('settingsStore setters · emit on change', () => {
     settingsEvents.on('model-changed', h);
     useSettingsStore.getState().setSelectedModel(current);
     expect(h).not.toHaveBeenCalled();
+  });
+
+  it('normalizes legacy exact model ids before persisting or emitting', () => {
+    useSettingsStore.setState({ selectedModel: 'sonnet' });
+    const h = vi.fn();
+    settingsEvents.on('model-changed', h);
+    useSettingsStore.getState().setSelectedModel('claude-fable-5-1m');
+    expect(useSettingsStore.getState().selectedModel).toBe('fable');
+    expect(h).toHaveBeenCalledWith({ old: 'sonnet', next: 'fable' });
+    useSettingsStore.setState({ selectedModel: 'sonnet' });
   });
 
   it('setThinkingLevel fires thinking-changed', () => {

@@ -9,6 +9,7 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   variant?: 'danger' | 'default';
+  hideCancel?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -21,6 +22,7 @@ export function ConfirmDialog({
   confirmLabel,
   cancelLabel,
   variant = 'default',
+  hideCancel = false,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -46,13 +48,15 @@ export function ConfirmDialog({
         )}
         {!detail && <div className="mb-4" />}
         <div className="flex justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-xs rounded-md bg-bg-secondary
-              text-text-muted hover:bg-bg-tertiary transition-smooth cursor-pointer"
-          >
-            {cancelLabel || t('common.cancel')}
-          </button>
+          {!hideCancel && (
+            <button
+              onClick={onCancel}
+              className="px-3 py-1.5 text-xs rounded-md bg-bg-secondary
+                text-text-muted hover:bg-bg-tertiary transition-smooth cursor-pointer"
+            >
+              {cancelLabel || t('common.cancel')}
+            </button>
+          )}
           <button
             onClick={onConfirm}
             className={`px-3 py-1.5 text-xs rounded-md transition-smooth cursor-pointer

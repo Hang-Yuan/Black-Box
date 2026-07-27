@@ -30,15 +30,21 @@ function saveCustomPreviewsLocal(map: Record<string, string>) {
   localStorage.setItem(CUSTOM_PREVIEWS_KEY, JSON.stringify(map));
 }
 
-/** Persist the last active session ID so app restart can auto-restore */
+/** Persist the last active session ID so a real app quit/relaunch can restore
+ *  it. sessionStorage alone survives reload but is discarded with the window. */
 function saveLastSessionId(id: string | null) {
   if (id && !id.startsWith('draft_')) {
+    localStorage.setItem(LAST_SESSION_KEY, id);
     sessionStorage.setItem(LAST_SESSION_KEY, id);
+  } else if (id === null) {
+    localStorage.removeItem(LAST_SESSION_KEY);
+    sessionStorage.removeItem(LAST_SESSION_KEY);
   }
 }
 
 function loadLastSessionId(): string | null {
-  return sessionStorage.getItem(LAST_SESSION_KEY);
+  return localStorage.getItem(LAST_SESSION_KEY)
+    || sessionStorage.getItem(LAST_SESSION_KEY);
 }
 
 /** Persist stdinToTab across page refreshes using sessionStorage.
@@ -81,6 +87,8 @@ interface SessionState {
   addDraftSession: (id: string, projectPath: string) => void;
   /** Update an existing draft session's project path (e.g. after folder selection) */
   updateDraftProject: (id: string, projectPath: string) => void;
+  /** Update the authoritative cwd shown for any task after a Local/Worktree handoff. */
+  updateSessionProject: (id: string, projectPath: string) => void;
   /** Set a custom display name for a session */
   setCustomPreview: (sessionId: string, name: string) => void;
   /** Get the display name for a session (custom > preview > fallback) */
@@ -139,7 +147,10 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       // Merge: preserve in-memory cliResumeId on disk sessions
       const merged = diskSessions.map((d) => {
         const mem = existing.find((s) => s.id === d.id);
-        return mem?.cliResumeId ? { ...d, cliResumeId: mem.cliResumeId } : d;
+        return {
+          ...d,
+          cliResumeId: mem?.cliResumeId || d.cliResumeId || d.id,
+        };
       });
       set({ sessions: [...drafts, ...merged], isLoading: false });
     } catch {
@@ -179,6 +190,19 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       s.id === id
         ? { ...s, project: projectPath, projectDir: projectPath.replace(/\//g, '-'), modifiedAt: Date.now() }
         : s,
+    ),
+  })),
+
+  updateSessionProject: (id, projectPath) => set((state) => ({
+    sessions: state.sessions.map((session) =>
+      session.id === id
+        ? {
+          ...session,
+          project: projectPath,
+          projectDir: projectPath.replace(/[\\/]/g, '-'),
+          modifiedAt: Date.now(),
+        }
+        : session,
     ),
   })),
 

@@ -1,0 +1,15 @@
+{
+  "name": "blackbox-smoke",
+  "description": "Local-only Black Box plugin lifecycle acceptance fixtures",
+  "owner": {
+    "name": "Black Box"
+  },
+  "plugins": [
+    {
+      "name": "blackbox-trace-plugin",
+      "source": "./plugins/blackbox-trace-plugin",
+      "description": "Local fixture for plugin skill and subagent trace verification",
+      "version": "0.1.0"
+    }
+  ]
+}

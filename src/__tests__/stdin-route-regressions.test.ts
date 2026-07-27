@@ -27,6 +27,11 @@ const rewindSource = readFileSync(
   'utf-8',
 );
 
+const sessionIdentitySource = readFileSync(
+  resolve(__dirname, '../lib/session-identity.ts'),
+  'utf-8',
+);
+
 const conversationListSource = readFileSync(
   resolve(__dirname, '../components/conversations/ConversationList.tsx'),
   'utf-8',
@@ -71,7 +76,8 @@ describe('stdin route regressions', () => {
   });
 
   it('rewind waits for stdin ownership to clear before resetting the tab', () => {
-    expect(rewindSource).toContain("await waitForStdinCleared(tid, stdinId);");
+    expect(rewindSource).toContain("await waitForStdinCleared(tabId, stdinId);");
+    expect(rewindSource).not.toContain('getActiveTabState');
   });
 
   it('ExitPlanMode auto-restart waits for finalize before silent resume', () => {
@@ -91,14 +97,32 @@ describe('stdin route regressions', () => {
 
   it('hidden provider thinking records resume evidence without deleting real sessions', () => {
     expect(streamProcessorSource).toContain('turnAcceptedForResume: true');
-    expect(inputBarSource).toContain('resumeTab?.sessionMeta.turnAcceptedForResume === true');
-    expect(streamProcessorSource).toContain('if (tabId.startsWith(\'draft_\')) {');
-    expect(streamProcessorSource).toContain('tabId = cliSessionId;');
+    expect(inputBarSource).toContain('turnAcceptedForResume: resumeTab?.sessionMeta.turnAcceptedForResume');
+    expect(inputBarSource).toContain('shouldAttemptDurableResume');
+    expect(streamProcessorSource).toContain('adoptCliSessionIdentity(tabId, cliSessionId, stdinId)');
+    expect(sessionIdentitySource).toContain('sessions.promoteDraft(currentTabId, durableId)');
     expect(streamProcessorSource).not.toContain('bridge.deleteSession(tabId, oldSession.path)');
   });
 
+  it('promotes a draft even when spawnSession already cached the same CLI resume id', () => {
+    expect(streamProcessorSource).toContain("currentResumeId === cliSessionId && !tabId.startsWith('draft_')");
+    expect(streamProcessorSource).toContain('adoptCliSessionIdentity(tabId, cliSessionId, stdinId)');
+  });
+
+  it('de-duplicates result frames after presentation sanitization', () => {
+    expect(streamProcessorSource).toContain('sanitizeAssistantTextForDisplay(msg.result)');
+    expect(streamProcessorSource).toContain('m.content === bgResultDisplayText');
+  });
+
+  it('does not attach the removed Black Box Goal lifecycle to process exits', () => {
+    expect(streamProcessorSource).not.toContain('pauseGoalForProcessExit');
+    expect(streamProcessorSource).not.toContain('goal-continuation');
+  });
+
   it('post-spawn metadata follows draft promotion to the current stdin owner', () => {
-    expect(inputBarSource).toContain('const spawnOwnerTabId = useSessionStore.getState().getTabForStdin(preGeneratedId) ?? tabId;');
+    expect(inputBarSource).toContain('const ownerBeforeAdoption = useSessionStore.getState().getTabForStdin(preGeneratedId) ?? tabId;');
+    expect(inputBarSource).toContain('const spawnOwnerTabId = spawnResult.sessionInfo.cli_session_id');
+    expect(inputBarSource).toContain('adoptCliSessionIdentity(');
     expect(inputBarSource).toContain('const existingOwnerSessionId = useChatStore.getState().getTab(spawnOwnerTabId)?.sessionMeta.sessionId;');
     expect(inputBarSource).toContain('?? (spawnOwnerTabId !== tabId ? existingOwnerSessionId : undefined)');
     expect(inputBarSource).toContain('setSessionMeta(spawnOwnerTabId, {');
@@ -106,6 +130,7 @@ describe('stdin route regressions', () => {
 
   it('background auto-compact keeps the tab busy until compact settles', () => {
     expect(streamProcessorSource).toContain("store.setSessionStatus(tabId, 'running');");
-    expect(streamProcessorSource).toContain("completePendingCommand(tabId, { output: 'Compact timed out' });");
+    expect(streamProcessorSource).toContain('markPendingCommandSlow(tabId, bgCompactMsgId');
+    expect(streamProcessorSource).not.toContain("completePendingCommand(tabId, { output: 'Compact timed out' });");
   });
 });

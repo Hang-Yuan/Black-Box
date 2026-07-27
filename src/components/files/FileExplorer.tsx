@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { FileNode } from '../../lib/tauri-bridge';
+import { FileNode, FileSearchResponse } from '../../lib/tauri-bridge';
 import { useFileStore, FileChangeKind } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { bridge } from '../../lib/tauri-bridge';
@@ -216,26 +216,6 @@ interface FlatMatch {
   relDir: string;
 }
 
-function collectMatches(nodes: FileNode[], query: string, rootPrefix: string): FlatMatch[] {
-  const results: FlatMatch[] = [];
-  function walk(node: FileNode) {
-    if (node.name.toLowerCase().includes(query)) {
-      // Compute relative directory (parent path minus root prefix)
-      const lastSep = node.path.lastIndexOf('/');
-      const parentPath = lastSep > 0 ? node.path.slice(0, lastSep) : '';
-      const relDir = parentPath.startsWith(rootPrefix)
-        ? parentPath.slice(rootPrefix.length).replace(/^\//, '')
-        : parentPath;
-      results.push({ node, relDir });
-    }
-    if (node.children) {
-      for (const child of node.children) walk(child);
-    }
-  }
-  for (const n of nodes) walk(n);
-  return results;
-}
-
 function SearchResultItem({
   match,
   onContextMenu,
@@ -245,12 +225,12 @@ function SearchResultItem({
 }) {
   const { node, relDir } = match;
   const selectedFile = useFileStore((s) => s.selectedFile);
-  const selectFile = useFileStore((s) => s.selectFile);
+  const openFileReference = useFileStore((s) => s.openFileReference);
   const changeKind = useFileStore((s) => s.changedFiles.get(node.path));
   const isSelected = selectedFile === node.path;
   return (
     <button
-      onClick={() => { if (!node.is_dir) selectFile(node.path); }}
+      onClick={() => { if (!node.is_dir) void openFileReference(node.path); }}
       onContextMenu={(e) => { e.preventDefault(); onContextMenu(e, node.path, node.is_dir); }}
       className={`w-full flex items-center gap-1.5 py-1.5 px-3 rounded-md
         text-left text-[13px] transition-smooth group
@@ -308,6 +288,8 @@ function TreeNode({
 }) {
   const expanded = useFileStore((s) => s.expandedFolders.has(node.path));
   const toggleFolder = useFileStore((s) => s.toggleFolder);
+  const loadFolderChildren = useFileStore((s) => s.loadFolderChildren);
+  const isLoadingChildren = useFileStore((s) => s.loadingFolders.has(node.path));
   const selectFile = useFileStore((s) => s.selectFile);
   // 高亮统一看 revealTarget（文件夹也能高亮）；selectFile 会同步设置它
   const isActive = useFileStore((s) => s.revealTarget === node.path);
@@ -326,6 +308,12 @@ function TreeNode({
   useEffect(() => {
     if (isActive) rowRef.current?.scrollIntoView({ block: 'nearest' });
   }, [isActive]);
+
+  useEffect(() => {
+    if (node.is_dir && isExpanded && node.children_truncated) {
+      void loadFolderChildren(node.path);
+    }
+  }, [node.is_dir, node.path, node.children_truncated, isExpanded, loadFolderChildren]);
 
   const handleClick = () => {
     if (node.is_dir) {
@@ -411,12 +399,16 @@ function TreeNode({
       >
         <span className="flex-shrink-0 w-3.5 flex items-center">
           {node.is_dir ? (
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
-              stroke="currentColor" strokeWidth="1.5"
-              className={`text-text-tertiary transition-transform duration-150
-                ${isExpanded ? 'rotate-90' : ''}`}>
-              <path d="M3 2l4 3-4 3" />
-            </svg>
+            isLoadingChildren ? (
+              <span className="h-2.5 w-2.5 rounded-full border border-text-tertiary/30 border-t-text-tertiary animate-spin" />
+            ) : (
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
+                stroke="currentColor" strokeWidth="1.5"
+                className={`text-text-tertiary transition-transform duration-150
+                  ${isExpanded ? 'rotate-90' : ''}`}>
+                <path d="M3 2l4 3-4 3" />
+              </svg>
+            )
           ) : (
             <FileIcon name={node.name} size={14} className="text-accent" />
           )}
@@ -499,6 +491,7 @@ export function FileExplorer() {
   const tree = useFileStore((s) => s.tree);
   const isLoading = useFileStore((s) => s.isLoading);
   const rootPath = useFileStore((s) => s.rootPath);
+  const revealTarget = useFileStore((s) => s.revealTarget);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
 
   const refreshTree = useFileStore((s) => s.refreshTree);
@@ -508,8 +501,16 @@ export function FileExplorer() {
   const showHiddenFiles = useSettingsStore((s) => s.showHiddenFiles);
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [deepSearch, setDeepSearch] = useState<FileSearchResponse>({
+    matches: [],
+    truncated: false,
+    skipped_directories: 0,
+  });
+  const [isDeepSearching, setIsDeepSearching] = useState(false);
+  const [deepSearchFailed, setDeepSearchFailed] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const searchRequestRef = useRef(0);
 
   // Right-click menu state
   const [clipboardPath, setClipboardPath] = useState<string | null>(null);
@@ -521,15 +522,67 @@ export function FileExplorer() {
   const [creatingIn, setCreatingIn] = useState<{ dir: string; type: 'file' | 'folder' } | null>(null);
   const [createName, setCreateName] = useState('');
 
+  useEffect(() => {
+    if (revealTarget) setSearchQuery('');
+  }, [revealTarget]);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    const searchRoot = rootPath || workingDirectory;
+    const requestId = ++searchRequestRef.current;
+    if (!query || !searchRoot) {
+      setDeepSearch({ matches: [], truncated: false, skipped_directories: 0 });
+      setIsDeepSearching(false);
+      setDeepSearchFailed(false);
+      return;
+    }
+
+    setIsDeepSearching(true);
+    setDeepSearchFailed(false);
+    const timer = window.setTimeout(() => {
+      bridge.searchFileTree(searchRoot, query, showHiddenFiles, 200)
+        .then((response) => {
+          if (searchRequestRef.current !== requestId) return;
+          setDeepSearch(response);
+          setIsDeepSearching(false);
+        })
+        .catch(() => {
+          if (searchRequestRef.current !== requestId) return;
+          setDeepSearch({ matches: [], truncated: false, skipped_directories: 0 });
+          setDeepSearchFailed(true);
+          setIsDeepSearching(false);
+        });
+    }, 180);
+
+    return () => window.clearTimeout(timer);
+  }, [searchQuery, rootPath, workingDirectory, showHiddenFiles]);
+
   const filteredTree = useMemo(() => {
     if (showHiddenFiles) return tree;
     function filterNodes(nodes: FileNode[]): FileNode[] {
       return nodes
-        .filter((n) => !n.name.startsWith('.'))
+        .filter((n) => (
+          !n.name.startsWith('.')
+          || revealTarget === n.path
+          || !!revealTarget?.startsWith(`${n.path}/`)
+        ))
         .map((n) => n.children ? { ...n, children: filterNodes(n.children) } : n);
     }
     return filterNodes(tree);
-  }, [tree, showHiddenFiles]);
+  }, [tree, showHiddenFiles, revealTarget]);
+
+  const deepSearchMatches = useMemo<FlatMatch[]>(() => (
+    deepSearch.matches.map((match) => ({
+      node: {
+        name: match.name,
+        path: match.path,
+        is_dir: match.is_dir,
+        children: match.is_dir ? [] : null,
+        children_truncated: match.is_dir,
+      },
+      relDir: match.relative_dir,
+    }))
+  ), [deepSearch.matches]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, path: string, isDir: boolean) => {
     setContextMenu({ x: e.clientX, y: e.clientY, path, isDir });
@@ -692,35 +745,52 @@ export function FileExplorer() {
           </div>
         )}
         <div className="h-full overflow-y-auto py-1">
-        {isLoading && filteredTree.length === 0 ? (
+        {searchQuery ? (
+          isDeepSearching ? (
+            <div className="flex items-center justify-center py-8">
+              <div className="w-5 h-5 border-2 border-accent/30
+                border-t-accent rounded-full animate-spin" />
+            </div>
+          ) : deepSearchFailed ? (
+            <div className="text-center py-8 text-xs text-error">
+              {t('files.searchFailed')}
+            </div>
+          ) : deepSearchMatches.length > 0 ? (
+            <div className="py-1">
+              {deepSearchMatches.map((match) => (
+                <SearchResultItem
+                  key={match.node.path}
+                  match={match}
+                  onContextMenu={handleContextMenu}
+                />
+              ))}
+              {deepSearch.truncated && (
+                <div className="px-3 py-2 text-[11px] text-text-tertiary">
+                  {t('files.searchTruncated')}
+                </div>
+              )}
+              {deepSearch.skipped_directories > 0 && (
+                <div className="px-3 py-2 text-[11px] text-amber-500">
+                  {t('files.searchIncomplete').replace(
+                    '{count}',
+                    String(deepSearch.skipped_directories),
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-xs text-text-tertiary">
+              {t('files.noFiles')}
+            </div>
+          )
+        ) : isLoading && filteredTree.length === 0 ? (
           <div className="flex items-center justify-center py-8">
             <div className="w-5 h-5 border-2 border-accent/30
               border-t-accent rounded-full animate-spin" />
           </div>
         ) : filteredTree.length > 0 ? (
-          searchQuery ? (
-            // --- Flat search results ---
-            (() => {
-              const matches = collectMatches(filteredTree, searchQuery.toLowerCase(), rootPath || '');
-              return matches.length > 0 ? (
-                <div className="py-1">
-                  {matches.map((m) => (
-                    <SearchResultItem
-                      key={m.node.path}
-                      match={m}
-                      onContextMenu={handleContextMenu}
-                    />
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center py-8 text-xs text-text-tertiary">
-                  {t('files.noFiles')}
-                </div>
-              );
-            })()
-          ) : (
-            // --- Normal tree view ---
-            <>
+          // --- Normal tree view ---
+          <>
               {/* Inline creation input at root level */}
               {creatingIn && creatingIn.dir === (workingDirectory || rootPath) && (
                 <div className="flex items-center gap-2 py-1.5 px-2"
@@ -763,8 +833,7 @@ export function FileExplorer() {
                   onCreateCancel={handleCreateCancel}
                 />
               ))}
-            </>
-          )
+          </>
         ) : (
           <div className="text-center py-8 text-xs text-text-tertiary">
             {t('files.noFiles')}

@@ -212,6 +212,7 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       // Access the placeholder extension and reconfigure
       editor.extensionManager.extensions.forEach((ext) => {
         if (ext.name === 'placeholder') {
+          if ((ext.options as any).placeholder === placeholder) return;
           (ext.options as any).placeholder = placeholder;
           // Force re-render of decorations
           editor.view.dispatch(editor.view.state.tr);
@@ -233,6 +234,10 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       },
       setText(text: string) {
         if (!editor) return;
+        // setContent/clearContent emit an editor update. Avoid generating that
+        // transaction when the store is merely reflecting the editor's own
+        // latest value back into the imperative bridge.
+        if (editorToPlainText(editor) === text) return;
         if (!text) {
           editor.commands.clearContent();
           return;

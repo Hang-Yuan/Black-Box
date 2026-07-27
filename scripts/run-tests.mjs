@@ -233,7 +233,7 @@ function executeStep(step, stepIndex, phase, captureSnapshots, remainingBudgetMs
       record.visibleText = captureVisibleText();
     } else {
       // Standard: capture visible text only for UI-changing commands
-      const uiChangingCmds = new Set(['send', 'type', 'switch-session', 'switch-model', 'switch-provider',
+      const uiChangingCmds = new Set(['send', 'type', 'switch-session', 'switch-model', 'switch-provider', 'switch-mode',
         'allow-permission', 'deny-permission', 'open-settings', 'close-settings', 'new-session', 'restart']);
       if (uiChangingCmds.has(step.cmd)) {
         record.visibleText = captureVisibleText();

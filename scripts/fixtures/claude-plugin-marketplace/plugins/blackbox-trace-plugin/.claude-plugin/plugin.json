@@ -1,0 +1,8 @@
+{
+  "name": "blackbox-trace-plugin",
+  "version": "0.1.0",
+  "description": "Black Box isolated plugin lifecycle and subagent trace fixture",
+  "author": {
+    "name": "Black Box"
+  }
+}

@@ -26,6 +26,12 @@ pub enum StdoutMessage {
         request_id: String,
         request: ControlRequestPayload,
     },
+    #[serde(rename = "control_cancel_request")]
+    ControlCancelRequest {
+        request_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Any other message type — pass through to frontend
     #[serde(other)]
     Other,
@@ -149,7 +155,15 @@ mod tests {
                 "tool_name": "Bash",
                 "input": {"command": "ls -la"},
                 "description": "List files",
-                "tool_use_id": "tu_001"
+                "tool_use_id": "tu_001",
+                "permission_suggestions": [{
+                    "type": "addRules",
+                    "rules": [{"toolName": "Bash", "ruleContent": "ls:*"}],
+                    "behavior": "allow",
+                    "destination": "session"
+                }],
+                "blocked_path": "/tmp/example",
+                "decision_reason": "Default mode asks before Bash"
             }
         }"#;
         let msg: StdoutMessage = serde_json::from_str(json).unwrap();
@@ -163,10 +177,16 @@ mod tests {
                     ControlRequestPayload::CanUseTool {
                         tool_name,
                         description,
+                        permission_suggestions,
+                        blocked_path,
+                        decision_reason,
                         ..
                     } => {
                         assert_eq!(tool_name, "Bash");
                         assert_eq!(description.unwrap(), "List files");
+                        assert_eq!(permission_suggestions.unwrap()[0]["destination"], "session");
+                        assert_eq!(blocked_path.unwrap(), "/tmp/example");
+                        assert_eq!(decision_reason.unwrap(), "Default mode asks before Bash");
                     }
                     _ => panic!("Expected CanUseTool"),
                 }
@@ -180,6 +200,23 @@ mod tests {
         let json = r#"{"type": "assistant", "message": {}, "uuid": "x", "session_id": "y"}"#;
         let msg: StdoutMessage = serde_json::from_str(json).unwrap();
         assert!(matches!(msg, StdoutMessage::Other));
+    }
+
+    #[test]
+    fn test_parse_control_cancel_request() {
+        let json = r#"{
+            "type": "control_cancel_request",
+            "request_id": "abc123",
+            "reason": "interrupted"
+        }"#;
+        let msg: StdoutMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            StdoutMessage::ControlCancelRequest { request_id, reason } => {
+                assert_eq!(request_id, "abc123");
+                assert_eq!(reason.as_deref(), Some("interrupted"));
+            }
+            _ => panic!("Expected ControlCancelRequest"),
+        }
     }
 
     #[test]

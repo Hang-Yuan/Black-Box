@@ -18,23 +18,30 @@ interface CommandSection {
 }
 
 function filterCommands(commands: UnifiedCommand[], query: string): UnifiedCommand[] {
-  if (!commands.length) return [];
+  // Cold official-reference entries are metadata only. They must never be
+  // keyboard-selectable or presented as available before the live CLI says so.
+  const visibleCommands = commands.filter((command) => command.availability !== 'reference');
+  if (!visibleCommands.length) return [];
   const q = query.toLowerCase().trim();
-  if (!q) return commands.slice(0, 12); // empty query → show all
+  if (!q) return visibleCommands;
 
   const nameWithSlash = '/' + q;
 
   // First pass: commands whose name starts with the query (strongest match)
-  const startsWithMatches = commands.filter((cmd) =>
+  const startsWithMatches = visibleCommands.filter((cmd) =>
     cmd.name.toLowerCase().startsWith(nameWithSlash)
+    || cmd.aliases?.some((alias) => alias.toLowerCase().startsWith(nameWithSlash))
   );
+  const startsWithNames = new Set(startsWithMatches.map((cmd) => cmd.name.toLowerCase()));
 
   // Second pass: commands whose name or description contains the query
-  const containsMatches = commands.filter((cmd) => {
+  const containsMatches = visibleCommands.filter((cmd) => {
     // Skip already-matched commands
-    if (cmd.name.toLowerCase().startsWith(nameWithSlash)) return false;
+    if (startsWithNames.has(cmd.name.toLowerCase())) return false;
     // Match on description
     if (cmd.description.toLowerCase().includes(q)) return true;
+    if (cmd.argument_hint?.toLowerCase().includes(q)) return true;
+    if (cmd.aliases?.some((alias) => alias.toLowerCase().includes(q))) return true;
     // Also search translated descriptions for builtin commands
     if (cmd.category === 'builtin') {
       const localDesc = tStatic(`slash.desc.${cmd.name.slice(1)}`);
@@ -43,7 +50,7 @@ function filterCommands(commands: UnifiedCommand[], query: string): UnifiedComma
     return false;
   });
 
-  return [...startsWithMatches, ...containsMatches].slice(0, 12);
+  return [...startsWithMatches, ...containsMatches];
 }
 
 function groupCommands(filtered: UnifiedCommand[]): CommandSection[] {
@@ -52,14 +59,20 @@ function groupCommands(filtered: UnifiedCommand[]): CommandSection[] {
   const builtin = filtered.filter(c => c.category === 'builtin');
   const projectCmds = filtered.filter(c => c.category === 'command' && c.source === 'project');
   const globalCmds = filtered.filter(c => c.category === 'command' && c.source === 'global');
+  const runtimeCmds = filtered.filter(c => c.category === 'command' && c.source === 'runtime');
+  const runtimeWorkflows = filtered.filter(c => c.kind === 'workflow' && c.source === 'runtime');
   const projectSkills = filtered.filter(c => c.category === 'skill' && c.source === 'project');
   const globalSkills = filtered.filter(c => c.category === 'skill' && c.source === 'global');
+  const runtimeSkills = filtered.filter(c => c.category === 'skill' && c.source === 'runtime');
 
   if (builtin.length) sections.push({ key: 'builtin', labelKey: 'slash.builtin', items: builtin });
   if (projectCmds.length) sections.push({ key: 'projectCmds', labelKey: 'slash.projectCommands', items: projectCmds });
   if (globalCmds.length) sections.push({ key: 'globalCmds', labelKey: 'slash.globalCommands', items: globalCmds });
+  if (runtimeCmds.length) sections.push({ key: 'runtimeCmds', labelKey: 'slash.runtimeCommands', items: runtimeCmds });
+  if (runtimeWorkflows.length) sections.push({ key: 'runtimeWorkflows', labelKey: 'slash.runtimeWorkflows', items: runtimeWorkflows });
   if (projectSkills.length) sections.push({ key: 'projectSkills', labelKey: 'slash.projectSkills', items: projectSkills });
   if (globalSkills.length) sections.push({ key: 'globalSkills', labelKey: 'slash.globalSkills', items: globalSkills });
+  if (runtimeSkills.length) sections.push({ key: 'runtimeSkills', labelKey: 'slash.runtimeSkills', items: runtimeSkills });
 
   return sections;
 }
@@ -148,6 +161,21 @@ export function SlashCommandPopover({
                         {t('slash.session')}
                       </span>
                     )}
+                    {cmd.runtime_available && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 font-medium">
+                        {t('slash.runtime')}
+                      </span>
+                    )}
+                    {cmd.owner === 'blackbox' && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/10 text-violet-400 font-medium">
+                        {t('slash.blackbox')}
+                      </span>
+                    )}
+                    {cmd.availability === 'provisional' && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-500/10 text-sky-400 font-medium">
+                        {t('slash.provisional')}
+                      </span>
+                    )}
                     {cmd.execution === 'ui' && cmd.immediate && (
                       <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-bg-tertiary text-text-tertiary font-medium">
                         {t('slash.immediate')}
@@ -160,10 +188,22 @@ export function SlashCommandPopover({
                     )}
                   </div>
                   <div className="text-text-tertiary text-[11px] truncate mt-0.5">
-                    {cmd.category === 'builtin'
-                      ? t(`slash.desc.${cmd.name.slice(1)}`) || cmd.description
-                      : cmd.description}
+                    {(() => {
+                      if (cmd.category !== 'builtin') {
+                        return cmd.description || t(cmd.category === 'skill'
+                          ? 'slash.runtimeSkillDesc'
+                          : 'slash.runtimeCommandDesc');
+                      }
+                      const key = `slash.desc.${cmd.name.slice(1)}`;
+                      const localized = t(key);
+                      return localized === key ? cmd.description : localized;
+                    })()}
                   </div>
+                  {cmd.argument_hint && (
+                    <div className="mt-0.5 text-[9px] text-text-tertiary font-mono truncate">
+                      {cmd.argument_hint}
+                    </div>
+                  )}
                 </div>
               </button>
             );

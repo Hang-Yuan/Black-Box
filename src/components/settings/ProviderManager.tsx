@@ -4,10 +4,11 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { type PresetProvider } from '../../lib/provider-presets';
-import { parseAndValidate, importAsProvider, exportProvider } from '../../lib/api-config';
+import { exportProvider } from '../../lib/api-config';
 import { AddProviderMenu } from './AddProviderMenu';
 import { ProviderCard, type CardTestStatus } from './ProviderCard';
 import { ProviderForm, type TestStatus } from './ProviderForm';
+import { getProviderConnectionTestModel } from '../../lib/api-provider';
 
 export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: boolean } = {}) {
   const t = useT();
@@ -23,7 +24,6 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
   const [autoTestId, setAutoTestId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [importStatus, setImportStatus] = useState<'idle' | 'success'>('idle');
   const [importError, setImportError] = useState('');
   const [cardTestStatuses, setCardTestStatuses] = useState<Record<string, CardTestStatus>>({});
   const [cardTestTimes, setCardTestTimes] = useState<Record<string, number>>({});
@@ -46,12 +46,14 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
       name: existingCount > 0 ? `${preset.name} (${existingCount + 1})` : preset.name,
       baseUrl: preset.baseUrl,
       apiFormat: preset.apiFormat,
+      authScheme: preset.authScheme,
       modelMappings: [
+        { tier: 'fable', providerModel: preset.defaultModels?.fable || preset.defaultModels?.opus || preset.defaultModel || 'claude-fable-5' },
         { tier: 'opus', providerModel: preset.defaultModels?.opus || preset.defaultModel || 'claude-opus-4-8' },
         { tier: 'sonnet', providerModel: preset.defaultModels?.sonnet || preset.defaultModel || 'claude-sonnet-4-6' },
         { tier: 'haiku', providerModel: preset.defaultModels?.haiku || preset.defaultModel || 'claude-haiku-4-5-20251001' },
       ],
-      extra_env: { ...preset.extra_env },
+      extraEnv: { ...preset.extraEnv },
       preset: preset.id,
     });
     const { providers: updated } = useProviderStore.getState();
@@ -62,73 +64,16 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
     }
   }, [addProvider, providers, setActive]);
 
-  const handleAddCustom = useCallback(() => {
-    addProvider({
-      name: '',
-      baseUrl: '',
-      apiFormat: 'anthropic',
-      modelMappings: [
-        { tier: 'opus', providerModel: 'claude-opus-4-8' },
-        { tier: 'sonnet', providerModel: 'claude-sonnet-4-6' },
-        { tier: 'haiku', providerModel: 'claude-haiku-4-5-20251001' },
-      ],
-      extra_env: {},
-    });
-    const { providers: updated } = useProviderStore.getState();
-    const last = updated[updated.length - 1];
-    if (last) {
-      setActive(last.id);
-      setEditingId(last.id);
-    }
-  }, [addProvider, setActive]);
-
-  const handleImport = useCallback(async () => {
-    const { open: openDialog } = await import('@tauri-apps/plugin-dialog');
-    const result = await openDialog({
-      title: t('provider.importTitle'),
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-      multiple: false,
-    });
-    const filePath = Array.isArray(result) ? result[0] : result;
-    if (!filePath) return;
-
-    setImportError('');
-    setImportStatus('idle');
-
-    try {
-      // Phase 3 §3.2: user chose this path via the native file dialog →
-      // authorize it so read_file_content is permitted.
-      const importTabId = useSessionStore.getState().selectedSessionId;
-      if (importTabId) {
-        await bridge.addPathGrant(importTabId, filePath).catch(() => {});
-      }
-      const content = await bridge.readFileContent(filePath, importTabId || undefined);
-      const parsed = parseAndValidate(content);
-      if (!parsed.ok) {
-        setImportError(parsed.error);
-        setTimeout(() => setImportError(''), 5000);
-        return;
-      }
-      importAsProvider(parsed.provider);
-      setImportStatus('success');
-      setTimeout(() => setImportStatus('idle'), 3000);
-      const { providers: updated } = useProviderStore.getState();
-      const last = updated[updated.length - 1];
-      if (last) {
-        setActive(last.id);
-        setEditingId(last.id);
-      }
-    } catch (e) {
-      setImportError(String(e));
-      setTimeout(() => setImportError(''), 5000);
-    }
-  }, [t, setActive]);
-
-  const handleConfirmDelete = useCallback(() => {
+  const handleConfirmDelete = useCallback(async () => {
     if (!deleteTarget) return;
-    if (editingId === deleteTarget) setEditingId(null);
-    deleteProvider(deleteTarget);
-    setDeleteTarget(null);
+    setImportError('');
+    try {
+      await deleteProvider(deleteTarget);
+      if (editingId === deleteTarget) setEditingId(null);
+      setDeleteTarget(null);
+    } catch (error) {
+      setImportError(String(error));
+    }
   }, [deleteTarget, editingId, deleteProvider]);
 
   /** Card test button: quick independent test without opening form */
@@ -139,15 +84,23 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
     setCardTestStatuses((prev) => ({ ...prev, [providerId]: 'testing' }));
     setCardTestTimes((prev) => { const next = { ...prev }; delete next[providerId]; return next; });
 
-    const testModel = p.modelMappings.find((m) => m.providerModel)?.providerModel || '';
-    if (!testModel || !p.apiKey) {
+    const testModel = getProviderConnectionTestModel(p.modelMappings);
+    if (!testModel || (!p.apiKey && (!p.credentialState || p.credentialState === 'missing'))) {
       setCardTestStatuses((prev) => ({ ...prev, [providerId]: 'failed' }));
       return;
     }
 
     try {
       const start = Date.now();
-      const result = await bridge.testProviderConnection(p.baseUrl, p.apiFormat, p.apiKey, testModel);
+      const result = await bridge.testProviderConnection(
+        p.baseUrl,
+        p.apiFormat,
+        p.apiKey || undefined,
+        testModel,
+        p.proxyUrl || undefined,
+        p.id,
+        p.authScheme,
+      );
       const elapsed = Date.now() - start;
 
       if (result.connectivity.ok && result.auth.ok && result.model.ok) {
@@ -188,7 +141,6 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
   }, [t]);
 
   const isExpanded = alwaysExpanded || !collapsed;
-
   return (
     <div className={alwaysExpanded ? '' : 'pt-2 border-t border-border-subtle'}>
       {/* Header */}
@@ -215,9 +167,8 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
 
       {isExpanded && (
         <div className="space-y-3 ml-0">
-          {/* CC Switch coexistence notice */}
-          <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
-            {t('provider.ccswitchNotice')}
+          <div className="rounded-md border border-accent/25 bg-accent/5 px-3 py-2 text-[12px] leading-5 text-text-muted">
+            {t('provider.fixedCatalogNotice')}
           </div>
 
           {/* Inherit system config option */}
@@ -310,9 +261,6 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
               {t('provider.addProvider')}
             </button>
 
-            {importStatus === 'success' && (
-              <span className="text-xs text-green-500">{t('provider.importSuccess')}</span>
-            )}
             {importError && (
               <span className="text-xs text-red-400 truncate flex-1" title={importError}>
                 {importError}
@@ -326,8 +274,6 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
             anchorRef={addBtnRef}
             providers={providers}
             onAddFromPreset={handleAddFromPreset}
-            onAddCustom={handleAddCustom}
-            onImport={handleImport}
           />
         </div>
       )}

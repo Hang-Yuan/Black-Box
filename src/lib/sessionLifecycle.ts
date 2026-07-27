@@ -16,11 +16,13 @@ import {
   type StartSessionParams,
   type SessionInfo,
 } from './tauri-bridge';
-import { useChatStore, generateInterruptedId } from '../stores/chatStore';
+import { useChatStore, generateInterruptedId, isSessionBusy } from '../stores/chatStore';
 import type { SessionStatus } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
+import { useProviderStore } from '../stores/providerStore';
 import { streamController } from '../stream/instance';
 import type { CliPermissionMode, SessionMode, ThinkingLevel } from '../stores/settingsStore';
+import { clearSessionPermissionGrants } from './session-permission-grants';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,9 +36,11 @@ export interface SpawnParams {
   cwdSnapshot: string;
   configSnapshot: {
     model: string;
+    auxiliaryModel: string;
     providerId: string;
     thinkingLevel: ThinkingLevel;
     permissionMode: CliPermissionMode;
+    agentTeamsEnabled: boolean;
   };
   sessionModeSnapshot: SessionMode;
   sessionParams: StartSessionParams;
@@ -162,6 +166,7 @@ export function cleanupListeners(stdinId: string): void {
 
 /** Drop the stdinId route and its listeners when a process is no longer valid. */
 export function cleanupStdinRoute(stdinId: string): void {
+  clearSessionPermissionGrants(stdinId);
   useSessionStore.getState().unregisterStdinTab(stdinId);
   cleanupListeners(stdinId);
 }
@@ -174,6 +179,107 @@ export function hasRecoverableFrontendSession(stdinId: string): boolean {
   const tab = useChatStore.getState().getTab(tabId);
   if (!tab || tab.sessionMeta.stdinId !== stdinId) return false;
   return Boolean((window as any).__claudeUnlisteners?.[stdinId]);
+}
+
+// A page reload destroys listener closures but leaves the Tauri process alive.
+// Both App and ConversationList need the same startup barrier, otherwise the
+// sidebar can reload a JSONL and immediately spawn --resume while the old child
+// is still being killed. Keep one module-level promise so the two callers join
+// the same recovery operation.
+let startupRecoveryPromise: Promise<void> | null = null;
+
+export function settleOrphanedBackendProcesses(): Promise<void> {
+  if (startupRecoveryPromise) return startupRecoveryPromise;
+  const recovery = (async () => {
+    const activeIds = await bridge.listActiveProcesses();
+    const orphaned = activeIds.filter((id) => !hasRecoverableFrontendSession(id));
+    await Promise.all(orphaned.map(async (stdinId) => {
+      const ownerTabId = useSessionStore.getState().getTabForStdin(stdinId);
+      await bridge.gracefulStopSession(stdinId);
+      useSessionStore.getState().unregisterStdinTab(stdinId);
+      if (ownerTabId && useChatStore.getState().getTab(ownerTabId)?.sessionMeta.stdinId === stdinId) {
+        useChatStore.getState().setSessionMeta(ownerTabId, {
+          stdinId: undefined,
+          stdinReady: false,
+          lastProgressAt: undefined,
+        });
+      }
+    }));
+  })();
+  startupRecoveryPromise = recovery.catch((error) => {
+    // Permit an explicit retry, but never turn a failed startup barrier into a
+    // successful promise. Disk loading/spawn must remain fail-closed until the
+    // orphan process state is known and settled.
+    startupRecoveryPromise = null;
+    throw error;
+  });
+  return startupRecoveryPromise;
+}
+
+export const __sessionLifecycleTesting = {
+  resetStartupRecovery: () => { startupRecoveryPromise = null; },
+};
+
+/** Gracefully finish every persistent CLI child before the native app exits. */
+export async function gracefullyStopAllBackendProcesses(): Promise<void> {
+  const activeIds = await bridge.listActiveProcesses();
+  await Promise.all(activeIds.map(async (stdinId) => {
+    await bridge.gracefulStopSession(stdinId);
+    cleanupStdinRoute(stdinId);
+  }));
+}
+
+/** Settle persistent CLI children before replacing the Claude executable.
+ *
+ * Recoverable sessions go through the full frontend teardown path so their
+ * stdin route, listener bundle, partial output, and resumable CLI UUID remain
+ * internally consistent. Orphans have no UI owner to finalize and are safely
+ * drained directly by Rust before their stale route is removed.
+ */
+export async function settleBackendProcessesForCliUpdate(
+  activeIds: string[],
+): Promise<void> {
+  const plan = planCliUpdateSessions(activeIds);
+  if (plan.busyIds.length > 0) {
+    throw new Error(`CLI_UPDATE_SESSION_BUSY:${plan.busyIds.length}`);
+  }
+  if (plan.unknownIds.length > 0) {
+    throw new Error(`CLI_UPDATE_SESSION_UNKNOWN:${plan.unknownIds.length}`);
+  }
+
+  await Promise.all(plan.warmIds.map(async ({ stdinId, tabId }) => {
+    await teardownSession(stdinId, tabId, 'switch');
+  }));
+}
+
+export interface CliUpdateSessionPlan {
+  warmIds: Array<{ stdinId: string; tabId: string }>;
+  busyIds: Array<{ stdinId: string; tabId: string }>;
+  unknownIds: string[];
+}
+
+/** Classify ProcessManager children using the owning tab's live UI state.
+ * Completed/idle/stopped sessions are persistent warm connections and can be
+ * closed after confirmation. Generating, reconnecting, stopping, or waiting
+ * for a user answer must remain under the conversation's own Stop control.
+ */
+export function planCliUpdateSessions(activeIds: string[]): CliUpdateSessionPlan {
+  const plan: CliUpdateSessionPlan = { warmIds: [], busyIds: [], unknownIds: [] };
+  for (const stdinId of activeIds) {
+    const tabId = useSessionStore.getState().getTabForStdin(stdinId);
+    const tab = tabId ? useChatStore.getState().getTab(tabId) : undefined;
+    if (!tabId || !tab || tab.sessionMeta.stdinId !== stdinId) {
+      plan.unknownIds.push(stdinId);
+      continue;
+    }
+    const entry = { stdinId, tabId };
+    if (isSessionBusy(tab.sessionStatus) || tab.activityStatus.phase === 'awaiting') {
+      plan.busyIds.push(entry);
+    } else {
+      plan.warmIds.push(entry);
+    }
+  }
+  return plan;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +309,15 @@ export async function spawnSession(params: SpawnParams): Promise<SpawnResult> {
     setRunning = true,
   } = params;
   const rollbacks: (() => void)[] = [];
+
+  // Defense in depth for future spawn callers: Rust resolves provider secrets
+  // from providers.json, so no process may start while a newer UI edit exists
+  // only in memory. Current UI callers also flush before their config capture.
+  await useProviderStore.getState().flushSave();
+
+  // Do not spawn while a reload/startup orphan barrier is unresolved or
+  // failed. Otherwise two stdin owners may concurrently resume one CLI UUID.
+  await settleOrphanedBackendProcesses();
 
   try {
     // STEP 1: Register stdinTab mapping FIRST (triggers orphan drain)
@@ -332,9 +447,10 @@ const teardownTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 /**
  * Initiate a graceful CLI process shutdown:
  * 1. Set sessionStatus to 'stopping'
- * 2. Call bridge.killSession
- * 3. Do NOT unregister or clear listeners — process_exit handler does that
- * 4. 5-second timeout: force-finalize if process_exit never arrives
+ * 2. Ask Rust to stop and confirm child exit
+ * 3. Finalize locally only after that confirmation (safe fallback if the exit
+ *    event was lost)
+ * 4. On timeout/error, keep stdin ownership and fail closed
  */
 export async function teardownSession(
   stdinId: string,
@@ -345,21 +461,31 @@ export async function teardownSession(
   // Set stopping state
   useChatStore.getState().setSessionStatus(tabId, 'stopping');
 
-  // Start 5-second timeout BEFORE the bridge call. Rust's kill_session already
-  // waits up to 5s internally, so starting the timer after await would make the
-  // effective timeout ~10s. Using Promise.race keeps it at a true 5s.
+  let rejectTimeout: ((error: Error) => void) | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    rejectTimeout = reject;
+  });
   const timeoutId = setTimeout(() => {
     teardownTimeouts.delete(stdinId);
-    if (finalizedSet.has(stdinId)) return;
-    console.warn(`[sessionLifecycle] teardown timeout for ${stdinId} (reason: ${reason}) — force-finalizing`);
-    handleProcessExitFinalize(stdinId, true);
-  }, 5_000);
+    rejectTimeout?.(new Error(`SESSION_STOP_TIMEOUT: stdin_id=${stdinId}`));
+  }, 12_000);
   teardownTimeouts.set(stdinId, timeoutId);
 
-  // Race the kill against the timeout — whichever finishes first unblocks the caller.
-  const killPromise = bridge.killSession(stdinId).catch(() => { /* already dead */ });
-  const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 5_000));
-  await Promise.race([killPromise, timeoutPromise]);
+  const stopProcess = reason === 'stop' || reason === 'delete'
+    ? bridge.killSession(stdinId)
+    : bridge.gracefulStopSession(stdinId).then(() => undefined);
+  try {
+    await Promise.race([stopProcess, timeoutPromise]);
+  } catch (error) {
+    cancelTeardownTimeout(stdinId);
+    useChatStore.getState().setSessionStatus(tabId, 'error');
+    throw error;
+  }
+  cancelTeardownTimeout(stdinId);
+  // Rust now returns only after the child exit is confirmed. If the frontend
+  // process_exit event was dropped, authoritative backend confirmation makes
+  // local route finalization safe and prevents waitForStdinCleared deadlock.
+  if (!finalizedSet.has(stdinId)) handleProcessExitFinalize(stdinId);
 }
 
 /** Cancel any pending teardown timeout (called when process_exit arrives normally). */

@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { type ChatMessage, useChatStore } from '../../stores/chatStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
+import { buildAskUserQuestionAnswers } from '../../lib/ask-user-question';
 
 /** Decode literal Unicode escape sequences (e.g. `\u2014`) that appear in text. */
 function decodeUnicodeEscapes(text: string): string {
@@ -88,6 +89,7 @@ export function QuestionCard({ message, floating }: Props) {
   const interactionState = message.interactionState ?? (isFullyResolved ? 'resolved' : 'pending');
   const isSending = interactionState === 'sending';
   const isFailed = interactionState === 'failed';
+  const isExpired = interactionState === 'expired';
   // Phase 4 §5.3 (S3): the card can only submit once the CLI's control_request
   // has arrived with a requestId. Until then, buttons are disabled with a
   // "loading" label. After 5s without a requestId, surface a "retry sync" hint
@@ -131,19 +133,10 @@ export function QuestionCard({ message, floating }: Props) {
       const owner = resolveOwner();
       if (!owner) return;
       const { setInteractionState, setSessionStatus, setActivityStatus } = useChatStore.getState();
-      const answers: Record<string, string> = {};
-      questions.forEach((q, qIdx) => {
-        if (useOther[qIdx] && otherText[qIdx]?.trim()) {
-          answers[String(qIdx)] = otherText[qIdx].trim();
-        } else {
-          const selected = selectedMap[qIdx] || new Set<number>();
-          const labels = Array.from(selected)
-            .map((i) => q.options[i]?.label)
-            .filter(Boolean);
-          if (labels.length > 0) {
-            answers[String(qIdx)] = labels.join(', ');
-          }
-        }
+      const answers = buildAskUserQuestionAnswers(questions, {
+        selectedMap,
+        useOther,
+        otherText,
       });
       setInteractionState(owner.tabId, message.id, 'sending');
       try {
@@ -202,6 +195,11 @@ export function QuestionCard({ message, floating }: Props) {
           ? 'border-border-subtle bg-bg-secondary/20'
           : 'border-l-[3px] border-l-accent border-r border-t border-b border-r-accent/15 border-t-accent/15 border-b-accent/15 bg-gradient-to-r from-accent/[0.03] to-transparent'
         }`}>
+        {isExpired && (
+          <div className="px-3 py-2 text-xs text-text-tertiary border-b border-border-subtle/50">
+            {message.interactionError || t('msg.requestCancelled')}
+          </div>
+        )}
 
         {/* Already answered questions — timeline view */}
         {Object.keys(answeredMap).length > 0 && (
@@ -286,6 +284,7 @@ export function QuestionCard({ message, floating }: Props) {
                   <button
                     key={optIdx}
                     onClick={() => handleToggle(optIdx, !!currentQ.multiSelect)}
+                    data-testid={`ask-question-option-${currentIdx}-${optIdx}`}
                     className={`text-left px-3 py-2 rounded-md text-xs
                       transition-all duration-150 border cursor-pointer
                       hover:scale-[1.01]
@@ -305,6 +304,7 @@ export function QuestionCard({ message, floating }: Props) {
               {/* Other option */}
               <button
                 onClick={handleOtherToggle}
+                data-testid={`ask-question-other-${currentIdx}`}
                 className={`text-left px-3 py-2 rounded-md text-xs
                   transition-all duration-150 border cursor-pointer
                   hover:scale-[1.01]
@@ -326,6 +326,7 @@ export function QuestionCard({ message, floating }: Props) {
                   onChange={(e) => setOtherText((p) => ({ ...p, [currentIdx]: e.target.value }))}
                   placeholder={t('msg.questionOtherPlaceholder')}
                   autoFocus
+                  data-testid={`ask-question-other-input-${currentIdx}`}
                   className="w-full max-w-xs px-3 py-1.5 rounded-md text-xs
                     bg-transparent border border-border-subtle
                     focus:border-border-focus outline-none text-text-primary
@@ -363,6 +364,7 @@ export function QuestionCard({ message, floating }: Props) {
               <button
                 onClick={handleConfirm}
                 disabled={!hasCurrentSelection || isSending || awaitingSdkPatch}
+                data-testid="ask-question-confirm"
                 className={`px-4 py-1.5 rounded-md text-xs font-semibold
                   bg-accent text-text-inverse hover:bg-accent-hover
                   transition-smooth cursor-pointer shadow-sm
@@ -378,6 +380,7 @@ export function QuestionCard({ message, floating }: Props) {
               <button
                 onClick={handleSkip}
                 disabled={isSending || awaitingSdkPatch}
+                data-testid="ask-question-skip"
                 className="px-3 py-1.5 rounded-md text-xs font-medium
                   text-text-tertiary hover:text-text-primary
                   hover:bg-bg-tertiary transition-smooth cursor-pointer

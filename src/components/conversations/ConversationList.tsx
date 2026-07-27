@@ -13,9 +13,43 @@ import { SessionGroup } from './SessionGroup';
 import { SessionItem } from './SessionItem';
 import { SessionContextMenu, ProjectContextMenu, GroupContextMenu } from './SessionContextMenu';
 import { useGroupStore } from '../../stores/groupStore';
+import { useForkStore } from '../../stores/forkStore';
 import { initGroupPersistence } from '../../stores/groupPersistence';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
-import { teardownSession, waitForStdinCleared } from '../../lib/sessionLifecycle';
+import {
+  settleOrphanedBackendProcesses,
+  teardownSession,
+  waitForStdinCleared,
+} from '../../lib/sessionLifecycle';
+import {
+  filterSessionsForConversationView,
+  groupsForConversationView,
+  toggleArchivedSession,
+  type ConversationView,
+} from '../../lib/conversation-archive';
+
+function closePlanPanelForComparison() {
+  window.dispatchEvent(new CustomEvent('blackbox:close-plan-panel'));
+}
+
+let pinnedMetadataWriteQueue: Promise<void> = Promise.resolve();
+let archivedMetadataWriteQueue: Promise<void> = Promise.resolve();
+
+function enqueuePinnedMetadata(ids: string[]) {
+  pinnedMetadataWriteQueue = pinnedMetadataWriteQueue
+    .then(() => bridge.savePinnedSessions(ids))
+    .catch((error) => {
+      console.error('[BLACKBOX Metadata] Failed to persist pinned sessions:', error);
+    });
+}
+
+function enqueueArchivedMetadata(ids: string[]) {
+  archivedMetadataWriteQueue = archivedMetadataWriteQueue
+    .then(() => bridge.saveArchivedSessions(ids))
+    .catch((error) => {
+      console.error('[BLACKBOX Metadata] Failed to persist archived sessions:', error);
+    });
+}
 
 // --- Path utilities ---
 
@@ -62,16 +96,10 @@ function normalizeProjectKey(raw: string): string {
   return raw;
 }
 
-/** Extract display label from a project key.
- *  When `parentHint` is true (duplicate names), appends parent folder:
- *  "A (Desktop)" vs "A (坚果云)" */
-function projectLabel(project: string, parentHint?: boolean): string {
+/** Extract the leaf workspace name. The full path remains internal context. */
+export function projectLabel(project: string): string {
   const parts = project.replace(/^~[\\/]/, '').split(/[\\/]/);
-  const name = parts[parts.length - 1] || project;
-  if (parentHint && parts.length >= 2) {
-    return `${name} (${parts[parts.length - 2]})`;
-  }
-  return name;
+  return parts[parts.length - 1] || project;
 }
 
 // --- Context menu types ---
@@ -103,11 +131,31 @@ export function ConversationList() {
   const setSelected = useSessionStore((s) => s.setSelectedSession);
   const customPreviews = useSessionStore((s) => s.customPreviews);
   const setCustomPreview = useSessionStore((s) => s.setCustomPreview);
+  const loadCustomPreviewsFromDisk = useSessionStore((s) => s.loadCustomPreviewsFromDisk);
   const runningSessions = useSessionStore((s) => s.runningSessions);
   const contentSearchResults = useSessionStore((s) => s.contentSearchResults);
   const isContentSearching = useSessionStore((s) => s.isContentSearching);
   const searchSessionContent = useSessionStore((s) => s.searchSessionContent);
   const clearContentSearch = useSessionStore((s) => s.clearContentSearch);
+  const selectedFork = useForkStore((s) => selectedId ? s.forks[selectedId] : undefined);
+  const selectedUserTurnCount = useChatStore((s) => selectedId
+    ? (s.tabs.get(selectedId)?.messages.filter((message) => message.role === 'user').length ?? 0)
+    : 0);
+  const selectedInputDraft = useChatStore((s) => selectedId
+    ? (s.tabs.get(selectedId)?.inputDraft ?? '')
+    : '');
+
+  useEffect(() => {
+    if (
+      !selectedId
+      || selectedFork?.forkPoint !== 'checkpoint'
+      || !selectedFork.checkpointTurnIndex
+      || !selectedFork.checkpointPreview
+      || selectedUserTurnCount !== selectedFork.checkpointTurnIndex - 1
+      || selectedInputDraft.trim()
+    ) return;
+    useChatStore.getState().setInputDraft(selectedId, selectedFork.checkpointPreview);
+  }, [selectedFork, selectedId, selectedInputDraft, selectedUserTurnCount]);
 
   // Context menus
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -126,6 +174,9 @@ export function ConversationList() {
     projectKey: string;
     count: number;
   } | null>(null);
+  const [forkNotice, setForkNotice] = useState<string | null>(null);
+  const [startupRecoveryError, setStartupRecoveryError] = useState(false);
+  const [startupRecoveryAttempt, setStartupRecoveryAttempt] = useState(0);
 
   // Shift+click multi-select: track last clicked index
   const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null);
@@ -134,19 +185,18 @@ export function ConversationList() {
   const [manualExpanded, setManualExpanded] = useState<Set<string>>(new Set());
   const [manualCollapsed, setManualCollapsed] = useState<Set<string>>(new Set());
 
-  // Pinned & archived (Phase 3)
-  const [pinnedSessions, setPinnedSessions] = useState<Set<string>>(() => {
-    try {
-      const data = localStorage.getItem('blackbox_pinned_sessions');
-      return new Set(data ? JSON.parse(data) : []);
-    } catch { return new Set(); }
-  });
-  const [archivedSessions, setArchivedSessions] = useState<Set<string>>(() => {
-    try {
-      const data = localStorage.getItem('blackbox_archived_sessions');
-      return new Set(data ? JSON.parse(data) : []);
-    } catch { return new Set(); }
-  });
+  // The archive is a separate conversation view, not a destructive move. Task
+  // groups keep their ledger identity but start collapsed every time history is
+  // opened. Workspace headers stay visible so archived group names are easy to find.
+  const [conversationView, setConversationView] = useState<ConversationView>('active');
+  const [archiveExpandedGroups, setArchiveExpandedGroups] = useState<Set<string>>(new Set());
+  const [archiveCollapsedProjects, setArchiveCollapsedProjects] = useState<Set<string>>(new Set());
+
+  // Black Box's on-disk session_metadata.json is the sole authority for pins,
+  // archive state, task groups, and ordering. React state is only the hydrated
+  // view; localStorage must not compete with restore/import tombstones.
+  const [pinnedSessions, setPinnedSessions] = useState<Set<string>>(new Set());
+  const [archivedSessions, setArchivedSessions] = useState<Set<string>>(new Set());
 
   // Refresh animation
   const [refreshing, setRefreshing] = useState(false);
@@ -179,47 +229,92 @@ export function ConversationList() {
   // Persist pinned/archived
   const persistPinned = useCallback((next: Set<string>) => {
     setPinnedSessions(next);
-    localStorage.setItem('blackbox_pinned_sessions', JSON.stringify([...next]));
-    bridge.savePinnedSessions([...next]).catch(() => {});
+    enqueuePinnedMetadata([...next]);
+  }, []);
+
+  const persistArchived = useCallback((next: Set<string>) => {
+    setArchivedSessions(next);
+    enqueueArchivedMetadata([...next]);
   }, []);
 
   // Load pinned/archived from backend on init
   useEffect(() => {
     bridge.loadPinnedSessions?.()
       .then((data: string[]) => {
-        if (data?.length) setPinnedSessions(new Set(data));
+        if (Array.isArray(data)) setPinnedSessions(new Set(data));
       })
       .catch(() => {});
     bridge.loadArchivedSessions?.()
       .then((data: string[]) => {
-        if (data?.length) setArchivedSessions(new Set(data));
+        if (Array.isArray(data)) {
+          setArchivedSessions(new Set(data));
+        }
       })
       .catch(() => {});
   }, []);
 
   // Load session groups from disk + keep disk in sync on every change
   useEffect(() => {
-    initGroupPersistence();
+    initGroupPersistence().catch((error) => {
+      console.error('[BLACKBOX Metadata] Failed to hydrate session groups:', error);
+    });
   }, []);
+
+  // A portable organization import updates the unified on-disk authority.
+  // Rehydrate every projection together so the sidebar reflects the merge
+  // immediately without restarting Black Box.
+  useEffect(() => {
+    const reloadOrganization = () => {
+      Promise.all([
+        bridge.loadPinnedSessions(),
+        bridge.loadArchivedSessions(),
+        initGroupPersistence(),
+        loadCustomPreviewsFromDisk(),
+      ])
+        .then(([pinned, archived]) => {
+          if (Array.isArray(pinned)) setPinnedSessions(new Set(pinned));
+          if (Array.isArray(archived)) setArchivedSessions(new Set(archived));
+          return fetchSessions();
+        })
+        .catch((error) => {
+          console.error('[BLACKBOX Metadata] Failed to refresh imported organization:', error);
+        });
+    };
+    window.addEventListener('blackbox:session-organization-imported', reloadOrganization);
+    return () => window.removeEventListener('blackbox:session-organization-imported', reloadOrganization);
+  }, [fetchSessions, loadCustomPreviewsFromDisk]);
 
   // Initial fetch + polling
   useEffect(() => {
-    fetchSessions().then(() => {
-      const currentSelected = useSessionStore.getState().selectedSessionId;
-      if (!currentSelected) {
-        const lastId = useSessionStore.getState().getLastSessionId();
-        if (lastId) {
-          const sessions = useSessionStore.getState().sessions;
-          const match = sessions.find((s) => s.id === lastId);
-          if (match) {
-            handleLoadSession(match);
+    let cancelled = false;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    setStartupRecoveryError(false);
+    settleOrphanedBackendProcesses()
+      .then(() => fetchSessions())
+      .then(() => {
+        if (cancelled) return;
+        const currentSelected = useSessionStore.getState().selectedSessionId;
+        if (!currentSelected) {
+          const lastId = useSessionStore.getState().getLastSessionId();
+          if (lastId) {
+            const sessions = useSessionStore.getState().sessions;
+            const match = sessions.find((s) => s.id === lastId);
+            if (match) {
+              handleLoadSession(match);
+            }
           }
         }
-      }
-    });
-    const interval = setInterval(fetchSessions, 30000);
-    return () => clearInterval(interval);
-  }, []);
+        interval = setInterval(fetchSessions, 30000);
+      })
+      .catch((error) => {
+        console.error('[BLACKBOX] Session recovery barrier failed; disk restore is paused:', error);
+        if (!cancelled) setStartupRecoveryError(true);
+      });
+    return () => {
+      cancelled = true;
+      if (interval) clearInterval(interval);
+    };
+  }, [startupRecoveryAttempt]);
 
   // Listen for sessions:changed event for instant refresh
   useEffect(() => {
@@ -247,12 +342,14 @@ export function ConversationList() {
     return customPreviews[session.id] || session.preview || '';
   }, [customPreviews]);
 
-  // Filtered sessions (search + archive)
-  const filtered = useMemo(() => {
-    let result = sessions;
+  const archivedVisualState = useMemo(
+    () => conversationView === 'archived' ? new Set<string>() : archivedSessions,
+    [conversationView, archivedSessions],
+  );
 
-    // Always hide archived sessions
-    result = result.filter((s) => !archivedSessions.has(s.id));
+  // Filtered sessions (search + selected conversation view)
+  const filtered = useMemo(() => {
+    let result = filterSessionsForConversationView(sessions, archivedSessions, conversationView);
 
     // Search
     if (searchQuery.trim()) {
@@ -266,7 +363,7 @@ export function ConversationList() {
     }
 
     return result;
-  }, [sessions, searchQuery, displayName, archivedSessions]);
+  }, [sessions, searchQuery, displayName, archivedSessions, conversationView]);
 
   // Group by project
   const projectGroups = useMemo(() => {
@@ -296,10 +393,9 @@ export function ConversationList() {
     return sessions.filter((s) => {
       if (metadataIds.has(s.id)) return false;
       if (!contentSearchResults.has(s.id)) return false;
-      // Always hide archived sessions
-      return !archivedSessions.has(s.id);
+      return archivedSessions.has(s.id) === (conversationView === 'archived');
     });
-  }, [sessions, filtered, contentSearchResults, searchQuery, archivedSessions]);
+  }, [sessions, filtered, contentSearchResults, searchQuery, archivedSessions, conversationView]);
 
   // Smart expand: expand if contains selected, or manually expanded
   const isExpanded = useCallback((key: string) => {
@@ -326,10 +422,43 @@ export function ConversationList() {
     }
   }, [isExpanded]);
 
+  const isProjectExpanded = useCallback((project: string) => {
+    if (conversationView === 'archived') return !archiveCollapsedProjects.has(project);
+    return isExpanded(project);
+  }, [conversationView, archiveCollapsedProjects, isExpanded]);
+
+  const handleToggleProjectCollapse = useCallback((project: string) => {
+    if (conversationView === 'active') {
+      toggleCollapse(project);
+      return;
+    }
+    setArchiveCollapsedProjects((previous) => {
+      const next = new Set(previous);
+      if (next.has(project)) next.delete(project);
+      else next.add(project);
+      return next;
+    });
+  }, [conversationView, toggleCollapse]);
+
+  const switchConversationView = useCallback((view: ConversationView) => {
+    setConversationView(view);
+    setContextMenu(null);
+    setProjectMenu(null);
+    setGroupMenu(null);
+    setMultiSelect(false);
+    setSelectedIds(new Set());
+    if (view === 'archived') {
+      // History can be large: task groups always enter collapsed by default.
+      setArchiveExpandedGroups(new Set());
+      setArchiveCollapsedProjects(new Set());
+    }
+  }, []);
+
   // --- Session loading (slim version using session-loader) ---
   const handleLoadSession = useCallback(async (session: SessionListItem) => {
     const { path: sessionPath, id: sessionId, project: projectOrDir } = session;
     const currentTabId = selectedId;
+    useSettingsStore.getState().setMainView('chat');
     if (currentTabId === sessionId) return;
 
     // Save current to cache
@@ -367,13 +496,20 @@ export function ConversationList() {
     useSettingsStore.getState().setWorkingDirectory(resolveProjectPath(projectOrDir));
     const { clearMessages, addMessage, setSessionStatus, setSessionMeta } = useChatStore.getState();
     const agentActions = useAgentStore.getState();
+    const hydrationGeneration = generateMessageId();
     clearMessages(sessionId);
     agentActions.clearAgents();
     setSessionStatus(sessionId, 'running');
     // TK-329: explicitly clear stdinId when loading from disk — no live process exists yet.
     // Only set the CLI UUID (for resume). Prevents inheriting a stale stdinId
     // from a previous session that might still be alive in the backend.
-    setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+    setSessionMeta(sessionId, {
+      sessionId,
+      stdinId: undefined,
+      stdinReady: false,
+      hydratingFromDisk: true,
+      hydrationGeneration,
+    });
     // PRD §9: Write cliResumeId in sessionStore — InputBar reads this for resume
     useSessionStore.getState().setCliResumeId(sessionId, sessionId);
 
@@ -382,7 +518,23 @@ export function ConversationList() {
       if (useSessionStore.getState().selectedSessionId !== sessionId) {
         return;
       }
+      if (
+        useChatStore.getState().getTab(sessionId)?.sessionMeta.hydrationGeneration
+        !== hydrationGeneration
+      ) {
+        return;
+      }
       const { messages, agents } = parseSessionMessages(rawMessages);
+      setSessionMeta(sessionId, {
+        // A durable disk transcript remains a valid resume target even when
+        // its only visible assistant output is a tool card or its compact
+        // summary is intentionally hidden by the presentation parser.
+        turnAcceptedForResume: messages.some(
+          (message) => message.role === 'user' || message.role === 'assistant',
+        ),
+        hydratingFromDisk: false,
+        hydrationGeneration: undefined,
+      });
 
       // Apply agents
       for (const agent of agents) {
@@ -401,9 +553,34 @@ export function ConversationList() {
         }
       }
 
+      // A historical fork branches immediately before the selected user turn.
+      // Keep that original prompt editable even after an app reload, but stop
+      // restoring it once the child has accepted any replacement turn.
+      const fork = useForkStore.getState().forks[sessionId];
+      const childUserTurns = messages.filter((message) => message.role === 'user').length;
+      if (
+        fork?.forkPoint === 'checkpoint'
+        && fork.checkpointTurnIndex
+        && fork.checkpointPreview
+        && childUserTurns === fork.checkpointTurnIndex - 1
+        && !useChatStore.getState().getTab(sessionId)?.inputDraft.trim()
+      ) {
+        useChatStore.getState().setInputDraft(sessionId, fork.checkpointPreview);
+      }
+
       setSessionStatus(sessionId, 'completed');
     } catch (err) {
       if (useSessionStore.getState().selectedSessionId !== sessionId) return;
+      if (
+        useChatStore.getState().getTab(sessionId)?.sessionMeta.hydrationGeneration
+        !== hydrationGeneration
+      ) {
+        return;
+      }
+      setSessionMeta(sessionId, {
+        hydratingFromDisk: false,
+        hydrationGeneration: undefined,
+      });
       setSessionStatus(sessionId, 'error');
       addMessage(sessionId, {
         id: generateMessageId(),
@@ -414,6 +591,28 @@ export function ConversationList() {
       });
     }
   }, [selectedId, setSelected, t]);
+
+  useEffect(() => {
+    const handleOpenSession = (event: Event) => {
+      const detail = (event as CustomEvent<{ sessionId?: string; draftText?: string }>).detail;
+      const sessionId = detail?.sessionId;
+      if (!sessionId) return;
+      const session = useSessionStore.getState().sessions.find((item) => item.id === sessionId);
+      if (session) {
+        void handleLoadSession(session).then(() => {
+          const draftText = detail?.draftText?.trim();
+          if (!draftText || useSessionStore.getState().selectedSessionId !== sessionId) return;
+          const existing = useChatStore.getState().getTab(sessionId)?.inputDraft.trim() || '';
+          useChatStore.getState().setInputDraft(
+            sessionId,
+            existing ? `${existing}\n\n${draftText}` : draftText,
+          );
+        });
+      }
+    };
+    window.addEventListener('blackbox:open-session', handleOpenSession);
+    return () => window.removeEventListener('blackbox:open-session', handleOpenSession);
+  }, [handleLoadSession]);
 
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {
@@ -451,11 +650,24 @@ export function ConversationList() {
       // Phase 3 §3.1: drop per-tab path grants so an authorized external
       // file can't be read again after the tab is gone.
       bridge.clearPathGrants(sessionId).catch(() => {});
+      useGroupStore.getState().removeFromGroup(sessionId);
+      useForkStore.getState().removeFork(sessionId);
       fetchSessions();
+      return true;
     } catch (err) {
       console.error('Failed to delete session:', err);
+      return false;
     }
   }, [selectedId, setSelected, fetchSessions]);
+
+  const pruneSessionMetadata = useCallback((sessionIds: Iterable<string>) => {
+    const removed = new Set(sessionIds);
+    if (removed.size === 0) return;
+    const nextPinned = new Set([...pinnedSessions].filter((id) => !removed.has(id)));
+    const nextArchived = new Set([...archivedSessions].filter((id) => !removed.has(id)));
+    if (nextPinned.size !== pinnedSessions.size) persistPinned(nextPinned);
+    if (nextArchived.size !== archivedSessions.size) persistArchived(nextArchived);
+  }, [pinnedSessions, archivedSessions, persistPinned, persistArchived]);
 
   // Single delete → confirm dialog
   const handleDeleteSingle = useCallback((session: SessionListItem) => {
@@ -482,12 +694,14 @@ export function ConversationList() {
       const raw = s.project || s.projectDir;
       return raw.endsWith(suffix);
     });
+    const deleted: string[] = [];
     for (const session of projectSessions) {
-      await executeDelete(session.id, session.path);
+      if (await executeDelete(session.id, session.path)) deleted.push(session.id);
     }
+    pruneSessionMetadata(deleted);
     setDeleteAllTarget(null);
     fetchSessions();
-  }, [deleteAllTarget, executeDelete, fetchSessions]);
+  }, [deleteAllTarget, executeDelete, fetchSessions, pruneSessionMetadata]);
 
   // --- Context menu handlers ---
   const handleContextMenu = useCallback((e: React.MouseEvent, session: SessionListItem) => {
@@ -518,6 +732,7 @@ export function ConversationList() {
   }, []);
 
   const handleNewSessionInProject = useCallback((projectKey: string) => {
+    useSettingsStore.getState().setMainView('chat');
     const suffix = projectKey.replace(/^~/, '');
     const allSessions = useSessionStore.getState().sessions;
     const match = allSessions.find((s) => {
@@ -534,8 +749,103 @@ export function ConversationList() {
     const newDraftId = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     useChatStore.getState().ensureTab(newDraftId);
     useChatStore.getState().resetTab(newDraftId);
+    // Agent Teams are session-scoped. A new draft starts with a clean live
+    // roster even when the previous conversation keeps idle teammates cached.
+    useAgentStore.getState().restoreFromCache(newDraftId);
     useSessionStore.getState().addDraftSession(newDraftId, realPath);
     return newDraftId;
+  }, []);
+
+  const handleForkSession = useCallback(async (session: SessionListItem) => {
+    if (!session.path || runningSessions.has(session.id)) return;
+    const parentThreadId = session.cliResumeId || session.id;
+    const cwd = resolveProjectPath(session.project || session.projectDir);
+
+    try {
+      const location = await bridge.getTaskLocation(parentThreadId, cwd);
+      if (location.currentLocation === 'worktree') {
+        setForkNotice(t('conv.forkWorktreeBlocked'));
+        return;
+      }
+    } catch {
+      // A non-Git conversation has no task-location record; it is still safe
+      // to fork because Claude Code only clones conversation context.
+    }
+
+    let draftId: string | null = null;
+    try {
+      const rawMessages = await bridge.loadSession(session.path);
+      const { messages, agents } = parseSessionMessages(rawMessages);
+      const currentTabId = useSessionStore.getState().selectedSessionId;
+      if (currentTabId) {
+        useChatStore.getState().saveToCache(currentTabId);
+        useAgentStore.getState().saveToCache(currentTabId);
+      }
+
+      draftId = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const parentTitle = displayName(session) || t('conv.empty');
+      const chat = useChatStore.getState();
+      chat.ensureTab(draftId);
+      chat.resetTab(draftId);
+      for (const message of messages) {
+        if (message.toolResultContent) {
+          const { toolResultContent, ...baseMessage } = message;
+          chat.addMessage(draftId, baseMessage);
+          chat.updateMessage(draftId, message.id, { toolResultContent });
+        } else {
+          chat.addMessage(draftId, message);
+        }
+      }
+      chat.setSessionStatus(draftId, 'completed');
+      chat.setSessionMeta(draftId, {
+        forkSourceId: parentThreadId,
+        sessionId: undefined,
+        stdinId: undefined,
+        cwdSnapshot: cwd,
+        turnAcceptedForResume: false,
+      });
+
+      const agentStore = useAgentStore.getState();
+      agentStore.clearAgents();
+      for (const agent of agents) agentStore.upsertAgent(agent);
+      agentStore.saveToCache(draftId);
+
+      useForkStore.getState().createPendingFork(draftId, parentThreadId, parentTitle, cwd);
+      useSessionStore.getState().addDraftSession(draftId, cwd);
+      useSessionStore.getState().setCustomPreview(
+        draftId,
+        parentTitle ? `${parentTitle} · ${t('conv.fork')}` : t('conv.forkDefaultTitle'),
+      );
+
+      const parentGroup = useGroupStore.getState().groups.find(
+        (group) => group.sessionIds.includes(session.id),
+      );
+      if (parentGroup) useGroupStore.getState().addToGroup(draftId, parentGroup.id);
+
+      useSettingsStore.getState().setMainView('chat');
+      useSettingsStore.getState().setWorkingDirectory(cwd);
+      useFileStore.getState().closePreview();
+      setConversationView('active');
+    } catch (error) {
+      if (draftId) {
+        useForkStore.getState().removeFork(draftId);
+        useSessionStore.getState().removeDraft(draftId);
+        useChatStore.getState().removeTab(draftId);
+        useAgentStore.getState().clearCacheForTab(draftId);
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      setForkNotice(`${t('conv.forkFailed')}: ${detail}`);
+    }
+  }, [displayName, runningSessions, t]);
+
+  const handleCompareSession = useCallback((session: SessionListItem) => {
+    const activeThreadId = useSessionStore.getState().selectedSessionId;
+    if (!activeThreadId || activeThreadId === session.id || !session.path) return;
+    const settings = useSettingsStore.getState();
+    if (settings.secondaryPanelOpen) settings.toggleSecondaryPanel();
+    closePlanPanelForComparison();
+    useForkStore.getState().openComparison(session.id);
+    settings.setMainView('chat');
   }, []);
 
   // New session that lands straight into a task group: create it in the group's
@@ -561,6 +871,10 @@ export function ConversationList() {
     else next.add(session.id);
     persistPinned(next);
   }, [pinnedSessions, persistPinned]);
+
+  const handleToggleArchive = useCallback((session: SessionListItem) => {
+    persistArchived(toggleArchivedSession(archivedSessions, session.id));
+  }, [archivedSessions, persistArchived]);
 
   // --- Session group handlers ---
   // Create an empty group in a workspace (workspace header → "create group").
@@ -601,24 +915,33 @@ export function ConversationList() {
   }, []);
 
   const handleToggleGroupCollapse = useCallback((groupId: string) => {
+    if (conversationView === 'archived') {
+      setArchiveExpandedGroups((previous) => {
+        const next = new Set(previous);
+        if (next.has(groupId)) next.delete(groupId);
+        else next.add(groupId);
+        return next;
+      });
+      return;
+    }
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
       if (next.has(groupId)) next.delete(groupId);
       else next.add(groupId);
       return next;
     });
-  }, []);
+  }, [conversationView]);
 
   // Build flat list of visible session IDs for shift+click range selection
   const flatSessionIds = useMemo(() => {
     const ids: string[] = [];
     for (const [project, items] of projectGroups) {
-      if (isExpanded(project)) {
+      if (isProjectExpanded(project)) {
         for (const s of items) ids.push(s.id);
       }
     }
     return ids;
-  }, [projectGroups, isExpanded]);
+  }, [projectGroups, isProjectExpanded]);
 
   // Multi-select handlers (with shift+click range support)
   const handleToggleCheck = useCallback((sessionId: string, shiftKey?: boolean) => {
@@ -659,17 +982,31 @@ export function ConversationList() {
     });
   }, [selectedIds]);
 
+  const handleBatchArchive = useCallback(() => {
+    if (selectedIds.size === 0) return;
+    const next = new Set(archivedSessions);
+    for (const id of selectedIds) {
+      if (conversationView === 'archived') next.delete(id);
+      else next.add(id);
+    }
+    persistArchived(next);
+    setSelectedIds(new Set());
+    setMultiSelect(false);
+  }, [selectedIds, archivedSessions, conversationView, persistArchived]);
+
   const confirmBatchDelete = useCallback(async () => {
     const allSessions = useSessionStore.getState().sessions;
+    const deleted: string[] = [];
     for (const id of selectedIds) {
       const session = allSessions.find((s) => s.id === id);
-      if (session) await executeDelete(session.id, session.path);
+      if (session && await executeDelete(session.id, session.path)) deleted.push(session.id);
     }
+    pruneSessionMetadata(deleted);
     setSelectedIds(new Set());
     setMultiSelect(false);
     setDeleteAllTarget(null);
     fetchSessions();
-  }, [selectedIds, executeDelete, fetchSessions]);
+  }, [selectedIds, executeDelete, fetchSessions, pruneSessionMetadata]);
 
   const handleRename = useCallback((sessionId: string, newName: string) => {
     setCustomPreview(sessionId, newName);
@@ -687,8 +1024,48 @@ export function ConversationList() {
 
   return (
     <div className="flex flex-col gap-1 px-3">
-      {/* Search + Filters */}
-      <div className="px-1 mb-2">
+      {startupRecoveryError && (
+        <div
+          data-testid="session-recovery-blocked"
+          className="mb-2 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2
+            text-[10px] leading-relaxed text-warning"
+        >
+          <div>{t('conv.recoveryBlocked')}</div>
+          <button
+            type="button"
+            className="mt-1 font-medium underline underline-offset-2 hover:text-text-primary"
+            onClick={() => setStartupRecoveryAttempt((attempt) => attempt + 1)}
+          >
+            {t('conv.retryRecovery')}
+          </button>
+        </div>
+      )}
+      {/* Active / archive switch + search */}
+      <div className="px-1 mb-2 space-y-2">
+        <div
+          data-testid="conversation-view-toggle"
+          className="grid grid-cols-2 gap-1 rounded-lg bg-bg-tertiary/70 p-1"
+        >
+          {([
+            ['active', t('conv.activeView')],
+            ['archived', t('conv.archivedView')],
+          ] as const).map(([view, label]) => (
+            <button
+              key={view}
+              type="button"
+              data-testid={`conversation-view-${view}`}
+              aria-pressed={conversationView === view}
+              onClick={() => switchConversationView(view)}
+              className={`flex min-w-0 items-center justify-center gap-1.5 rounded-md px-2 py-1.5
+                text-[11px] transition-smooth
+                ${conversationView === view
+                  ? 'bg-bg-card text-text-primary shadow-sm'
+                  : 'text-text-tertiary hover:text-text-muted'}`}
+            >
+              <span className="truncate">{label}</span>
+            </button>
+          ))}
+        </div>
         <div className="flex items-center gap-2">
           <div className="flex-1 min-w-0 flex items-center gap-2 px-2.5 py-1.5 rounded-md
             bg-bg-tertiary
@@ -730,26 +1107,36 @@ export function ConversationList() {
         </div>
       )}
 
-      {/* Project groups — detect duplicate folder names for disambiguation */}
+      {/* Project groups — the sidebar intentionally shows only the leaf folder name. */}
       {projectGroups.map(([project, items]) => {
-        const baseName = projectLabel(project);
-        const isDuplicate = projectGroups.filter(([k]) => projectLabel(k) === baseName).length > 1;
+        const workspaceGroups = groups.filter((group) => group.workspace === project);
+        const visibleWorkspaceGroups = groupsForConversationView(
+          workspaceGroups,
+          items,
+          conversationView,
+        );
+        const viewCollapsedGroups = conversationView === 'archived'
+          ? new Set(
+              visibleWorkspaceGroups
+                .filter((group) => !archiveExpandedGroups.has(group.id))
+                .map((group) => group.id),
+            )
+          : collapsedGroups;
         return (
         <SessionGroup
           key={project}
           projectKey={project}
-          projectLabel={projectLabel(project, isDuplicate)}
-          projectPath={project}
+          projectLabel={projectLabel(project)}
           sessions={items}
-          isExpanded={isExpanded(project)}
+          isExpanded={isProjectExpanded(project)}
           selectedId={selectedId}
           runningSessions={runningSessions}
           pinnedSessions={pinnedSessions}
-          archivedSessions={archivedSessions}
+          archivedSessions={archivedVisualState}
           customPreviews={customPreviews}
           multiSelect={multiSelect}
           selectedIds={selectedIds}
-          onToggleCollapse={toggleCollapse}
+          onToggleCollapse={handleToggleProjectCollapse}
           onContextMenu={handleContextMenu}
           onProjectContextMenu={handleProjectContextMenu}
           onLoadSession={handleLoadSession}
@@ -758,8 +1145,8 @@ export function ConversationList() {
           onToggleCheck={handleToggleCheck}
           renamingSessionId={renamingSessionId}
           onRenameDone={() => setRenamingSessionId(null)}
-          workspaceGroups={groups.filter((g) => g.workspace === project)}
-          collapsedGroups={collapsedGroups}
+          workspaceGroups={visibleWorkspaceGroups}
+          collapsedGroups={viewCollapsedGroups}
           onToggleGroupCollapse={handleToggleGroupCollapse}
           onGroupContextMenu={handleGroupContextMenu}
           renamingGroupId={renamingGroupId}
@@ -767,6 +1154,7 @@ export function ConversationList() {
           onRenameGroupCancel={() => setRenamingGroupId(null)}
           onReorderGroups={handleReorderGroups}
           onNewSessionInGroup={handleNewSessionInGroup}
+          readOnly={conversationView === 'archived'}
         />
         );
       })}
@@ -790,7 +1178,7 @@ export function ConversationList() {
                 isSelected={selectedId === session.id}
                 isRunning={runningSessions.has(session.id)}
                 isPinned={pinnedSessions.has(session.id)}
-                isArchived={archivedSessions.has(session.id)}
+                isArchived={conversationView === 'active' && archivedSessions.has(session.id)}
                 displayName={displayName(session)}
                 contentSnippet={result?.snippet}
                 matchCount={result?.match_count}
@@ -822,7 +1210,11 @@ export function ConversationList() {
       {!isLoading && filtered.length === 0 && contentOnlyMatches.length === 0 && !isContentSearching && (
         <div className="text-center py-6 px-4">
           <div className="text-text-tertiary text-xs">
-            {searchQuery ? t('conv.noMatch') : t('conv.noConv')}
+            {searchQuery
+              ? t('conv.noMatch')
+              : conversationView === 'archived'
+                ? t('conv.noArchived')
+                : t('conv.noConv')}
           </div>
         </div>
       )}
@@ -859,6 +1251,14 @@ export function ConversationList() {
             {t('conv.selected').replace('{n}', String(selectedIds.size))}
           </span>
           <button
+            onClick={handleBatchArchive}
+            disabled={selectedIds.size === 0}
+            className="px-2 py-1 text-xs rounded-md bg-accent/10 text-accent
+              hover:bg-accent/20 transition-smooth disabled:opacity-30"
+          >
+            {conversationView === 'archived' ? t('conv.unarchive') : t('conv.archive')}
+          </button>
+          <button
             onClick={handleBatchDelete}
             disabled={selectedIds.size === 0}
             className="px-2 py-1 text-xs rounded-md bg-error/10 text-error
@@ -888,25 +1288,35 @@ export function ConversationList() {
           y={contextMenu.y}
           session={contextMenu.session}
           onRename={handleRenameFromMenu}
+          onFork={contextMenu.session.path ? handleForkSession : undefined}
+          forkDisabled={runningSessions.has(contextMenu.session.id)}
+          onCompare={contextMenu.session.path ? handleCompareSession : undefined}
+          compareDisabled={!selectedId
+            || selectedId === contextMenu.session.id
+            || runningSessions.has(contextMenu.session.id)}
           onRevealInFinder={handleRevealInFinder}
           onExport={handleExportMarkdown}
           onDelete={handleDeleteSingle}
-          onPin={handleTogglePin}
+          onPin={conversationView === 'active' ? handleTogglePin : undefined}
           isPinned={pinnedSessions.has(contextMenu.session.id)}
-          onCreateGroupWithSession={handleCreateGroupWithSession}
-          availableGroups={wsGroups
-            .filter((g) => g.id !== currentGroup?.id)
-            .map((g) => ({ id: g.id, label: g.label }))}
-          onAddToGroup={handleAddToGroup}
-          currentGroupId={currentGroup?.id ?? null}
-          onRemoveFromGroup={handleRemoveFromGroup}
+          onArchive={handleToggleArchive}
+          isArchived={archivedSessions.has(contextMenu.session.id)}
+          onCreateGroupWithSession={conversationView === 'active' ? handleCreateGroupWithSession : undefined}
+          availableGroups={conversationView === 'active'
+            ? wsGroups
+                .filter((g) => g.id !== currentGroup?.id)
+                .map((g) => ({ id: g.id, label: g.label }))
+            : undefined}
+          onAddToGroup={conversationView === 'active' ? handleAddToGroup : undefined}
+          currentGroupId={conversationView === 'active' ? currentGroup?.id ?? null : null}
+          onRemoveFromGroup={conversationView === 'active' ? handleRemoveFromGroup : undefined}
           onClose={() => setContextMenu(null)}
         />
         );
       })()}
 
       {/* Project context menu */}
-      {projectMenu && (
+      {conversationView === 'active' && projectMenu && (
         <ProjectContextMenu
           x={projectMenu.x}
           y={projectMenu.y}
@@ -920,7 +1330,7 @@ export function ConversationList() {
       )}
 
       {/* Group context menu */}
-      {groupMenu && (
+      {conversationView === 'active' && groupMenu && (
         <GroupContextMenu
           x={groupMenu.x}
           y={groupMenu.y}
@@ -937,14 +1347,32 @@ export function ConversationList() {
           open={true}
           title={t('conv.delete')}
           message={t('conv.deleteConfirm')}
-          detail={displayName(deleteTarget) || deleteTarget.preview}
+          detail={t('conv.deleteConfirmDetail').replace(
+            '{name}',
+            displayName(deleteTarget) || deleteTarget.preview,
+          )}
           variant="danger"
           confirmLabel={t('conv.delete')}
-          onConfirm={() => {
-            executeDelete(deleteTarget.id, deleteTarget.path);
+          onConfirm={async () => {
+            const target = deleteTarget;
             setDeleteTarget(null);
+            if (await executeDelete(target.id, target.path)) {
+              pruneSessionMetadata([target.id]);
+            }
           }}
           onCancel={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {forkNotice && (
+        <ConfirmDialog
+          open={true}
+          title={t('conv.fork')}
+          message={forkNotice}
+          confirmLabel={t('common.confirm')}
+          hideCancel={true}
+          onConfirm={() => setForkNotice(null)}
+          onCancel={() => setForkNotice(null)}
         />
       )}
 

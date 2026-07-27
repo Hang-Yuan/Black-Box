@@ -1,6 +1,10 @@
 import type { ChatMessage } from '../stores/chatStore';
 import { generateMessageId } from '../stores/chatStore';
-import type { AgentPhase } from '../stores/agentStore';
+import type { AgentKind, AgentPhase } from '../stores/agentStore';
+import {
+  sanitizeAssistantTextForDisplay,
+  sanitizeToolResultForDisplay,
+} from './presentation-sanitizer';
 
 export interface AgentData {
   id: string;
@@ -10,12 +14,28 @@ export interface AgentData {
   startTime: number;
   endTime: number;
   isMain: boolean;
+  kind?: AgentKind;
+  name?: string;
 }
 
 export interface LoadedSession {
   messages: ChatMessage[];
   agents: AgentData[];
   mainAgentStartTime: number;
+}
+
+/** Claude JSONL timestamps may be epoch numbers or ISO strings. Chat UI needs epoch ms. */
+export function normalizeSessionTimestamp(value: unknown, fallback = Date.now()): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (value instanceof Date) {
+    const parsed = value.getTime();
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
 }
 
 /** Detect system-injected content that should not be shown to users */
@@ -38,9 +58,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
 
   // Create main agent with session start time
   const firstMsg = rawMessages[0];
-  const sessionStartTime = firstMsg?.timestamp
-    ? new Date(firstMsg.timestamp).getTime()
-    : Date.now();
+  const sessionStartTime = normalizeSessionTimestamp(firstMsg?.timestamp);
 
   agents.push({
     id: 'main',
@@ -50,6 +68,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     startTime: sessionStartTime,
     endTime: Date.now(),
     isMain: true,
+    kind: 'main',
   });
 
   // Collect tool_use_id → index mapping for binding tool results
@@ -78,16 +97,43 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     if (!toolUseId) return;
     const idx = toolUseIdToIndex.get(toolUseId);
     if (idx === undefined || !messages[idx]) return;
+    const safeResult = sanitizeToolResultForDisplay(messages[idx].toolName, resultText);
     messages[idx] = {
       ...messages[idx],
       toolCompleted: true,
-      ...(resultText ? { toolResultContent: resultText } : {}),
+      ...(safeResult ? { toolResultContent: safeResult } : {}),
     };
   };
 
   for (const msg of rawMessages) {
     // Skip system-injected meta messages
     if (msg.isMeta) continue;
+
+    // Claude Code persists streaming input sent while the agent loop is busy
+    // as a queue-operation plus a queued_command attachment, not as a normal
+    // user record. Rehydrate the attachment once so live Steer guidance stays
+    // visible after WebView reload or native app restart. The attachment UUID
+    // is not a file-checkpoint key, so deliberately omit checkpointUuid.
+    if (
+      msg.type === 'attachment'
+      && msg.attachment?.type === 'queued_command'
+      && msg.attachment?.commandMode === 'prompt'
+      && typeof msg.attachment?.prompt === 'string'
+    ) {
+      const content = msg.attachment.prompt.trim();
+      if (content && !isSystemText(content)) {
+        messages.push({
+          id: msg.uuid || generateMessageId(),
+          role: 'user',
+          type: 'text',
+          content,
+          timestamp: normalizeSessionTimestamp(msg.attachment.timestamp ?? msg.timestamp),
+          isSteer: true,
+          steerState: 'sent',
+        });
+      }
+      continue;
+    }
 
     const hasTopLevelToolUseResult = Object.prototype.hasOwnProperty.call(msg, 'tool_use_result')
       || Object.prototype.hasOwnProperty.call(msg, 'toolUseResult');
@@ -112,11 +158,12 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       );
       for (const b of blocks) {
         if (b?.tool_use_id && (b?.type === 'tool_result' || hasTopLevelToolUseResult || hasTopLevelToolResult)) {
+          const blockResultText = extractToolResultText(b.content ?? b.output);
           bindToolResult(
             b.tool_use_id,
             (hasTopLevelToolUseResult || hasTopLevelToolResult)
-              ? topLevelResultText
-              : extractToolResultText(b.content ?? b.output),
+              ? (topLevelResultText || blockResultText)
+              : blockResultText,
           );
         }
       }
@@ -162,7 +209,11 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
           role: 'user',
           type: 'text',
           content,
-          timestamp: msg.timestamp || Date.now(),
+          timestamp: normalizeSessionTimestamp(msg.timestamp),
+          // Claude's replayed user UUID is the native file-checkpoint key.
+          // Preserve it across reload so restore_all / restore_code remain
+          // available for durable history, not only for the live stream.
+          checkpointUuid: msg.uuid || undefined,
           attachments: attachments.length > 0 ? attachments : undefined,
         });
       }
@@ -171,25 +222,31 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       if (Array.isArray(blocks)) {
         for (const block of blocks) {
           if (block.type === 'text') {
-            if (isSystemText(block.text || '')) continue;
+            const displayText = sanitizeAssistantTextForDisplay(block.text);
+            if (isSystemText(displayText)) continue;
             messages.push({
               id: msg.uuid || generateMessageId(),
               role: 'assistant',
               type: 'text',
-              content: block.text,
-              timestamp: msg.timestamp || Date.now(),
+              content: displayText,
+              timestamp: normalizeSessionTimestamp(msg.timestamp),
             });
           } else if (block.type === 'tool_use') {
             // Rebuild agent tree from Agent/Task tool_use blocks
             if (block.name === 'Task' || block.name === 'Agent') {
+              const teammateName = typeof block.input?.name === 'string'
+                ? block.input.name.trim()
+                : '';
               agents.push({
                 id: block.id || generateMessageId(),
                 parentId: 'main',
-                description: block.input?.description || block.input?.prompt || 'Agent',
+                description: teammateName || block.input?.description || block.input?.prompt || 'Agent',
                 phase: 'completed',
-                startTime: msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now(),
+                startTime: normalizeSessionTimestamp(msg.timestamp),
                 endTime: Date.now(),
                 isMain: false,
+                kind: teammateName ? 'teammate' : 'subagent',
+                name: teammateName || undefined,
               });
             }
 
@@ -204,7 +261,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 toolInput: block.input,
                 questions: block.input.questions,
                 resolved: true,
-                timestamp: msg.timestamp || Date.now(),
+                timestamp: normalizeSessionTimestamp(msg.timestamp),
               };
             } else if (block.name === 'TodoWrite' && block.input?.todos) {
               chatMsg = {
@@ -215,7 +272,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 toolName: block.name,
                 toolInput: block.input,
                 todoItems: block.input.todos,
-                timestamp: msg.timestamp || Date.now(),
+                timestamp: normalizeSessionTimestamp(msg.timestamp),
               };
             } else {
               chatMsg = {
@@ -225,7 +282,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 content: '',
                 toolName: block.name,
                 toolInput: block.input,
-                timestamp: msg.timestamp || Date.now(),
+                timestamp: normalizeSessionTimestamp(msg.timestamp),
               };
             }
             // Record tool_use_id for later result binding
@@ -242,10 +299,14 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
             if (block.tool_use_id) {
               const idx = toolUseIdToIndex.get(block.tool_use_id);
               if (idx !== undefined && messages[idx]) {
+                const safeResult = sanitizeToolResultForDisplay(
+                  messages[idx].toolName,
+                  resultText,
+                );
                 messages[idx] = {
                   ...messages[idx],
                   toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
+                  ...(safeResult ? { toolResultContent: safeResult } : {}),
                 };
               }
             }
@@ -255,7 +316,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
               role: 'assistant',
               type: 'thinking',
               content: block.thinking || '',
-              timestamp: msg.timestamp || Date.now(),
+              timestamp: normalizeSessionTimestamp(msg.timestamp),
             });
           }
         }

@@ -8,7 +8,7 @@
  *   in the UI. Without a pub/sub channel there is no way for the stream layer
  *   (or any other consumer) to know it should re-snapshot.
  *
- *   See Her v0.5.2 roadmap §4.3.5 — "settingsStore 事件化".
+ *   This is the Black Box settingsStore event bridge.
  *
  * Design:
  *   A minimal typed emitter with no runtime dependency. Subscribers are kept

@@ -203,6 +203,9 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
   /* Secondary panel: normal mode when no preview, floating overlay when preview is active */
   const showSecondary = secondaryPanelOpen && !isFilePreviewMode;
   const showFloatingSecondary = secondaryPanelOpen && isFilePreviewMode;
+  const visibleSecondaryPanelWidth = Number.isFinite(secondaryPanelWidth)
+    ? Math.max(MIN_PANEL_WIDTH, Math.min(MAX_PANEL_WIDTH, secondaryPanelWidth))
+    : 300;
 
   return (
     <div className="flex h-full w-full overflow-hidden gradient-bg">
@@ -218,7 +221,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
         style={{ width: showSidebar ? `${sidebarWidth}px` : '0px' }}
       >
         <div
-          className="h-full overflow-hidden bg-bg-sidebar"
+          className="h-full overflow-hidden bg-bg-sidebar app-sidebar-surface"
           style={{ width: `${sidebarWidth}px` }}
         >
           {sidebar}
@@ -237,7 +240,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
       )}
 
       {/* Main Panel — full-height, separated by vertical border lines */}
-      <div className="flex-1 min-w-0 flex flex-col bg-bg-chat overflow-hidden">
+      <div className="flex-1 min-w-0 flex flex-col bg-bg-chat app-main-surface overflow-hidden">
         {main}
       </div>
 
@@ -257,36 +260,43 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
         className="flex-shrink-0 overflow-hidden transition-all duration-300 ease-out"
         style={{ width: isFilePreviewMode ? `${previewWidth}px` : '0px' }}
       >
-        <div className="h-full overflow-hidden flex flex-col bg-bg-chat"
+        <div className="h-full overflow-hidden flex flex-col bg-bg-chat app-main-surface"
           style={{ width: `${previewWidth}px` }}>
           <FilePreview />
         </div>
       </div>
 
-      {/* Secondary Panel resize handle — 同上：w-px 分隔线本体 + 悬浮热区，三处分隔线统一 */}
+      {/* Secondary Panel — only mount the visible shell. Keeping a zero-width
+          panel mounted left its complete contents in the macOS accessibility
+          tree and could leave WebKit's width transition visually stuck at 0. */}
       {secondary && showSecondary && (
-        <div
-          onMouseDown={handleRightMouseDown}
-          className="w-px h-full flex-shrink-0 relative cursor-col-resize z-10
-            bg-border-subtle hover:bg-accent/40 transition-colors group"
-        >
-          {/* 拖拽热区：向两侧各扩 4px，绝对定位不占布局宽度 */}
-          <div className="absolute inset-y-0 -left-1 -right-1 cursor-col-resize" />
-        </div>
-      )}
-      {/* Secondary Panel — animates to w-0 when hidden or preview mode */}
-      {secondary && (
-        <div
-          className="flex-shrink-0 transition-all duration-300 ease-out overflow-hidden"
-          style={{ width: showSecondary ? `${secondaryPanelWidth}px` : '0px' }}
-        >
+        <>
           <div
-            className="h-full overflow-y-auto overflow-x-hidden bg-bg-sidebar"
-            style={{ width: `${secondaryPanelWidth}px` }}
+            onMouseDown={handleRightMouseDown}
+            className="w-px h-full flex-shrink-0 relative cursor-col-resize z-10
+              bg-border-subtle hover:bg-accent/40 transition-colors group"
           >
-            {secondary}
+            {/* 拖拽热区：向两侧各扩 4px，绝对定位不占布局宽度 */}
+            <div className="absolute inset-y-0 -left-1 -right-1 cursor-col-resize" />
           </div>
-        </div>
+          <div
+            data-testid="secondary-panel-shell"
+            data-open="true"
+            className="flex-shrink-0 overflow-hidden animate-in slide-in-from-right duration-150"
+            style={{
+              width: `${visibleSecondaryPanelWidth}px`,
+              minWidth: `${visibleSecondaryPanelWidth}px`,
+              flexBasis: `${visibleSecondaryPanelWidth}px`,
+            }}
+          >
+            <div
+              className="h-full overflow-y-auto overflow-x-hidden bg-bg-sidebar app-sidebar-surface"
+              style={{ width: `${visibleSecondaryPanelWidth}px` }}
+            >
+              {secondary}
+            </div>
+          </div>
+        </>
       )}
 
       {/* Floating Sidebar — overlay when file preview is active */}
@@ -300,7 +310,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
             className="fixed top-0 left-0 h-full z-50 flex animate-in slide-in-from-left duration-200"
             style={{ width: `${sidebarWidth}px` }}
           >
-            <div className="flex-1 h-full overflow-y-auto bg-bg-sidebar
+            <div className="flex-1 h-full overflow-y-auto bg-bg-sidebar app-sidebar-surface
               border-r border-border-subtle shadow-lg">
               {sidebar}
             </div>
@@ -319,9 +329,9 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
           {/* Floating panel — anchored to right edge */}
           <div
             className="fixed top-0 right-0 h-full z-50 flex animate-in slide-in-from-right duration-200"
-            style={{ width: `${secondaryPanelWidth}px` }}
+            style={{ width: `${visibleSecondaryPanelWidth}px` }}
           >
-            <div className="flex-1 h-full overflow-y-auto overflow-x-hidden bg-bg-sidebar
+            <div className="flex-1 h-full overflow-y-auto overflow-x-hidden bg-bg-sidebar app-sidebar-surface
               border-l border-border-subtle shadow-lg">
               {secondary}
             </div>

@@ -3,18 +3,9 @@ import { useSettingsStore, type SessionMode } from '../../stores/settingsStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useT } from '../../lib/i18n';
+import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
 
 const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
-  {
-    id: 'code',
-    labelKey: 'mode.code',
-    icon: (
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
-        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-        <path d="M5 4L1 8l4 4M11 4l4 4-4 4" />
-      </svg>
-    ),
-  },
   {
     id: 'ask',
     labelKey: 'mode.ask',
@@ -27,12 +18,33 @@ const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
     ),
   },
   {
+    id: 'code',
+    labelKey: 'mode.code',
+    icon: (
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <path d="M5 4L1 8l4 4M11 4l4 4-4 4" />
+      </svg>
+    ),
+  },
+  {
     id: 'plan',
     labelKey: 'mode.plan',
     icon: (
       <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
         stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
         <path d="M4 4h8M4 8h6M4 12h4" />
+      </svg>
+    ),
+  },
+  {
+    id: 'auto',
+    labelKey: 'mode.auto',
+    icon: (
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M8 1.75v2M8 12.25v2M1.75 8h2M12.25 8h2M3.58 3.58L5 5M11 11l1.42 1.42M12.42 3.58L11 5M5 11l-1.42 1.42" />
+        <circle cx="8" cy="8" r="2.25" />
       </svg>
     ),
   },
@@ -48,7 +60,17 @@ const MODES: { id: SessionMode; labelKey: string; icon: ReactNode }[] = [
   },
 ];
 
-export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
+export function ModeSelector({
+  disabled = false,
+  placement = 'up',
+  compact = false,
+  iconOnly = false,
+}: {
+  disabled?: boolean;
+  placement?: 'up' | 'down';
+  compact?: boolean;
+  iconOnly?: boolean;
+}) {
   const t = useT();
   const sessionMode = useSettingsStore((s) => s.sessionMode);
   const setSessionMode = useSettingsStore((s) => s.setSessionMode);
@@ -65,6 +87,8 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
 
+  useEffect(() => subscribeHeaderPopover('mode', () => setOpen(false)), []);
+
   const current = MODES.find((m) => m.id === sessionMode) || MODES[0];
   const isBypass = sessionMode === 'bypass';
 
@@ -72,6 +96,7 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
     code: { i18nKey: 'cmd.switchedToCode', icon: '⚡' },
     ask: { i18nKey: 'cmd.switchedToAsk', icon: '💬' },
     plan: { i18nKey: 'cmd.switchedToPlan', icon: '📋' },
+    auto: { i18nKey: 'cmd.switchedToAuto', icon: '✨' },
     bypass: { i18nKey: 'cmd.switchedToBypass', icon: '⭐' },
   };
 
@@ -97,16 +122,22 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
     <div ref={ref} className={`relative ${disabled ? 'opacity-40 pointer-events-none' : ''}`}>
       {/* Trigger button — shows current mode */}
       <button
-        onClick={() => setOpen(!open)}
-        className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs
+        onClick={() => setOpen((value) => {
+          const next = !value;
+          if (next) announceHeaderPopover('mode');
+          return next;
+        })}
+        title={t(current.labelKey)}
+        className={`inline-flex items-center gap-1.5 rounded-md
           border transition-smooth cursor-pointer
+          ${compact ? 'px-1.5 py-0.5 text-[9px]' : 'px-2 py-1 text-xs'}
           ${isBypass
             ? 'border-warning/30 bg-warning/10 text-warning'
             : 'border-border-subtle bg-bg-secondary/50 text-text-muted hover:text-text-primary hover:bg-bg-secondary'
           }`}
       >
         {current.icon}
-        <span className="font-medium">{t(current.labelKey)}</span>
+        {!iconOnly && <span className="font-medium">{t(current.labelKey)}</span>}
         <svg width="8" height="8" viewBox="0 0 8 8" fill="none"
           stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
           className={`transition-transform duration-150 ${open ? 'rotate-180' : ''}`}>
@@ -114,11 +145,12 @@ export function ModeSelector({ disabled = false }: { disabled?: boolean }) {
         </svg>
       </button>
 
-      {/* Dropdown menu — opens upward */}
+      {/* Dropdown menu — placement follows the surrounding toolbar. */}
       {open && (
-        <div className="absolute bottom-full left-0 mb-1 min-w-[140px]
+        <div className={`absolute left-0 min-w-[160px]
           bg-bg-card border border-border-subtle rounded-lg shadow-lg
-          py-1 z-50 animate-fade-in">
+          py-1 z-50 animate-fade-in
+          ${placement === 'down' ? 'top-full mt-1' : 'bottom-full mb-1'}`}>
           {MODES.map((mode) => {
             const isActive = mode.id === sessionMode;
             return (

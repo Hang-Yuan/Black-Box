@@ -30,6 +30,10 @@
         {"cmd": "new-session", "flags": {"cwd": "/tmp/blackbox-test"}},
         {"cmd": "check-editor", "assert": {"hasEditor": true}},
         {"cmd": "status"}
+      ],
+      "teardown": [
+        {"cmd": "stop", "continueOnError": true},
+        {"cmd": "delete-session", "continueOnError": true}
       ]
     },
     {

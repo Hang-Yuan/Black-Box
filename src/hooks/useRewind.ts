@@ -11,7 +11,8 @@
  *   5. Cancel
  */
 import { useMemo, useCallback } from 'react';
-import { useChatStore, useActiveTab, getActiveTabState, generateMessageId, isSessionBusy } from '../stores/chatStore';
+import { useChatStore, useActiveTab, generateMessageId, isSessionBusy } from '../stores/chatStore';
+import type { TabSession } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { bridge } from '../lib/tauri-bridge';
@@ -21,36 +22,39 @@ import { teardownSession, waitForStdinCleared } from '../lib/sessionLifecycle';
 
 export type RewindAction = 'restore_all' | 'restore_conversation' | 'restore_code' | 'summarize';
 
-/**
- * Restore files to a CLI checkpoint via bridge.rewindFiles().
- * Returns true if files were restored, false if no checkpoint available.
- */
-async function restoreFilesViaCheckpoint(turn: Turn): Promise<boolean> {
-  if (!turn.checkpointUuid) return false;
+const rewindInFlightTabs = new Set<string>();
 
-  const tabState = getActiveTabState();
+interface FileRestoreRequest {
+  stdinId?: string;
+  sessionId: string;
+  checkpointUuid: string;
+  cwd: string;
+}
+
+/** Resolve one immutable file-rewind request before process teardown. */
+function resolveFileRestoreRequest(
+  turn: Turn,
+  tabId: string,
+  tabState: TabSession,
+): FileRestoreRequest | null {
+  if (!turn.checkpointUuid) return null;
+
   const stdinId = tabState.sessionMeta.stdinId;
   const fallbackSessionId = tabState.sessionMeta.sessionId && !tabState.sessionMeta.sessionId.startsWith('desk_')
     ? tabState.sessionMeta.sessionId
     : undefined;
   // Use cliResumeId from sessionStore as the primary resume credential
-  const tabId = useSessionStore.getState().selectedSessionId;
-  const sessionId = tabId
-    ? (useSessionStore.getState().sessions.find((s) => s.id === tabId)?.cliResumeId ?? fallbackSessionId)
-    : fallbackSessionId;
+  const sessionId = useSessionStore.getState().sessions
+    .find((session) => session.id === tabId)?.cliResumeId ?? fallbackSessionId;
   // Use cwdSnapshot when available, fall back to global workingDirectory
   const cwd = tabState.sessionMeta.cwdSnapshot || useSettingsStore.getState().workingDirectory;
-  if (!sessionId || !cwd) return false;
-
-  try {
-    // Primary: SDK control protocol via stdin (fast, in-process)
-    // Fallback: spawn new CLI process (slow, full initialization)
-    await bridge.rewindFiles(stdinId || '', turn.checkpointUuid, sessionId, cwd);
-    return true;
-  } catch (err) {
-    console.error('[rewind] rewindFiles failed:', err);
-    return false;
-  }
+  if (!sessionId || !cwd) return null;
+  return {
+    stdinId,
+    sessionId,
+    checkpointUuid: turn.checkpointUuid,
+    cwd,
+  };
 }
 
 export function useRewind() {
@@ -65,35 +69,31 @@ export function useRewind() {
   const canRewind = turns.length >= 1 && !isSessionBusy(sessionStatus);
 
   /** Kill the current CLI process and clean up via lifecycle module */
-  const killProcess = useCallback(async () => {
-    const state = getActiveTabState();
+  const killProcess = useCallback(async (tabId: string) => {
+    const state = useChatStore.getState().getTab(tabId);
+    if (!state) return;
     const stdinId = state.sessionMeta.stdinId;
-    const tid = useSessionStore.getState().selectedSessionId;
-    if (stdinId && tid) {
-      await teardownSession(stdinId, tid, 'rewind');
-      await waitForStdinCleared(tid, stdinId);
+    if (stdinId) {
+      await teardownSession(stdinId, tabId, 'rewind');
+      await waitForStdinCleared(tabId, stdinId);
     }
   }, []);
 
-  /** Reset session state after rewind.
-   *  Clears both stdinId (process link) AND sessionId (CLI UUID) so the next
-   *  message starts a fresh session instead of --resume'ing the old context. */
-  const resetSession = useCallback(() => {
-    const tid = useSessionStore.getState().selectedSessionId;
-    if (!tid) return;
-    useChatStore.getState().setSessionStatus(tid, 'idle');
-    useChatStore.getState().setSessionMeta(tid, { stdinId: undefined, sessionId: undefined });
-    // Clear CLI resume credential so the next message starts fresh instead of
-    // --resume'ing the pre-rewind conversation context.
-    useSessionStore.getState().setCliResumeId(tid, null);
+  /** Reset only the dead process route after rewind. The durable Claude UUID
+   *  must stay attached: conversation rewind now atomically truncates the
+   *  source JSONL, so the next --resume continues from that exact checkpoint. */
+  const resetSession = useCallback((tabId: string) => {
+    useChatStore.getState().setSessionStatus(tabId, 'idle');
+    useChatStore.getState().setSessionMeta(tabId, {
+      stdinId: undefined,
+      stdinReady: false,
+      pendingReadyMessage: undefined,
+    });
   }, []);
 
   /** Save rewound state to tab cache */
-  const saveToTab = useCallback(() => {
-    const tabId = useSessionStore.getState().selectedSessionId;
-    if (tabId) {
-      useChatStore.getState().saveToCache(tabId);
-    }
+  const saveToTab = useCallback((tabId: string) => {
+    useChatStore.getState().saveToCache(tabId);
   }, []);
 
   /**
@@ -103,7 +103,16 @@ export function useRewind() {
   const executeRewind = useCallback(async (turn: Turn, action: RewindAction = 'restore_conversation') => {
     const tid = useSessionStore.getState().selectedSessionId;
     if (!tid) return;
-    const state = getActiveTabState();
+    if (rewindInFlightTabs.has(tid)) return;
+    rewindInFlightTabs.add(tid);
+    try {
+    const state = useChatStore.getState().getTab(tid);
+    if (!state) return;
+    const sessionItem = useSessionStore.getState().sessions.find((session) => session.id === tid);
+    const fallbackSessionId = state.sessionMeta.sessionId && !state.sessionMeta.sessionId.startsWith('desk_')
+      ? state.sessionMeta.sessionId
+      : undefined;
+    const durableSessionId = sessionItem?.cliResumeId ?? fallbackSessionId;
 
     // Guard: validate turn index
     if (turn.startMsgIdx < 0 || turn.startMsgIdx > state.messages.length) {
@@ -111,19 +120,33 @@ export function useRewind() {
       return;
     }
 
-    // For file-restore actions, send rewind via stdin BEFORE killing the process
-    // (SDK control protocol is fast and needs the process alive)
+    // restore_code may use the live control protocol because it intentionally
+    // keeps the conversation graph. restore_all is delegated after teardown to
+    // one backend transaction that stages JSONL, rewinds files against the
+    // still-complete graph, then atomically publishes the staged conversation.
     const needsFileRestore = action === 'restore_all' || action === 'restore_code';
+    const fileRestoreRequest = needsFileRestore
+      ? resolveFileRestoreRequest(turn, tid, state)
+      : null;
     let fileRestoreOk = false;
-    if (needsFileRestore && turn.checkpointUuid) {
+    let needsStandaloneFileRestore = action === 'restore_code'
+      && Boolean(fileRestoreRequest && !fileRestoreRequest.stdinId);
+    if (action === 'restore_code' && fileRestoreRequest?.stdinId) {
       try {
-        fileRestoreOk = await restoreFilesViaCheckpoint(turn);
-      } catch { /* handled below */ }
+        await bridge.rewindFilesViaControl(
+          fileRestoreRequest.stdinId,
+          fileRestoreRequest.checkpointUuid,
+        );
+        fileRestoreOk = true;
+      } catch (error) {
+        console.warn('[useRewind] live file rewind failed; deferring fallback until exit:', error);
+        needsStandaloneFileRestore = true;
+      }
     }
 
     // Kill CLI process after file restore (or immediately for non-file actions)
     try {
-      await killProcess();
+      await killProcess(tid);
     } catch (err) {
       console.warn('[useRewind] Failed to kill process:', err);
       return;
@@ -132,11 +155,91 @@ export function useRewind() {
     // Grab original text before truncating
     const originalUserText = state.messages[turn.startMsgIdx]?.content || '';
 
+    // Conversation actions must update Claude's durable graph before the UI is
+    // truncated. Otherwise the screen appears rewound while the next process
+    // either sees the discarded turns or starts with no context at all.
+    if (action === 'restore_all') {
+      if (!durableSessionId || !fileRestoreRequest) {
+        resetSession(tid);
+        useChatStore.getState().addMessage(tid, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: t('rewind.conversationRestoreFailed'),
+          commandType: 'error',
+          timestamp: Date.now(),
+        });
+        return;
+      }
+      try {
+        await bridge.rewindAllTransaction(
+          durableSessionId,
+          fileRestoreRequest.checkpointUuid,
+          fileRestoreRequest.cwd,
+        );
+        fileRestoreOk = true;
+      } catch (error) {
+        console.error('[useRewind] combined file/conversation rewind failed:', error);
+        resetSession(tid);
+        useChatStore.getState().addMessage(tid, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: `${t('rewind.conversationRestoreFailed')}: ${String(error)}`,
+          commandType: 'error',
+          timestamp: Date.now(),
+        });
+        return;
+      }
+    } else if (action === 'restore_conversation' || action === 'summarize') {
+      const conversationCheckpoint = turn.checkpointUuid ?? turn.userMessageId;
+      if (!durableSessionId) {
+        resetSession(tid);
+        useChatStore.getState().addMessage(tid, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: t('rewind.conversationRestoreFailed'),
+          commandType: 'error',
+          timestamp: Date.now(),
+        });
+        return;
+      }
+      try {
+        await bridge.rewindSessionConversation(durableSessionId, conversationCheckpoint);
+      } catch (error) {
+        console.error('[useRewind] durable conversation rewind failed:', error);
+        resetSession(tid);
+        useChatStore.getState().addMessage(tid, {
+          id: generateMessageId(),
+          role: 'system',
+          type: 'text',
+          content: `${t('rewind.conversationRestoreFailed')}: ${String(error)}`,
+          commandType: 'error',
+          timestamp: Date.now(),
+        });
+        return;
+      }
+    }
+
+    if (needsStandaloneFileRestore && fileRestoreRequest) {
+      try {
+        await bridge.rewindFilesStandalone(
+          fileRestoreRequest.sessionId,
+          fileRestoreRequest.checkpointUuid,
+          fileRestoreRequest.cwd,
+        );
+        fileRestoreOk = true;
+      } catch (error) {
+        console.error('[useRewind] standalone file rewind failed after confirmed exit:', error);
+      }
+    }
+
     try {
       switch (action) {
         case 'restore_all': {
           useChatStore.getState().rewindToTurn(tid, turn.startMsgIdx);
-          resetSession();
+          resetSession(tid);
           useChatStore.getState().setInputDraft(tid, originalUserText);
 
           const successMsg = fileRestoreOk
@@ -157,7 +260,7 @@ export function useRewind() {
         case 'restore_conversation': {
           // Only restore conversation (keep code as-is) — instant, no CLI call
           useChatStore.getState().rewindToTurn(tid, turn.startMsgIdx);
-          resetSession();
+          resetSession(tid);
           useChatStore.getState().setInputDraft(tid, originalUserText);
 
           useChatStore.getState().addMessage(tid, {
@@ -174,7 +277,7 @@ export function useRewind() {
 
         case 'restore_code': {
           // Don't truncate messages — keep full conversation
-          resetSession();
+          resetSession(tid);
           useChatStore.getState().setInputDraft(tid, originalUserText);
 
           const codeMsg = fileRestoreOk
@@ -211,14 +314,17 @@ export function useRewind() {
 
           // Truncate to selected point
           useChatStore.getState().rewindToTurn(tid, turn.startMsgIdx);
-          resetSession();
+          resetSession(tid);
 
-          // Add summary as a system message (preserves context without full messages)
+          // The durable JSONL has already been rewound above. Put the locally
+          // generated summary in the composer so the user can review and send
+          // it as the next real turn; never pretend a UI-only card is CLI context.
           const totalTurns = turns.length;
           const summaryHeader = t('rewind.summaryTitle')
             .replace('{from}', String(turn.index))
             .replace('{to}', String(totalTurns));
           const summaryContent = `**${summaryHeader}**\n\n${summaryParts.join('\n\n')}`;
+          useChatStore.getState().setInputDraft(tid, summaryContent);
 
           useChatStore.getState().addMessage(tid, {
             id: generateMessageId(),
@@ -235,11 +341,14 @@ export function useRewind() {
     } catch (err) {
       console.error('[useRewind] executeRewind failed:', err);
       // Ensure we're in a recoverable state even if rewind failed
-      resetSession();
+      resetSession(tid);
     }
 
     // Save to cache
-    saveToTab();
+    saveToTab(tid);
+    } finally {
+      rewindInFlightTabs.delete(tid);
+    }
   }, [killProcess, resetSession, saveToTab, turns.length]);
 
   return { turns, showRewind, canRewind, executeRewind };
