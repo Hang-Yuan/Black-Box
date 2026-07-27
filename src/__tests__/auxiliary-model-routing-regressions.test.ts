@@ -33,6 +33,9 @@ describe('auxiliary model routing regressions', () => {
     expect(teamGate).toBeGreaterThan(pin);
     expect(backend.slice(pin, teamGate)).toContain('auxiliary_model_tier.clone()');
     expect(backend).toContain('apply_provider_model_aliases(');
+    expect(backend).toContain(
+      'resolve_auxiliary_model_tier(params.auxiliary_model_tier.as_deref(), &auxiliary_model)?',
+    );
     expect(backend).toContain('"matcher": "Agent"');
     expect(backend).toContain('"--auxiliary-model-hook"');
     expect(modelHook).toContain('tool_input.insert("model".to_string()');

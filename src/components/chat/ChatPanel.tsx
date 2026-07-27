@@ -669,7 +669,7 @@ export function ChatPanel() {
       ? sessionMeta.model
       : selectedModelResolution.ok
         ? selectedModelResolution.model
-        : sessionMeta.model || selectedModel
+        : sessionMeta.model || _selModel
   );
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
   const taskComposerMode = useComposerModeStore((state) => (

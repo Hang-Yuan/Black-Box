@@ -123,13 +123,29 @@ describe('settingsStore setters · emit on change', () => {
   });
 
   it('normalizes legacy exact model ids before persisting or emitting', () => {
-    useSettingsStore.setState({ selectedModel: 'sonnet' });
+    useSettingsStore.setState({ selectedModel: 'sonnet', customModelId: null });
     const h = vi.fn();
     settingsEvents.on('model-changed', h);
     useSettingsStore.getState().setSelectedModel('claude-fable-5-1m');
     expect(useSettingsStore.getState().selectedModel).toBe('fable');
     expect(h).toHaveBeenCalledWith({ old: 'sonnet', next: 'fable' });
-    useSettingsStore.setState({ selectedModel: 'sonnet' });
+    useSettingsStore.setState({ selectedModel: 'sonnet', customModelId: null });
+  });
+
+  it('keeps native custom models behind an explicit action', () => {
+    useSettingsStore.setState({ selectedModel: 'sonnet', customModelId: null });
+    const h = vi.fn();
+    settingsEvents.on('model-changed', h);
+
+    useSettingsStore.getState().setCustomModelId('claude-custom-native');
+    expect(useSettingsStore.getState().selectedModel).toBe('sonnet');
+    expect(useSettingsStore.getState().customModelId).toBe('claude-custom-native');
+    expect(h).toHaveBeenCalledWith({ old: 'sonnet', next: 'claude-custom-native' });
+
+    useSettingsStore.getState().setSelectedModel('claude-fable-5-1m');
+    expect(useSettingsStore.getState().selectedModel).toBe('fable');
+    expect(useSettingsStore.getState().customModelId).toBeNull();
+    useSettingsStore.setState({ selectedModel: 'sonnet', customModelId: null });
   });
 
   it('setThinkingLevel fires thinking-changed', () => {

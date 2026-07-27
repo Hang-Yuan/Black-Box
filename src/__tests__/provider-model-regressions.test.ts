@@ -54,6 +54,11 @@ const quickSelector = readFileSync(
 );
 const apiConfig = readFileSync(resolve(__dirname, '../lib/api-config.ts'), 'utf8');
 const providerStore = readFileSync(resolve(__dirname, '../stores/providerStore.ts'), 'utf8');
+const modelSelector = readFileSync(
+  resolve(__dirname, '../components/chat/ModelSelector.tsx'),
+  'utf8',
+);
+const settingsStore = readFileSync(resolve(__dirname, '../stores/settingsStore.ts'), 'utf8');
 
 function provider(): ApiProvider {
   return {
@@ -241,6 +246,54 @@ describe('single spawn configuration capture', () => {
     });
   });
 
+  it('never leaks a persisted native custom model into a third-party provider', () => {
+    const active = provider();
+    useProviderStore.setState({
+      providers: [active],
+      activeProviderId: active.id,
+      loaded: true,
+    });
+    useSettingsStore.setState({
+      selectedModel: 'sonnet',
+      customModelId: 'claude-custom-native',
+      auxiliaryModel: 'haiku',
+      thinkingLevel: 'medium',
+      agentTeamsEnabled: false,
+    });
+
+    expect(captureSpawnConfiguration()).toMatchObject({
+      ok: true,
+      providerId: active.id,
+      model: 'relay-sonnet',
+      auxiliaryModel: 'relay-haiku',
+    });
+    useSettingsStore.setState({ customModelId: null });
+  });
+
+  it('uses an explicit custom model only on the native Claude route', () => {
+    useProviderStore.setState({
+      providers: [],
+      activeProviderId: null,
+      loaded: true,
+    });
+    useSettingsStore.setState({
+      selectedModel: 'sonnet',
+      customModelId: 'claude-custom-native',
+      auxiliaryModel: 'haiku',
+      thinkingLevel: 'medium',
+      agentTeamsEnabled: false,
+    });
+
+    expect(captureSpawnConfiguration()).toMatchObject({
+      ok: true,
+      providerId: '',
+      model: 'claude-custom-native',
+      auxiliaryModelTier: 'haiku',
+      auxiliaryModel: 'claude-haiku-4-5-20251001',
+    });
+    useSettingsStore.setState({ customModelId: null });
+  });
+
   it('fails closed when official Kimi K2.7 Code is selected with Thinking off', () => {
     const active: ApiProvider = {
       ...provider(),
@@ -355,5 +408,11 @@ describe('single spawn configuration capture', () => {
     expect(sessionLifecycle).toContain('await useProviderStore.getState().flushSave();');
     expect(streamProcessor).toContain('const sessionHashMismatch = tab?.sessionMeta.spawnConfigHash !== undefined');
     expect(streamProcessor).toContain('hashMismatch || sessionHashMismatch || stdinMismatch');
+  });
+
+  it('persists the explicit custom model and keeps it out of the auxiliary selector', () => {
+    expect(settingsStore).toContain('customModelId: state.customModelId');
+    expect(modelSelector).toContain('const auxiliaryOptions = displayOptions.filter((option) => !option.isExtra)');
+    expect(modelSelector).toContain('setCustomModelId(option.id)');
   });
 });

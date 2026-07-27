@@ -1123,13 +1123,21 @@ export function InputBar() {
     clearFiles();
 
     // Normal path: show user message immediately
-    let pendingTurnMeta: { pendingTurnMessageId?: string; pendingTurnInput?: string; pendingTurnAttachments?: FileAttachment[] };
+    let pendingTurnMeta: {
+      pendingTurnMessageId?: string;
+      pendingTurnInput?: string;
+      pendingTurnAttachments?: FileAttachment[];
+      activeTurnInput?: string;
+      contextRecoveryAttempts?: number;
+    };
     if (silentRestartRef.current) {
       silentRestartRef.current = false;
       pendingTurnMeta = {
         pendingTurnMessageId: undefined,
         pendingTurnInput: undefined,
         pendingTurnAttachments: undefined,
+        activeTurnInput: undefined,
+        contextRecoveryAttempts: undefined,
       };
     } else {
       const pendingTurnMessageId = generateMessageId();
@@ -1145,6 +1153,8 @@ export function InputBar() {
         pendingTurnMessageId,
         pendingTurnInput: submittedUserText,
         pendingTurnAttachments: savedFiles,
+        activeTurnInput: submittedUserText,
+        contextRecoveryAttempts: 0,
       };
     }
 
@@ -1171,6 +1181,8 @@ export function InputBar() {
           pendingTurnMessageId: undefined,
           pendingTurnInput: undefined,
           pendingTurnAttachments: undefined,
+          activeTurnInput: undefined,
+          contextRecoveryAttempts: undefined,
         });
         if (savedFiles.length > 0) setFiles(savedFiles);
         return;
@@ -1202,6 +1214,8 @@ export function InputBar() {
           pendingTurnMessageId: undefined,
           pendingTurnInput: undefined,
           pendingTurnAttachments: undefined,
+          activeTurnInput: undefined,
+          contextRecoveryAttempts: undefined,
         });
         if (savedFiles.length > 0) setFiles(savedFiles);
         return;
@@ -1543,6 +1557,8 @@ export function InputBar() {
         pendingTurnMessageId: undefined,
         pendingTurnInput: undefined,
         pendingTurnAttachments: undefined,
+        activeTurnInput: undefined,
+        contextRecoveryAttempts: undefined,
       });
       if (savedFiles.length > 0) setFiles(savedFiles);
     }

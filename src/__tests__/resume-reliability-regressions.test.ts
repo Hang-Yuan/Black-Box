@@ -157,6 +157,22 @@ describe('durable resume reliability regressions', () => {
     expect(guard).not.toContain('auto-retrying without resume');
   });
 
+  it('retries the observed tiny zero-cache greeting once without duplicating the user turn', () => {
+    const stream = read('hooks/useStreamProcessor.ts');
+    const input = read('components/chat/InputBar.tsx');
+    const chatStore = read('stores/chatStore.ts');
+    expect(stream).toContain('shouldRetryContextDrop({');
+    expect(stream).toContain('Tiny zero-cache greeting detected; retrying the active turn once');
+    expect(stream).toContain('bridge.sendStdin(msgStdinId, retryPrompt)');
+    expect(stream).toContain('bridge.sendStdin(bgResultStdinId, retryPrompt)');
+    expect(stream).toContain('shouldHoldPotentialContextDropGreeting(tabId, block.text)');
+    expect(stream).toContain('isCliPlaceholder(block.text)');
+    expect(input).toContain('activeTurnInput: submittedUserText');
+    expect(input).toContain('contextRecoveryAttempts: 0');
+    expect(chatStore).toContain('activeTurnInput?: string');
+    expect(chatStore).toContain('contextRecoveryAttempts?: number');
+  });
+
   it('uses graceful process settlement for internal restart paths', () => {
     const source = read('lib/sessionLifecycle.ts');
     expect(source).toContain("reason === 'stop' || reason === 'delete'");

@@ -195,6 +195,12 @@ export interface SessionMeta {
   pendingTurnMessageId?: string;
   pendingTurnInput?: string;
   pendingTurnAttachments?: FileAttachment[];
+  /** Original text for the active turn. Kept through the result boundary so a
+   *  narrowly detected provider context-drop can be retried once without
+   *  duplicating the user bubble. */
+  activeTurnInput?: string;
+  /** Number of automatic context-drop retries for the active user turn. */
+  contextRecoveryAttempts?: number;
   /** Partial assistant正文 that was visible when the user clicked Stop.
    *  Claude CLI resume does not always include interrupted assistant output,
    *  so the next user turn may need this text injected once for continuity. */

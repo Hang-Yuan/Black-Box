@@ -2855,6 +2855,16 @@ pub(crate) fn native_agent_model_tier(raw: &str) -> Result<String, String> {
     Ok(tier.to_string())
 }
 
+pub(crate) fn resolve_auxiliary_model_tier(
+    explicit_tier: Option<&str>,
+    resolved_model: &str,
+) -> Result<String, String> {
+    match explicit_tier {
+        Some(tier) => native_agent_model_tier(tier),
+        None => native_agent_model_tier(resolved_model),
+    }
+}
+
 pub(crate) fn apply_provider_model_aliases(
     provider_id: Option<&str>,
     env: &mut HashMap<String, String>,
@@ -2941,12 +2951,8 @@ async fn start_claude_session(
         .map(normalize_cli_model_id)
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| "A resolved auxiliary model is required for subagents".to_string())?;
-    let auxiliary_model_tier = params
-        .auxiliary_model_tier
-        .as_deref()
-        .map(native_agent_model_tier)
-        .transpose()?
-        .unwrap_or(native_agent_model_tier(&auxiliary_model)?);
+    let auxiliary_model_tier =
+        resolve_auxiliary_model_tier(params.auxiliary_model_tier.as_deref(), &auxiliary_model)?;
     let session_id = params
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -12376,6 +12382,28 @@ pub fn run() {
 
 pub fn run_automation_cli(arguments: &[String]) -> Result<String, String> {
     automations::run_cli(arguments)
+}
+
+#[cfg(test)]
+mod auxiliary_model_tier_tests {
+    use super::resolve_auxiliary_model_tier;
+
+    #[test]
+    fn explicit_native_tier_wins_over_provider_model_name() {
+        assert_eq!(
+            resolve_auxiliary_model_tier(Some("haiku"), "glm-4.7").unwrap(),
+            "haiku"
+        );
+    }
+
+    #[test]
+    fn native_model_name_is_inferred_only_without_an_explicit_tier() {
+        assert_eq!(
+            resolve_auxiliary_model_tier(None, "claude-haiku-4-5-20251001").unwrap(),
+            "haiku"
+        );
+        assert!(resolve_auxiliary_model_tier(None, "glm-4.7").is_err());
+    }
 }
 
 #[cfg(test)]

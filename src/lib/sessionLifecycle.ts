@@ -648,6 +648,8 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       pendingTurnMessageId: undefined,
       pendingTurnInput: undefined,
       pendingTurnAttachments: undefined,
+      activeTurnInput: undefined,
+      contextRecoveryAttempts: undefined,
       interruptedAssistantText,
     });
 

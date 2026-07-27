@@ -12,6 +12,7 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
   const customModelId = useSettingsStore((s) => s.customModelId);
   const auxiliaryModel = useSettingsStore((s) => s.auxiliaryModel);
   const setSelectedModel = useSettingsStore((s) => s.setSelectedModel);
+  const setCustomModelId = useSettingsStore((s) => s.setCustomModelId);
   const setAuxiliaryModel = useSettingsStore((s) => s.setAuxiliaryModel);
   const providers = useProviderStore((s) => s.providers);
   const activeProviderId = useProviderStore((s) => s.activeProviderId);
@@ -50,13 +51,17 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
 
   const activeProvider = providers.find((provider) => provider.id === activeProviderId) ?? null;
   const displayOptions = getModelDisplayOptions(activeProvider);
-  const selectedOptionId = customModelId
+  const nativeCustomModelActive = !activeProvider
+    && !!customModelId
+    && displayOptions.some((option) => option.isExtra && option.id === customModelId);
+  const selectedOptionId = nativeCustomModelActive
     ? customModelId
     : getSelectedModelOptionId(selectedModel, displayOptions);
+  const auxiliaryOptions = displayOptions.filter((option) => !option.isExtra);
   const auxiliaryOptionId = getSelectedModelOptionId(auxiliaryModel, displayOptions);
 
   // Show custom model label when active; otherwise fall back to tier name.
-  const customOption = customModelId
+  const customOption = nativeCustomModelActive
     ? displayOptions.find((m) => m.id === customModelId)
     : undefined;
   const current = customOption
@@ -117,7 +122,11 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
                   if (option.id !== selectedOptionId) {
                     const oldShort = current.short;
                     const newShort = option.short;
-                    setSelectedModel(option.id);
+                    if (option.isExtra) {
+                      setCustomModelId(option.id);
+                    } else {
+                      setSelectedModel(option.id);
+                    }
                     // Insert model-switch tag into chat immediately
                     const msTabId = useSessionStore.getState().selectedSessionId;
                     if (msTabId) {
@@ -164,7 +173,7 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
             </div>
           </div>
           <div className="space-y-0.5">
-            {displayOptions.map((option) => (
+            {auxiliaryOptions.map((option) => (
               <button
                 key={`auxiliary:${option.id}`}
                 role="menuitemradio"

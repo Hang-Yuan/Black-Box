@@ -49,7 +49,7 @@ export interface ModelDisplayOption {
   sourceTier?: string;
 }
 
-function logicalModelDisplayOptions(): ModelDisplayOption[] {
+function logicalModelDisplayOptions(includeNativeCustomModels: boolean): ModelDisplayOption[] {
   const base: ModelDisplayOption[] = MODEL_OPTIONS.map((model) => ({
     id: model.id,
     label: model.label,
@@ -59,7 +59,7 @@ function logicalModelDisplayOptions(): ModelDisplayOption[] {
   }));
   // Append native custom model options configured via ANTHROPIC_CUSTOM_MODEL_OPTION.
   // These come from the login shell and are read once from the Rust bridge.
-  if (NATIVE_CUSTOM_MODEL_OPTIONS.length > 0) {
+  if (includeNativeCustomModels && NATIVE_CUSTOM_MODEL_OPTIONS.length > 0) {
     for (const opt of NATIVE_CUSTOM_MODEL_OPTIONS) {
       base.push({
         id: opt.model_id,
@@ -90,6 +90,13 @@ export function initNativeCustomModelOptions(): void {
   bridge.getNativeCustomModelOptions()
     .then((opts) => {
       NATIVE_CUSTOM_MODEL_OPTIONS = opts;
+      const selectedCustomModel = useSettingsStore.getState().customModelId;
+      if (
+        selectedCustomModel
+        && !opts.some((option) => option.model_id === selectedCustomModel)
+      ) {
+        useSettingsStore.getState().setCustomModelId(null);
+      }
       if (_onNativeOptionsLoaded) _onNativeOptionsLoaded();
     })
     .catch(() => {}); // Silently ignore — custom options are nice-to-have
@@ -138,7 +145,7 @@ export function shouldUseProviderModelOptions(provider: ApiProvider | null): boo
 export function getModelDisplayOptions(
   provider: ApiProvider | null = useProviderStore.getState().getActive(),
 ): ModelDisplayOption[] {
-  if (!shouldUseProviderModelOptions(provider)) return logicalModelDisplayOptions();
+  if (!shouldUseProviderModelOptions(provider)) return logicalModelDisplayOptions(provider === null);
 
   return MODEL_OPTIONS.flatMap((slot) => {
     const providerModel = provider!.modelMappings.find(
@@ -347,7 +354,7 @@ function resolveModelAgainstProvider(
 export function resolveModelOrError(selectedModel: string): ModelResolution {
   const provider = useProviderStore.getState().getActive();
   const customModel = useSettingsStore.getState().customModelId;
-  if (customModel) return { ok: true, model: customModel };
+  if (!provider && customModel) return { ok: true, model: customModel };
   return resolveModelAgainstProvider(selectedModel, provider);
 }
 
@@ -385,10 +392,11 @@ export function captureSpawnConfiguration(): SpawnConfigurationCapture {
   const settings = useSettingsStore.getState();
   const providerId = providerState.activeProviderId ?? '';
   const provider = providerState.providers.find((entry) => entry.id === providerId) ?? null;
-  // Custom model (e.g. from ANTHROPIC_CUSTOM_MODEL_OPTION) bypasses tier resolution.
+  // Native custom models never cross into a third-party provider route.
   const selectedModel = normalizeModelTier(settings.selectedModel);
-  const resolution: ModelResolution = settings.customModelId
-    ? { ok: true, model: settings.customModelId }
+  const nativeCustomModel = provider ? null : settings.customModelId;
+  const resolution: ModelResolution = nativeCustomModel
+    ? { ok: true, model: nativeCustomModel }
     : resolveModelAgainstProvider(selectedModel, provider);
   if (!resolution.ok) return resolution;
   const auxiliaryModelTier = normalizeModelTier(settings.auxiliaryModel);
@@ -426,6 +434,7 @@ export function captureSpawnConfiguration(): SpawnConfigurationCapture {
     configHash: [
       providerId,
       selectedModel,
+      nativeCustomModel ?? '',
       auxiliaryModelTier,
       settings.thinkingLevel,
       settings.agentTeamsEnabled ? 'teams' : 'solo',
@@ -533,6 +542,7 @@ export function spawnConfigHash(): string {
   return [
     providerState.activeProviderId ?? '',
     settings.selectedModel,
+    providerState.activeProviderId ? '' : settings.customModelId ?? '',
     settings.auxiliaryModel,
     settings.thinkingLevel,
     settings.agentTeamsEnabled ? 'teams' : 'solo',

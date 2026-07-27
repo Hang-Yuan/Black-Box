@@ -138,6 +138,7 @@ interface SettingsState {
   setMainView: (view: MainView) => void;
   setWorkingDirectory: (dir: string) => void;
   setSelectedModel: (model: string) => void;
+  setCustomModelId: (model: string | null) => void;
   setAuxiliaryModel: (model: string) => void;
   setSessionMode: (mode: SessionMode) => void;
   setLocale: (locale: Locale) => void;
@@ -260,15 +261,23 @@ export const useSettingsStore = create<SettingsState>()(
         set(() => ({ workingDirectory: dir })),
 
       setSelectedModel: (model) => {
-        const old = get().selectedModel;
+        const old = get().customModelId ?? get().selectedModel;
         const next = normalizeModelTier(model);
-        if (typeof model === 'string' && !isModelTier(model)) {
-          // Custom model — store as override, keep tier unchanged.
-          set(() => ({ customModelId: model }));
-        } else {
-          set(() => ({ selectedModel: next, customModelId: null }));
-        }
+        // Exact legacy Claude ids still normalize to their stable tier. Native
+        // custom models use the explicit setCustomModelId action so arbitrary
+        // provider ids cannot silently become a native override.
+        set(() => ({ selectedModel: next, customModelId: null }));
         if (old !== next) settingsEvents.emit('model-changed', { old, next });
+      },
+
+      setCustomModelId: (model) => {
+        const old = get().customModelId ?? get().selectedModel;
+        const next = model?.trim() || null;
+        set(() => ({ customModelId: next }));
+        const nextEffective = next ?? get().selectedModel;
+        if (old !== nextEffective) {
+          settingsEvents.emit('model-changed', { old, next: nextEffective });
+        }
       },
 
       setAuxiliaryModel: (model) => {
@@ -449,6 +458,7 @@ export const useSettingsStore = create<SettingsState>()(
         secondaryPanelWidth: state.secondaryPanelWidth,
         // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen
         selectedModel: state.selectedModel,
+        customModelId: state.customModelId,
         auxiliaryModel: state.auxiliaryModel,
         sessionMode: state.sessionMode,
         locale: state.locale,

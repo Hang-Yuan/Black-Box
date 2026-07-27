@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Black Box",
-  "version": "0.14.14",
+  "version": "0.14.15",
   "identifier": "com.blackbox.app",
   "build": {
     "beforeDevCommand": "pnpm dev",

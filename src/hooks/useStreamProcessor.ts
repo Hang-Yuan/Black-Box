@@ -26,6 +26,11 @@ import { bridge } from '../lib/tauri-bridge';
 import { spawnConfigHash, getAutoCompactThreshold } from '../lib/api-provider';
 import { buildApiRetryStatus } from '../lib/api-retry';
 import {
+  isGenericContextGreeting,
+  isGreetingOnlyPrompt,
+  shouldRetryContextDrop,
+} from '../lib/context-recovery';
+import {
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from '../lib/presentation-sanitizer';
@@ -218,6 +223,13 @@ function isCliPlaceholder(text: string | undefined | null): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
   return CLI_INTERNAL_PLACEHOLDERS.some((p) => trimmed === p);
+}
+
+function shouldHoldPotentialContextDropGreeting(tabId: string, text: string): boolean {
+  const meta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+  return (meta?.contextRecoveryAttempts ?? 0) < 1
+    && !isGreetingOnlyPrompt(meta?.activeTurnInput)
+    && isGenericContextGreeting(text);
 }
 
 // --- Streaming text buffer ---
@@ -447,6 +459,8 @@ export function drainPendingQueueAfterSettlement({
   store.setSessionMeta(tabId, {
     pendingTurnMessageId,
     pendingTurnInput: queuedText,
+    activeTurnInput: queuedText,
+    contextRecoveryAttempts: 0,
     turnAcceptedForResume: false,
     turnStartTime: Date.now(),
     lastProgressAt: Date.now(),
@@ -464,6 +478,8 @@ export function drainPendingQueueAfterSettlement({
       stdinId: undefined,
       stdinReady: false,
       pendingReadyMessage: undefined,
+      activeTurnInput: undefined,
+      contextRecoveryAttempts: undefined,
     });
     store.setSessionStatus(tabId, 'error');
   });
@@ -538,6 +554,8 @@ function markStdinReady(tabId: string, stdinId: string | undefined, model: strin
             pendingTurnMessageId: undefined,
             pendingTurnInput: undefined,
             pendingTurnAttachments: undefined,
+            activeTurnInput: undefined,
+            contextRecoveryAttempts: undefined,
             turnStartTime: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
@@ -1399,7 +1417,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         for (let blockIdx = 0; blockIdx < content.length; blockIdx++) {
           const block = content[blockIdx];
           if (block.type === 'text') {
-            if (bgHasAskUserQuestion) continue;
+            if (
+              bgHasAskUserQuestion
+              || isCliPlaceholder(block.text)
+              || shouldHoldPotentialContextDropGreeting(tabId, block.text)
+            ) continue;
             const textId = msg.uuid ? `${msg.uuid}_text_${blockIdx}` : generateMessageId();
             store.addMessage(tabId, {
               id: textId,
@@ -1662,6 +1684,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               turnStartTime: undefined,
               lastProgressAt: undefined,
               apiRetry: undefined,
+              activeTurnInput: undefined,
+              contextRecoveryAttempts: undefined,
             });
           }
           useSessionStore.getState().fetchSessions();
@@ -1674,6 +1698,63 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           timestamp: Date.now(),
           stdinId: bgResultStdinId,
         });
+
+        const bgResultDisplayText = typeof msg.result === 'string'
+          ? sanitizeAssistantTextForDisplay(msg.result)
+          : typeof msg.content === 'string'
+            ? sanitizeAssistantTextForDisplay(msg.content)
+            : '';
+        const bgRecoveryMeta = store.getTab(tabId)?.sessionMeta;
+        if (
+          bgResultStdinId
+          && shouldRetryContextDrop({
+            prompt: bgRecoveryMeta?.activeTurnInput,
+            response: bgResultDisplayText,
+            usage: msg.usage,
+            subtype: msg.subtype,
+            attempts: bgRecoveryMeta?.contextRecoveryAttempts,
+          })
+        ) {
+          const bgMessages = store.getTab(tabId)?.messages ?? [];
+          const greeting = [...bgMessages].reverse().find(
+            (message) => message.role === 'assistant'
+              && message.type === 'text'
+              && isGenericContextGreeting(message.content),
+          );
+          if (greeting) store.removeMessage(tabId, greeting.id);
+          const retryPrompt = bgRecoveryMeta!.activeTurnInput!;
+          const retryStartedAt = Date.now();
+          store.setSessionStatus(tabId, 'running');
+          store.setActivityStatus(tabId, { phase: 'thinking' });
+          store.setSessionMeta(tabId, {
+            contextRecoveryAttempts: (bgRecoveryMeta?.contextRecoveryAttempts ?? 0) + 1,
+            turnStartTime: retryStartedAt,
+            lastProgressAt: retryStartedAt,
+            inputTokens: 0,
+            outputTokens: 0,
+            apiRetry: undefined,
+          });
+          console.warn('[BLACKBOX] Tiny zero-cache greeting detected; retrying the active turn once');
+          bridge.sendStdin(bgResultStdinId, retryPrompt).catch((error) => {
+            console.error('[BLACKBOX] Context-drop recovery retry failed:', error);
+            const draft = store.getTab(tabId)?.inputDraft.trim() || '';
+            store.setInputDraft(tabId, draft ? `${draft}\n\n${retryPrompt}` : retryPrompt);
+            store.setSessionMeta(tabId, {
+              activeTurnInput: undefined,
+              contextRecoveryAttempts: undefined,
+            });
+            store.setSessionStatus(tabId, 'error');
+            store.addMessage(tabId, {
+              id: generateMessageId(),
+              role: 'system',
+              type: 'text',
+              content: '检测到会话上下文未载入，自动重试失败。原消息已放回输入框。',
+              commandType: 'error',
+              timestamp: Date.now(),
+            });
+          });
+          break;
+        }
 
         // Clear pending command on result (e.g. /compact completing on background tab)
         completePendingCommand(tabId, {
@@ -1709,11 +1790,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             turnStartTime: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
+            activeTurnInput: undefined,
+            contextRecoveryAttempts: undefined,
           });
         }
-        const bgResultDisplayText = typeof msg.result === 'string'
-          ? sanitizeAssistantTextForDisplay(msg.result)
-          : '';
         if (bgResultDisplayText && !isCliPlaceholder(bgResultDisplayText)) {
           // Only add if not already delivered via 'assistant' event
           const bgTab = store.getTab(tabId);
@@ -2494,7 +2574,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         for (let blockIdx = 0; blockIdx < content.length; blockIdx++) {
           const block = content[blockIdx];
           if (block.type === 'text') {
-            if (hasAskUserQuestion) continue;
+            if (
+              hasAskUserQuestion
+              || isCliPlaceholder(block.text)
+              || shouldHoldPotentialContextDropGreeting(tabId, block.text)
+            ) continue;
             setActivityStatus({ phase: 'writing' });
             agentActions.updatePhase(agentId, 'writing');
             // Use msg.uuid + block index as stable ID so re-delivered
@@ -2904,6 +2988,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               turnStartTime: undefined,
               lastProgressAt: undefined,
               apiRetry: undefined,
+              activeTurnInput: undefined,
+              contextRecoveryAttempts: undefined,
             });
           }
           agentActions.completeAll('error');
@@ -2962,6 +3048,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               providerSwitchPendingText: undefined,
               modelSwitched: false,
               modelSwitchPendingText: undefined,
+              activeTurnInput: undefined,
+              contextRecoveryAttempts: undefined,
             });
             const currentDraft = useChatStore.getState().getTab(tabId)?.inputDraft.trim() || '';
             useChatStore.getState().setInputDraft(
@@ -3034,6 +3122,63 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           resultDisplayText = sanitizeAssistantTextForDisplay(msg.result);
         } else if (typeof msg.content === 'string' && msg.content) {
           resultDisplayText = sanitizeAssistantTextForDisplay(msg.content);
+        }
+
+        const recoveryMeta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+        if (
+          msgStdinId
+          && shouldRetryContextDrop({
+            prompt: recoveryMeta?.activeTurnInput,
+            response: resultDisplayText,
+            usage: msg.usage,
+            subtype: msg.subtype,
+            attempts: recoveryMeta?.contextRecoveryAttempts,
+          })
+        ) {
+          const currentMessages = useChatStore.getState().getTab(tabId)?.messages ?? [];
+          const greeting = [...currentMessages].reverse().find(
+            (message) => message.role === 'assistant'
+              && message.type === 'text'
+              && isGenericContextGreeting(message.content),
+          );
+          if (greeting) useChatStore.getState().removeMessage(tabId, greeting.id);
+          const retryPrompt = recoveryMeta!.activeTurnInput!;
+          const retryStartedAt = Date.now();
+          setSessionStatus('running');
+          setActivityStatus({ phase: 'thinking' });
+          setSessionMeta({
+            contextRecoveryAttempts: (recoveryMeta?.contextRecoveryAttempts ?? 0) + 1,
+            turnStartTime: retryStartedAt,
+            lastProgressAt: retryStartedAt,
+            inputTokens: 0,
+            outputTokens: 0,
+            apiRetry: undefined,
+          });
+          console.warn('[BLACKBOX] Tiny zero-cache greeting detected; retrying the active turn once');
+          bridge.sendStdin(msgStdinId, retryPrompt).catch((error) => {
+            console.error('[BLACKBOX] Context-drop recovery retry failed:', error);
+            const draft = useChatStore.getState().getTab(tabId)?.inputDraft.trim() || '';
+            const restored = draft ? `${draft}\n\n${retryPrompt}` : retryPrompt;
+            useChatStore.getState().setInputDraft(tabId, restored);
+            if (useSessionStore.getState().selectedSessionId === tabId) {
+              setInputSync(restored);
+            }
+            setSessionMeta({
+              activeTurnInput: undefined,
+              contextRecoveryAttempts: undefined,
+            });
+            setSessionStatus('error');
+            setActivityStatus({ phase: 'error' });
+            addMessage({
+              id: generateMessageId(),
+              role: 'system',
+              type: 'text',
+              content: '检测到会话上下文未载入，自动重试失败。原消息已放回输入框。',
+              commandType: 'error',
+              timestamp: Date.now(),
+            });
+          });
+          break;
         }
 
         // If we have cost metadata AND a pending slash command (e.g., /compact, /cost),
@@ -3137,6 +3282,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             turnStartTime: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
+            activeTurnInput: undefined,
+            contextRecoveryAttempts: undefined,
           });
         }
         agentActions.completeAll(
@@ -3361,6 +3508,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             pendingReadyMessage: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
+            activeTurnInput: undefined,
+            contextRecoveryAttempts: undefined,
           });
         }
 
