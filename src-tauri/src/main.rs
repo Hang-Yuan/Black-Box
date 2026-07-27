@@ -33,6 +33,20 @@ fn main() {
     }
     if arguments
         .first()
+        .is_some_and(|value| value == "--identity-bootstrap-hook")
+    {
+        if arguments.len() != 1 {
+            eprintln!("--identity-bootstrap-hook does not accept arguments");
+            std::process::exit(1);
+        }
+        if let Err(error) = blackbox_lib::run_identity_bootstrap_hook() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if arguments
+        .first()
         .is_some_and(|value| value == "--automation-tool")
     {
         match blackbox_lib::run_automation_cli(&arguments[1..]) {

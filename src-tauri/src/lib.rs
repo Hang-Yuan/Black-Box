@@ -13,6 +13,7 @@ mod experimental_memory_recovery;
 mod experimental_petpack;
 mod experimental_rag;
 mod experimental_sqlite_attestation;
+mod identity_bootstrap;
 mod mcp_manager;
 pub mod path_access;
 mod plugin_manager;
@@ -2836,6 +2837,10 @@ pub fn run_time_context_hook() -> Result<(), String> {
     time_context_hook::run()
 }
 
+pub fn run_identity_bootstrap_hook() -> Result<(), String> {
+    identity_bootstrap::run()
+}
+
 pub(crate) fn native_agent_model_tier(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     let tier = match normalized.as_str() {
@@ -2923,9 +2928,40 @@ pub(crate) fn auxiliary_model_hook_settings(
                     "args": ["--time-context-hook"],
                     "timeout": 5
                 }]
+            }],
+            "SessionStart": [{
+                "matcher": "startup|resume|clear|compact|fork",
+                "hooks": [{
+                    "type": "command",
+                    "command": current_exe.to_string_lossy(),
+                    "args": ["--identity-bootstrap-hook"],
+                    "timeout": 10
+                }]
             }]
         }
     }))
+}
+
+#[tauri::command]
+async fn get_identity_bootstrap_status(
+) -> Result<identity_bootstrap::IdentityBootstrapStatus, String> {
+    identity_bootstrap::status()
+}
+
+#[tauri::command]
+async fn configure_identity_bootstrap(
+    source_files: Vec<String>,
+    startup_skill: Option<String>,
+    startup_skill_source: Option<String>,
+) -> Result<identity_bootstrap::IdentityBootstrapStatus, String> {
+    identity_bootstrap::configure(source_files, startup_skill, startup_skill_source)
+}
+
+#[tauri::command]
+async fn set_identity_bootstrap_enabled(
+    enabled: bool,
+) -> Result<identity_bootstrap::IdentityBootstrapStatus, String> {
+    identity_bootstrap::set_enabled(enabled)
 }
 
 #[tauri::command]
@@ -12183,6 +12219,9 @@ pub fn run() {
             create_hook_definition,
             update_hook_definition,
             delete_hook_definition,
+            get_identity_bootstrap_status,
+            configure_identity_bootstrap,
+            set_identity_bootstrap_enabled,
             read_skill,
             write_skill,
             delete_skill,

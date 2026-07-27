@@ -196,6 +196,15 @@ export interface HookDefinitionInfo {
   disabledBySource: boolean;
 }
 
+export interface IdentityBootstrapStatus {
+  configured: boolean;
+  enabled: boolean;
+  files: string[];
+  startupSkill?: string | null;
+  startupSkillInstalled: boolean;
+  marker: string;
+}
+
 export interface CreateHookRequest {
   scope: 'user' | 'project' | 'local';
   event: string;
@@ -878,6 +887,23 @@ export const bridge = {
     invoke<void>('delete_hook_definition', { cwd, guard: hook }),
 
   listHookEvents: () => invoke<string[]>('list_hook_events'),
+
+  getIdentityBootstrapStatus: () =>
+    invoke<IdentityBootstrapStatus>('get_identity_bootstrap_status'),
+
+  configureIdentityBootstrap: (
+    sourceFiles: string[],
+    startupSkill?: string | null,
+    startupSkillSource?: string | null,
+  ) =>
+    invoke<IdentityBootstrapStatus>('configure_identity_bootstrap', {
+      sourceFiles,
+      startupSkill: startupSkill?.trim() || null,
+      startupSkillSource: startupSkillSource?.trim() || null,
+    }),
+
+  setIdentityBootstrapEnabled: (enabled: boolean) =>
+    invoke<IdentityBootstrapStatus>('set_identity_bootstrap_enabled', { enabled }),
 
   readSkill: (path: string, tabId?: string) =>
     invoke<string>('read_skill', { path, tabId: tabId ?? null }),

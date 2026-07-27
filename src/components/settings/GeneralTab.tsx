@@ -12,6 +12,7 @@ import { UserAvatar } from '../shared/UserAvatar';
 import { AvatarCropModal } from './AvatarCropModal';
 import {
   bridge,
+  type IdentityBootstrapStatus,
   type PowerAssertionStatus,
   type SessionOrganizationReport,
 } from '../../lib/tauri-bridge';
@@ -163,6 +164,11 @@ export function GeneralTab() {
   const [organizationReport, setOrganizationReport] = useState<SessionOrganizationReport | null>(null);
   const [powerStatus, setPowerStatus] = useState<PowerAssertionStatus | null>(null);
   const [powerError, setPowerError] = useState<string | null>(null);
+  const [identityStatus, setIdentityStatus] = useState<IdentityBootstrapStatus | null>(null);
+  const [identitySkill, setIdentitySkill] = useState('week-sync');
+  const [identitySkillSource, setIdentitySkillSource] = useState<string | null>(null);
+  const [identityBusy, setIdentityBusy] = useState(false);
+  const [identityError, setIdentityError] = useState<string | null>(null);
   const activeProvider = providers.find((provider) => provider.id === activeProviderId) ?? null;
   const modelOptions = getModelDisplayOptions(activeProvider);
   const selectedModelOption = getSelectedModelOptionId(selectedModel, modelOptions);
@@ -173,6 +179,22 @@ export function GeneralTab() {
     const update = () => setSystemDark(media.matches);
     media.addEventListener('change', update);
     return () => media.removeEventListener('change', update);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    bridge.getIdentityBootstrapStatus()
+      .then((status) => {
+        if (cancelled) return;
+        setIdentityStatus(status);
+        if (status.startupSkill) setIdentitySkill(status.startupSkill);
+      })
+      .catch((error) => {
+        if (!cancelled) setIdentityError(String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -277,6 +299,64 @@ export function GeneralTab() {
       setOrganizationBusy(false);
     }
   }, [t]);
+
+  const handleIdentityImport = useCallback(async () => {
+    setIdentityError(null);
+    const selected = await open({
+      title: t('settings.identity.selectFiles'),
+      multiple: true,
+      directory: false,
+      filters: [
+        { name: 'Identity text', extensions: ['md', 'txt'] },
+      ],
+    });
+    if (!selected) return;
+    const sourceFiles = Array.isArray(selected) ? selected : [selected];
+    if (sourceFiles.length === 0) return;
+    setIdentityBusy(true);
+    try {
+      const status = await bridge.configureIdentityBootstrap(
+        sourceFiles,
+        identitySkill,
+        identitySkillSource,
+      );
+      setIdentityStatus(status);
+      setIdentitySkillSource(null);
+    } catch (error) {
+      setIdentityError(String(error));
+    } finally {
+      setIdentityBusy(false);
+    }
+  }, [identitySkill, identitySkillSource, t]);
+
+  const handleIdentitySkillSelect = useCallback(async () => {
+    setIdentityError(null);
+    const selected = await open({
+      title: t('settings.identity.selectSkill'),
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'Claude skill', extensions: ['md'] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    if (!selected.endsWith('/SKILL.md') && !selected.endsWith('\\SKILL.md')) {
+      setIdentityError(t('settings.identity.skillFileRequired'));
+      return;
+    }
+    setIdentitySkillSource(selected);
+  }, [t]);
+
+  const handleIdentityToggle = useCallback(async () => {
+    if (!identityStatus?.configured) return;
+    setIdentityBusy(true);
+    setIdentityError(null);
+    try {
+      setIdentityStatus(await bridge.setIdentityBootstrapEnabled(!identityStatus.enabled));
+    } catch (error) {
+      setIdentityError(String(error));
+    } finally {
+      setIdentityBusy(false);
+    }
+  }, [identityStatus]);
 
   return (
     <div className="space-y-6">
@@ -408,6 +488,88 @@ export function GeneralTab() {
         )}
 
         <p className="mt-3 text-[10px] leading-4 text-text-tertiary">{t('settings.power.limit')}</p>
+      </section>
+
+      <section
+        className="rounded-xl border border-border-subtle bg-bg-secondary/35 p-4"
+        data-testid="identity-bootstrap-settings"
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-[13px] font-semibold text-text-primary">
+              {t('settings.identity.title')}
+            </h3>
+            <p className="mt-1 text-[11px] leading-5 text-text-muted">
+              {t('settings.identity.description')}
+            </p>
+          </div>
+          <PowerSwitch
+            checked={identityStatus?.enabled ?? false}
+            disabled={identityBusy || !identityStatus?.configured}
+            label={t('settings.identity.title')}
+            testId="identity-bootstrap-toggle"
+            onToggle={handleIdentityToggle}
+          />
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+          <label className="min-w-0">
+            <span className="mb-1.5 block text-[11px] font-medium text-text-primary">
+              {t('settings.identity.startupSkill')}
+            </span>
+            <input
+              type="text"
+              value={identitySkill}
+              onChange={(event) => setIdentitySkill(event.target.value)}
+              disabled={identityBusy}
+              placeholder="week-sync"
+              className="w-full rounded-lg border border-border-subtle bg-bg-card/70 px-3 py-2 text-[11px] text-text-primary placeholder-text-tertiary focus:border-accent/50 focus:outline-none disabled:opacity-45"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={identityBusy}
+            onClick={handleIdentitySkillSelect}
+            className="self-end rounded-lg border border-border-subtle bg-bg-card/70 px-3 py-2 text-[11px] font-medium text-text-primary transition-smooth hover:border-accent/35 hover:bg-bg-card disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {identitySkillSource
+              ? t('settings.identity.skillSelected')
+              : t('settings.identity.selectSkill')}
+          </button>
+          <button
+            type="button"
+            disabled={identityBusy}
+            onClick={handleIdentityImport}
+            className="self-end rounded-lg border border-accent/30 bg-accent/[0.08] px-3 py-2 text-[11px] font-medium text-accent transition-smooth hover:bg-accent/[0.13] disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {identityStatus?.configured
+              ? t('settings.identity.replace')
+              : t('settings.identity.import')}
+          </button>
+        </div>
+
+        {identityStatus?.configured && (
+          <div className="mt-3 rounded-lg border border-border-subtle bg-bg-card/60 px-3 py-2 text-[10px] leading-4 text-text-muted">
+            <div>
+              {t('settings.identity.files')}: {identityStatus.files.join(' → ')}
+            </div>
+            {identityStatus.startupSkill && (
+              <div className={identityStatus.startupSkillInstalled ? 'text-emerald-500' : 'text-amber-500'}>
+                {identityStatus.startupSkillInstalled
+                  ? t('settings.identity.skillReady').replace('{skill}', identityStatus.startupSkill)
+                  : t('settings.identity.skillMissing').replace('{skill}', identityStatus.startupSkill)}
+              </div>
+            )}
+          </div>
+        )}
+        <p className="mt-3 text-[10px] leading-4 text-text-tertiary">
+          {t('settings.identity.isolation')}
+        </p>
+        {identityError && (
+          <p className="mt-2 text-[10px] leading-4 text-error" role="alert">
+            {t('settings.identity.error').replace('{error}', identityError)}
+          </p>
+        )}
       </section>
 
       <section

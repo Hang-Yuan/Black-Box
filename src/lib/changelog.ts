@@ -19,6 +19,24 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.16',
+    date: '2026-07-28',
+    highlights: {
+      zh: [
+        '修复切换 API 或模型后恢复会话时的上下文降级与重复问候，失败的恢复不再静默创建空白会话',
+        '辅助模型始终使用 Claude Code 原生档位，并由当前 Provider 的四档映射解析，避免 GLM 等兼容通道因缺少 Haiku 映射而中断',
+        '新增 Black Box 私有身份启动链：显式导入的身份快照会在新建、恢复、清空、压缩和分支会话启动时按顺序注入，并带完整性标记与失败兜底',
+        '身份文件、启动同步 Skill、Hooks 与运行状态全部留在 Black Box 私有 Claude 根中，不读取或共享 TOKENICODE 与 ~/.claude 的配置',
+      ],
+      en: [
+        'Fixes context degradation and repeated greetings after API or model switches, while failed resumes no longer fall through to a blank conversation',
+        'Keeps auxiliary routing on native Claude Code tiers and resolves them through the active provider’s four-slot mapping, preventing compatible providers such as GLM from failing on a missing Haiku mapping',
+        'Adds an explicit private identity bootstrap whose snapshots load in order for new, resumed, cleared, compacted, and forked sessions with an integrity marker and fallback',
+        'Keeps identity files, the startup sync skill, hooks, and runtime state inside Black Box’s private Claude root without reading or sharing TOKENICODE or ~/.claude configuration',
+      ],
+    },
+  },
+  {
     version: '0.14.14',
     date: '2026-07-26',
     highlights: {
