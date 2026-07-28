@@ -12,11 +12,15 @@ import { UserAvatar } from '../shared/UserAvatar';
 import { AvatarCropModal } from './AvatarCropModal';
 import {
   bridge,
+  type ClaudeRuntimeEnvironment,
+  type ClaudeRuntimeEnvironmentStatus,
   type IdentityBootstrapStatus,
   type PowerAssertionStatus,
   type SessionOrganizationReport,
 } from '../../lib/tauri-bridge';
 import { ask, open, save } from '@tauri-apps/plugin-dialog';
+import { relaunch } from '@tauri-apps/plugin-process';
+import { settleBackendProcessesForCliUpdate } from '../../lib/sessionLifecycle';
 
 interface SurfacePreviewPalette {
   canvas: string;
@@ -169,6 +173,9 @@ export function GeneralTab() {
   const [identitySkillSource, setIdentitySkillSource] = useState<string | null>(null);
   const [identityBusy, setIdentityBusy] = useState(false);
   const [identityError, setIdentityError] = useState<string | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<ClaudeRuntimeEnvironmentStatus | null>(null);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const activeProvider = providers.find((provider) => provider.id === activeProviderId) ?? null;
   const modelOptions = getModelDisplayOptions(activeProvider);
   const selectedModelOption = getSelectedModelOptionId(selectedModel, modelOptions);
@@ -183,6 +190,13 @@ export function GeneralTab() {
 
   useEffect(() => {
     let cancelled = false;
+    bridge.getClaudeRuntimeEnvironment()
+      .then((status) => {
+        if (!cancelled) setRuntimeStatus(status);
+      })
+      .catch((error) => {
+        if (!cancelled) setRuntimeError(String(error));
+      });
     bridge.getIdentityBootstrapStatus()
       .then((status) => {
         if (cancelled) return;
@@ -196,6 +210,36 @@ export function GeneralTab() {
       cancelled = true;
     };
   }, []);
+
+  const handleRuntimeEnvironmentChange = useCallback(async (
+    environment: ClaudeRuntimeEnvironment,
+  ) => {
+    if (!runtimeStatus || runtimeStatus.active === environment || runtimeBusy) return;
+    setRuntimeBusy(true);
+    setRuntimeError(null);
+    try {
+      const blockers = await bridge.getCliUpdateBlockers();
+      if (blockers.runningAutomation) {
+        throw new Error(t('settings.runtime.automationBusy'));
+      }
+      if (blockers.activeSessionIds.length > 0) {
+        await settleBackendProcessesForCliUpdate(blockers.activeSessionIds);
+      }
+      const selected = await bridge.setClaudeRuntimeEnvironment(environment);
+      setRuntimeStatus(selected);
+      await relaunch();
+    } catch (error) {
+      const message = String(error);
+      if (message.includes('CLI_UPDATE_SESSION_BUSY')) {
+        setRuntimeError(t('settings.runtime.sessionBusy'));
+      } else if (message.includes('CLI_UPDATE_SESSION_UNKNOWN')) {
+        setRuntimeError(t('settings.runtime.sessionUnknown'));
+      } else {
+        setRuntimeError(message);
+      }
+      setRuntimeBusy(false);
+    }
+  }, [runtimeBusy, runtimeStatus, t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -492,6 +536,59 @@ export function GeneralTab() {
 
       <section
         className="rounded-xl border border-border-subtle bg-bg-secondary/35 p-4"
+        data-testid="claude-runtime-environment-settings"
+      >
+        <div>
+          <h3 className="text-[13px] font-semibold text-text-primary">
+            {t('settings.runtime.title')}
+          </h3>
+          <p className="mt-1 text-[11px] leading-5 text-text-muted">
+            {t('settings.runtime.description')}
+          </p>
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          {(['isolated', 'system'] as const).map((environment) => {
+            const selected = runtimeStatus?.active === environment;
+            return (
+              <button
+                key={environment}
+                type="button"
+                disabled={!runtimeStatus || runtimeBusy || runtimeStatus.overriddenForDevelopment}
+                onClick={() => void handleRuntimeEnvironmentChange(environment)}
+                className={`rounded-lg border px-3 py-3 text-left transition-smooth disabled:cursor-not-allowed disabled:opacity-45
+                  ${selected
+                    ? 'border-accent/45 bg-accent/[0.09] text-accent'
+                    : 'border-border-subtle bg-bg-card/60 text-text-primary hover:border-accent/25 hover:bg-bg-card'}`}
+              >
+                <span className="block text-[11px] font-semibold">
+                  {t(`settings.runtime.${environment}`)}
+                </span>
+                <span className="mt-1 block text-[10px] leading-4 text-text-muted">
+                  {t(`settings.runtime.${environment}Hint`)}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {runtimeStatus && (
+          <p className="mt-3 break-all text-[10px] leading-4 text-text-tertiary">
+            {t('settings.runtime.activePath')}: {runtimeStatus.activeConfigDir}
+          </p>
+        )}
+        {runtimeBusy && (
+          <p className="mt-2 text-[10px] leading-4 text-text-muted">
+            {t('settings.runtime.relaunching')}
+          </p>
+        )}
+        {runtimeError && (
+          <p className="mt-2 text-[10px] leading-4 text-error" role="alert">
+            {t('settings.runtime.error').replace('{error}', runtimeError)}
+          </p>
+        )}
+      </section>
+
+      <section
+        className="rounded-xl border border-border-subtle bg-bg-secondary/35 p-4"
         data-testid="identity-bootstrap-settings"
       >
         <div className="flex items-start justify-between gap-4">
@@ -505,14 +602,18 @@ export function GeneralTab() {
           </div>
           <PowerSwitch
             checked={identityStatus?.enabled ?? false}
-            disabled={identityBusy || !identityStatus?.configured}
+            disabled={identityBusy || !identityStatus?.configured || runtimeStatus?.active === 'system'}
             label={t('settings.identity.title')}
             testId="identity-bootstrap-toggle"
             onToggle={handleIdentityToggle}
           />
         </div>
 
-        <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+        {runtimeStatus?.active === 'system' ? (
+          <p className="mt-4 rounded-lg border border-border-subtle bg-bg-card/60 px-3 py-2 text-[10px] leading-4 text-text-muted">
+            {t('settings.identity.systemManaged')}
+          </p>
+        ) : <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
           <label className="min-w-0">
             <span className="mb-1.5 block text-[11px] font-medium text-text-primary">
               {t('settings.identity.startupSkill')}
@@ -546,7 +647,7 @@ export function GeneralTab() {
               ? t('settings.identity.replace')
               : t('settings.identity.import')}
           </button>
-        </div>
+        </div>}
 
         {identityStatus?.configured && (
           <div className="mt-3 rounded-lg border border-border-subtle bg-bg-card/60 px-3 py-2 text-[10px] leading-4 text-text-muted">
@@ -563,7 +664,9 @@ export function GeneralTab() {
           </div>
         )}
         <p className="mt-3 text-[10px] leading-4 text-text-tertiary">
-          {t('settings.identity.isolation')}
+          {t(runtimeStatus?.active === 'system'
+            ? 'settings.identity.systemIsolation'
+            : 'settings.identity.isolation')}
         </p>
         {identityError && (
           <p className="mt-2 text-[10px] leading-4 text-error" role="alert">

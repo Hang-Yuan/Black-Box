@@ -1,9 +1,52 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const CONFIG_OVERRIDE_ENV: &str = "BLACKBOX_CLAUDE_CONFIG_DIR";
+const ACTIVE_ENVIRONMENT_ENV: &str = "BLACKBOX_ACTIVE_CLAUDE_ENVIRONMENT";
 const MIGRATION_RECEIPT: &str = "claude-isolation-v1.json";
+const RUNTIME_ENVIRONMENT_FILE: &str = "claude-runtime-environment.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ClaudeRuntimeEnvironment {
+    Isolated,
+    System,
+}
+
+impl ClaudeRuntimeEnvironment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::System => "system",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "isolated" => Some(Self::Isolated),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeEnvironmentPreference {
+    version: u8,
+    environment: ClaudeRuntimeEnvironment,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeEnvironmentStatus {
+    pub(crate) active: ClaudeRuntimeEnvironment,
+    pub(crate) selected: ClaudeRuntimeEnvironment,
+    pub(crate) active_config_dir: String,
+    pub(crate) requires_restart: bool,
+    pub(crate) overridden_for_development: bool,
+}
 
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,23 +68,149 @@ pub(crate) fn blackbox_dir() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".blackbox"))
 }
 
-/// Black Box owns a private Claude state root. The executable may be shared,
-/// but sessions, settings, hooks, plugins, skills, tasks, and auth state may not.
-pub(crate) fn claude_config_dir() -> Result<PathBuf, String> {
+pub(crate) fn private_claude_config_dir() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os(CONFIG_OVERRIDE_ENV).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
     Ok(blackbox_dir()?.join("claude"))
 }
 
+fn system_claude_config_dir() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".claude"))
+}
+
+fn runtime_environment_path() -> Result<PathBuf, String> {
+    Ok(blackbox_dir()?.join(RUNTIME_ENVIRONMENT_FILE))
+}
+
+fn read_selected_environment() -> Result<ClaudeRuntimeEnvironment, String> {
+    if std::env::var_os(CONFIG_OVERRIDE_ENV).is_some() {
+        return Ok(ClaudeRuntimeEnvironment::Isolated);
+    }
+    let path = runtime_environment_path()?;
+    if !path.exists() {
+        return Ok(ClaudeRuntimeEnvironment::Isolated);
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("Cannot read Claude runtime environment preference: {error}"))?;
+    let preference: RuntimeEnvironmentPreference = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Cannot parse Claude runtime environment preference: {error}"))?;
+    if preference.version != 1 {
+        return Err(format!(
+            "Unsupported Claude runtime environment preference version {}",
+            preference.version
+        ));
+    }
+    Ok(preference.environment)
+}
+
+pub(crate) fn active_environment() -> Result<ClaudeRuntimeEnvironment, String> {
+    if std::env::var_os(CONFIG_OVERRIDE_ENV).is_some() {
+        return Ok(ClaudeRuntimeEnvironment::Isolated);
+    }
+    if let Some(value) = std::env::var_os(ACTIVE_ENVIRONMENT_ENV) {
+        let value = value.to_string_lossy();
+        return ClaudeRuntimeEnvironment::parse(&value)
+            .ok_or_else(|| format!("Invalid active Claude runtime environment: {value}"));
+    }
+    read_selected_environment()
+}
+
+pub(crate) fn uses_system_environment() -> Result<bool, String> {
+    Ok(active_environment()? == ClaudeRuntimeEnvironment::System)
+}
+
+/// Resolve the active Claude state root. Isolated mode keeps Black Box state
+/// private; system mode intentionally uses the user's normal ~/.claude state.
+pub(crate) fn claude_config_dir() -> Result<PathBuf, String> {
+    match active_environment()? {
+        ClaudeRuntimeEnvironment::Isolated => private_claude_config_dir(),
+        ClaudeRuntimeEnvironment::System => system_claude_config_dir(),
+    }
+}
+
 pub(crate) fn apply_to_tokio_command(command: &mut tokio::process::Command) -> Result<(), String> {
-    command.env("CLAUDE_CONFIG_DIR", claude_config_dir()?);
+    match active_environment()? {
+        ClaudeRuntimeEnvironment::Isolated => {
+            command.env("CLAUDE_CONFIG_DIR", private_claude_config_dir()?);
+        }
+        ClaudeRuntimeEnvironment::System => {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn apply_to_std_command(command: &mut std::process::Command) -> Result<(), String> {
-    command.env("CLAUDE_CONFIG_DIR", claude_config_dir()?);
+    match active_environment()? {
+        ClaudeRuntimeEnvironment::Isolated => {
+            command.env("CLAUDE_CONFIG_DIR", private_claude_config_dir()?);
+        }
+        ClaudeRuntimeEnvironment::System => {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn activate_selected_environment() -> Result<PathBuf, String> {
+    let environment = read_selected_environment()?;
+    // SAFETY: the caller invokes this before the Tauri runtime and worker
+    // threads start. Child hooks inherit this immutable active-mode marker.
+    unsafe {
+        std::env::set_var(ACTIVE_ENVIRONMENT_ENV, environment.as_str());
+        match environment {
+            ClaudeRuntimeEnvironment::Isolated => {
+                std::env::set_var("CLAUDE_CONFIG_DIR", private_claude_config_dir()?);
+            }
+            ClaudeRuntimeEnvironment::System => {
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+    }
+    claude_config_dir()
+}
+
+pub(crate) fn runtime_environment_status() -> Result<RuntimeEnvironmentStatus, String> {
+    let active = active_environment()?;
+    let selected = read_selected_environment()?;
+    Ok(RuntimeEnvironmentStatus {
+        active,
+        selected,
+        active_config_dir: claude_config_dir()?.to_string_lossy().into_owned(),
+        requires_restart: active != selected,
+        overridden_for_development: std::env::var_os(CONFIG_OVERRIDE_ENV).is_some(),
+    })
+}
+
+pub(crate) fn select_runtime_environment(
+    environment: String,
+) -> Result<RuntimeEnvironmentStatus, String> {
+    if std::env::var_os(CONFIG_OVERRIDE_ENV).is_some() {
+        return Err(
+            "The Claude runtime environment is fixed by BLACKBOX_CLAUDE_CONFIG_DIR in this development instance"
+                .to_string(),
+        );
+    }
+    let environment = ClaudeRuntimeEnvironment::parse(&environment)
+        .ok_or_else(|| "Claude runtime environment must be isolated or system".to_string())?;
+    let path = runtime_environment_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Claude runtime environment preference has no parent".to_string())?;
+    protect_directory(parent)?;
+    let payload = serde_json::to_vec_pretty(&RuntimeEnvironmentPreference {
+        version: 1,
+        environment,
+    })
+    .map_err(|error| format!("Cannot encode Claude runtime environment preference: {error}"))?;
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temporary, payload)
+        .map_err(|error| format!("Cannot stage Claude runtime environment preference: {error}"))?;
+    protect_file(&temporary)?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("Cannot commit Claude runtime environment preference: {error}"))?;
+    runtime_environment_status()
 }
 
 fn protect_directory(path: &Path) -> Result<(), String> {
@@ -203,6 +372,15 @@ fn write_receipt(path: &Path, receipt: &IsolationMigrationReceipt) -> Result<(),
 /// owns. The legacy source is copied, never moved or deleted.
 pub(crate) fn initialize() -> Result<PathBuf, String> {
     let destination = claude_config_dir()?;
+    if uses_system_environment()? {
+        if !destination.is_dir() {
+            return Err(format!(
+                "System Claude environment does not exist: {}",
+                destination.display()
+            ));
+        }
+        return Ok(destination);
+    }
     protect_directory(&destination)?;
 
     // Explicit test/dev roots are already isolated and must never import host state.

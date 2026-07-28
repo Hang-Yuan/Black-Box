@@ -21,10 +21,12 @@ describe('private identity bootstrap regressions', () => {
   });
 
   it('keeps identity runtime state private and integrity checked', () => {
-    expect(bootstrap).toContain('client_runtime::claude_config_dir()?.join("identity-bootstrap")');
+    expect(bootstrap).toContain('client_runtime::private_claude_config_dir()?.join("identity-bootstrap")');
     expect(bootstrap).toContain('Identity snapshot changed');
     expect(bootstrap).toContain('BLACKBOX_IDENTITY_BOOTSTRAP_V1');
     expect(bootstrap).not.toContain('dirs::home_dir()?.join(".claude")');
+    expect(bootstrap).toContain('client_runtime::uses_system_environment()?');
+    expect(bootstrap).toContain('"suppressOutput": true');
   });
 
   it('exposes explicit snapshot and startup skill import controls', () => {

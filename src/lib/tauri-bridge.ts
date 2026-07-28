@@ -205,6 +205,16 @@ export interface IdentityBootstrapStatus {
   marker: string;
 }
 
+export type ClaudeRuntimeEnvironment = 'isolated' | 'system';
+
+export interface ClaudeRuntimeEnvironmentStatus {
+  active: ClaudeRuntimeEnvironment;
+  selected: ClaudeRuntimeEnvironment;
+  activeConfigDir: string;
+  requiresRestart: boolean;
+  overriddenForDevelopment: boolean;
+}
+
 export interface CreateHookRequest {
   scope: 'user' | 'project' | 'local';
   event: string;
@@ -904,6 +914,12 @@ export const bridge = {
 
   setIdentityBootstrapEnabled: (enabled: boolean) =>
     invoke<IdentityBootstrapStatus>('set_identity_bootstrap_enabled', { enabled }),
+
+  getClaudeRuntimeEnvironment: () =>
+    invoke<ClaudeRuntimeEnvironmentStatus>('get_claude_runtime_environment'),
+
+  setClaudeRuntimeEnvironment: (environment: ClaudeRuntimeEnvironment) =>
+    invoke<ClaudeRuntimeEnvironmentStatus>('set_claude_runtime_environment', { environment }),
 
   readSkill: (path: string, tabId?: string) =>
     invoke<string>('read_skill', { path, tabId: tabId ?? null }),

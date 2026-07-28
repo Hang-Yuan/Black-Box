@@ -11329,67 +11329,29 @@ async fn start_claude_login(app: AppHandle) -> Result<(), String> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct AuthStatus {
-    authenticated: bool,
-    unknown: bool,
+pub(crate) struct AuthStatus {
+    pub(crate) authenticated: bool,
+    pub(crate) unknown: bool,
 }
 
-/// Check whether the Claude CLI is authenticated by running a lightweight check.
-#[tauri::command]
-async fn check_claude_auth() -> Result<AuthStatus, String> {
+pub(crate) async fn probe_claude_auth_status() -> Result<AuthStatus, String> {
     let claude_bin = resolve_claude_sdk_runtime()?.path;
     let enriched_path = build_enriched_path();
 
-    // First try a quick credential file check (instant, no subprocess)
-    if let Ok(config_root) = client_runtime::claude_config_dir() {
-        let cred_path = config_root.join("credentials.json");
-        if cred_path.exists() {
-            // Parse JSON and check for actual token fields
-            if let Ok(content) = std::fs::read_to_string(&cred_path) {
-                if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                    let has_token = ["claudeAiOAuthToken", "accessToken", "token", "apiKey"]
-                        .iter()
-                        .any(|key| {
-                            json.get(key)
-                                .and_then(|v| v.as_str())
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false)
-                        });
-                    if has_token {
-                        return Ok(AuthStatus {
-                            authenticated: true,
-                            unknown: false,
-                        });
-                    }
-                }
-                // JSON invalid or no token found — fall through to claude doctor
-            }
-        }
-        // Also check .claude.json (older format)
-        let alt_path = config_root.join(".claude.json");
-        if alt_path.exists() {
-            return Ok(AuthStatus {
-                authenticated: true,
-                unknown: false,
-            });
-        }
-    }
-
-    // Fallback: run `claude doctor` with a shorter timeout
     #[cfg(target_os = "windows")]
     let mut cmd = if claude_needs_cmd_wrapper(&claude_bin) {
         let mut c = Command::new("cmd");
-        c.args(["/C", &claude_bin, "doctor"]);
+        c.args(["/C", &claude_bin, "auth", "status", "--json"]);
         c
     } else {
         let mut c = Command::new(&claude_bin);
-        c.arg("doctor");
+        c.args(["auth", "status", "--json"]);
         c
     };
     #[cfg(not(target_os = "windows"))]
     let mut cmd = {
         let mut c = Command::new(&claude_bin);
-        c.arg("doctor");
+        c.args(["auth", "status", "--json"]);
         c
     };
     client_runtime::apply_to_tokio_command(&mut cmd)?;
@@ -11400,20 +11362,33 @@ async fn check_claude_auth() -> Result<AuthStatus, String> {
 
     match result {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-            let combined = format!("{} {}", stdout, stderr);
-
-            let has_auth_issue = combined.contains("not authenticated")
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let payload = serde_json::from_str::<Value>(stdout.trim())
+                .or_else(|_| serde_json::from_str::<Value>(stderr.trim()));
+            if let Ok(payload) = payload {
+                if let Some(logged_in) = payload.get("loggedIn").and_then(Value::as_bool) {
+                    return Ok(AuthStatus {
+                        authenticated: logged_in,
+                        unknown: false,
+                    });
+                }
+            }
+            let combined = format!("{stdout} {stderr}").to_ascii_lowercase();
+            if combined.contains("not authenticated")
                 || combined.contains("not logged in")
                 || combined.contains("login required")
                 || combined.contains("unauthorized")
-                || combined.contains("no api key");
-
-            Ok(AuthStatus {
-                authenticated: output.status.success() && !has_auth_issue,
-                unknown: false,
-            })
+            {
+                return Ok(AuthStatus {
+                    authenticated: false,
+                    unknown: false,
+                });
+            }
+            Err(format!(
+                "Claude auth status returned an unreadable response (exit {:?})",
+                output.status.code()
+            ))
         }
         Ok(Err(e)) => Err(format!("Failed to run auth check: {}", e)),
         Err(_) => {
@@ -11424,6 +11399,25 @@ async fn check_claude_auth() -> Result<AuthStatus, String> {
             })
         }
     }
+}
+
+/// Check the CLI's own authoritative authentication state for the active
+/// runtime environment. Credential-file presence alone is not proof of login.
+#[tauri::command]
+async fn check_claude_auth() -> Result<AuthStatus, String> {
+    probe_claude_auth_status().await
+}
+
+#[tauri::command]
+fn get_claude_runtime_environment() -> Result<client_runtime::RuntimeEnvironmentStatus, String> {
+    client_runtime::runtime_environment_status()
+}
+
+#[tauri::command]
+fn set_claude_runtime_environment(
+    environment: String,
+) -> Result<client_runtime::RuntimeEnvironmentStatus, String> {
+    client_runtime::select_runtime_environment(environment)
 }
 
 /// Load custom session display names from the unified metadata authority.
@@ -12006,13 +12000,12 @@ fn get_power_assertion_status(
 pub fn run() {
     static CLOSE_IN_PROGRESS: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    let claude_config_dir = client_runtime::initialize()
-        .unwrap_or_else(|error| panic!("Black Box refused to use shared Claude state: {error}"));
-    // SAFETY: this runs before the Tauri runtime or worker threads start. Child
-    // processes and managers that honor CLAUDE_CONFIG_DIR must see one private root.
-    unsafe {
-        std::env::set_var("CLAUDE_CONFIG_DIR", claude_config_dir);
-    }
+    client_runtime::activate_selected_environment().unwrap_or_else(|error| {
+        panic!("Black Box cannot activate its Claude environment: {error}")
+    });
+    client_runtime::initialize().unwrap_or_else(|error| {
+        panic!("Black Box cannot initialize its Claude environment: {error}")
+    });
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -12324,6 +12317,8 @@ pub fn run() {
             workflow_manager::inspect_workflow_runtime_progress,
             start_claude_login,
             check_claude_auth,
+            get_claude_runtime_environment,
+            set_claude_runtime_environment,
             open_terminal_login,
             load_custom_previews,
             save_custom_previews,

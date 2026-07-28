@@ -28,6 +28,14 @@ interface PendingFileNavigation {
   location?: FileReferenceLocation;
 }
 
+interface FilePreviewSnapshot {
+  selectedFile: string;
+  fileContent: string | null;
+  previewMode: PreviewMode;
+  editContent: string | null;
+  revealTarget: string | null;
+}
+
 // Batch buffer for markFileChanged — collect changes within a single frame, flush once via rAF
 const _pendingChanges = new Map<string, FileChangeKind>();
 let _changeFlushRaf = 0;
@@ -49,6 +57,7 @@ interface FileState {
   loadingFolders: Set<string>;
   // 当前被定位高亮的路径（文件或文件夹，与「预览选中」解耦）
   revealTarget: string | null;
+  previewSnapshots: Record<string, FilePreviewSnapshot>;
 
   // Editing state
   editContent: string | null;     // buffer for edits (null = not dirty)
@@ -77,6 +86,8 @@ interface FileState {
   selectFile: (path: string, location?: FileReferenceLocation) => Promise<void>;
   clearSelection: () => void;
   closePreview: () => void;
+  savePreviewState: (sessionId: string) => void;
+  restorePreviewState: (sessionId: string) => void;
   setPreviewMode: (mode: PreviewMode) => void;
   setEditContent: (content: string) => void;
   saveFile: () => Promise<void>;
@@ -130,6 +141,7 @@ export const useFileStore = create<FileState>()((set, get) => ({
   expandedFolders: new Set<string>(),
   loadingFolders: new Set<string>(),
   revealTarget: null,
+  previewSnapshots: {},
 
   loadTree: async (path: string) => {
     if (!path) return;
@@ -285,6 +297,55 @@ export const useFileStore = create<FileState>()((set, get) => ({
     isLoadingContent: false,
     editContent: null,
     previewLocation: null,
+  }),
+
+  savePreviewState: (sessionId: string) => set((state) => {
+    if (!state.selectedFile) {
+      const previewSnapshots = { ...state.previewSnapshots };
+      delete previewSnapshots[sessionId];
+      return { previewSnapshots };
+    }
+    return {
+      previewSnapshots: {
+        ...state.previewSnapshots,
+        [sessionId]: {
+          selectedFile: state.selectedFile,
+          fileContent: state.fileContent,
+          previewMode: state.previewMode,
+          editContent: state.editContent,
+          revealTarget: state.revealTarget,
+        },
+      },
+    };
+  }),
+
+  restorePreviewState: (sessionId: string) => set((state) => {
+    const snapshot = state.previewSnapshots[sessionId];
+    if (!snapshot) {
+      return {
+        selectedFile: null,
+        fileContent: null,
+        isLoadingContent: false,
+        editContent: null,
+        previewLocation: null,
+        revealTarget: null,
+        pendingNavigation: null,
+        showUnsavedDialog: false,
+      };
+    }
+    return {
+      selectedFile: snapshot.selectedFile,
+      fileContent: snapshot.fileContent,
+      isLoadingContent: false,
+      previewMode: snapshot.previewMode,
+      // A line/anchor reference is a one-shot navigation instruction. Returning
+      // to a conversation restores the reader's later scroll position instead.
+      previewLocation: null,
+      editContent: snapshot.editContent,
+      revealTarget: snapshot.revealTarget,
+      pendingNavigation: null,
+      showUnsavedDialog: false,
+    };
   }),
 
   setPreviewMode: (mode: PreviewMode) => {

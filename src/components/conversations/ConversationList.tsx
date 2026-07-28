@@ -467,11 +467,15 @@ export function ConversationList() {
       useAgentStore.getState().saveToCache(currentTabId);
     }
 
-    // Close file preview
-    useFileStore.getState().closePreview();
+    // Preserve the complete reading surface per conversation: the open file,
+    // preview mode, unsaved edit buffer, and the component-level scroll state.
+    if (currentTabId) {
+      useFileStore.getState().savePreviewState(currentTabId);
+    }
 
     // Switch selection
     setSelected(sessionId);
+    useFileStore.getState().restorePreviewState(sessionId);
 
     // Try cache first
     const restored = useChatStore.getState().restoreFromCache(sessionId);

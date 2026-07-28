@@ -44,7 +44,7 @@ pub(crate) struct IdentityBootstrapStatus {
 }
 
 fn profile_root() -> Result<PathBuf, String> {
-    Ok(crate::client_runtime::claude_config_dir()?.join("identity-bootstrap"))
+    Ok(crate::client_runtime::private_claude_config_dir()?.join("identity-bootstrap"))
 }
 
 fn manifest_path() -> Result<PathBuf, String> {
@@ -239,7 +239,7 @@ fn fallback_block(manifest: &IdentityBootstrapManifest) -> Result<String, String
 }
 
 fn update_private_claude_fallback(manifest: &IdentityBootstrapManifest) -> Result<(), String> {
-    let path = crate::client_runtime::claude_config_dir()?.join("CLAUDE.md");
+    let path = crate::client_runtime::private_claude_config_dir()?.join("CLAUDE.md");
     let existing = if path.exists() {
         fs::read_to_string(&path)
             .map_err(|error| format!("Cannot read private Black Box CLAUDE.md: {error}"))?
@@ -268,6 +268,11 @@ pub(crate) fn configure(
     startup_skill: Option<String>,
     startup_skill_source: Option<String>,
 ) -> Result<IdentityBootstrapStatus, String> {
+    if crate::client_runtime::uses_system_environment()? {
+        return Err(
+            "Identity bootstrap is managed by the selected system Claude environment".to_string(),
+        );
+    }
     if source_files.is_empty() || source_files.len() > MAX_FILES {
         return Err(format!("Select between 1 and {MAX_FILES} identity files"));
     }
@@ -309,7 +314,7 @@ pub(crate) fn configure(
             return Err("Startup skill source must be a SKILL.md file".to_string());
         }
         let bytes = validate_source(source)?;
-        let destination = crate::client_runtime::claude_config_dir()?
+        let destination = crate::client_runtime::private_claude_config_dir()?
             .join("skills")
             .join(skill)
             .join("SKILL.md");
@@ -329,6 +334,11 @@ pub(crate) fn configure(
 }
 
 pub(crate) fn set_enabled(enabled: bool) -> Result<IdentityBootstrapStatus, String> {
+    if crate::client_runtime::uses_system_environment()? {
+        return Err(
+            "Identity bootstrap is managed by the selected system Claude environment".to_string(),
+        );
+    }
     let mut manifest =
         load_manifest()?.ok_or_else(|| "Identity bootstrap has not been configured".to_string())?;
     manifest.enabled = enabled;
@@ -351,7 +361,7 @@ pub(crate) fn status() -> Result<IdentityBootstrapStatus, String> {
         });
     };
     let installed = manifest.startup_skill.as_ref().is_some_and(|skill| {
-        crate::client_runtime::claude_config_dir()
+        crate::client_runtime::private_claude_config_dir()
             .map(|root| root.join("skills").join(skill).join("SKILL.md").is_file())
             .unwrap_or(false)
     });
@@ -370,6 +380,9 @@ pub(crate) fn status() -> Result<IdentityBootstrapStatus, String> {
 }
 
 fn build_output(payload: &Value) -> Result<Value, String> {
+    if crate::client_runtime::uses_system_environment()? {
+        return Ok(json!({"continue": true, "suppressOutput": true}));
+    }
     if let Some(event) = payload.get("hook_event_name").and_then(Value::as_str) {
         if event != "SessionStart" {
             return Err("Identity bootstrap hook only accepts SessionStart events".to_string());
@@ -423,7 +436,7 @@ fn build_output(payload: &Value) -> Result<Value, String> {
         ));
     }
     if let Some(skill) = &manifest.startup_skill {
-        let installed = crate::client_runtime::claude_config_dir()?
+        let installed = crate::client_runtime::private_claude_config_dir()?
             .join("skills")
             .join(skill)
             .join("SKILL.md")

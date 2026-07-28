@@ -3063,6 +3063,21 @@ async fn invoke_claude(
         crate::find_claude_binary().ok_or_else(|| "Claude CLI not found".to_string())?;
     let (provider_id, model, _auxiliary_model, auxiliary_model_tier) =
         resolve_provider_and_models(definition)?;
+    if provider_id.is_none() {
+        let auth = crate::probe_claude_auth_status().await.map_err(|error| {
+            AutomationExecutionError::new(format!(
+                "Cannot verify the native Claude account for this scheduled task: {error}"
+            ))
+        })?;
+        if !auth.authenticated {
+            let environment = crate::client_runtime::runtime_environment_status()
+                .map(|status| status.active_config_dir)
+                .unwrap_or_else(|_| "the active Claude environment".to_string());
+            return Err(AutomationExecutionError::new(format!(
+                "The native Claude account is not logged in for {environment}. Select an API provider for this scheduled task, or sign in to that Claude environment."
+            )));
+        }
+    }
     let (mut provider_env, mut provider_remove, provider_args, _caps) =
         crate::resolve_provider_env(provider_id.as_deref())?;
     crate::apply_provider_model_aliases(provider_id.as_deref(), &mut provider_env)?;

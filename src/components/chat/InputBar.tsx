@@ -1328,34 +1328,55 @@ export function InputBar() {
             } else {
               // ===== Send via stdin to existing persistent process (pre-warmed or follow-up) =====
               if (!stdinReady) {
-                setSessionMeta(tabId, {
-                  pendingReadyMessage: { stdinId, text },
-                });
-                console.log('[BLACKBOX] pre-warm process not ready yet — holding first message until system:init');
-                return;
-              }
-              try {
-                const stdinModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
-                markTurnThinking();
-                await bridge.sendStdin(stdinId, text);
-                sentViaStdin = true;
-                // Defensive: ensure spawnedModel is always recorded after first successful stdin send
-                if (!getActiveTabState().sessionMeta.spawnedModel) {
-                  setSessionMeta(tabId, { spawnedModel: stdinModel });
+                // Claude Code 2.1.220 no longer emits system:init for an idle
+                // stream-json process. Waiting for init before writing the
+                // first prompt therefore deadlocks a pre-warmed session. The
+                // Rust spawn command publishes stdin ownership before it
+                // returns, so it is safe to write immediately; init will then
+                // arrive and complete the normal ready transition.
+                try {
+                  const stdinModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
+                  await bridge.sendStdin(stdinId, text);
+                  sentViaStdin = true;
+                  if (!getActiveTabState().sessionMeta.spawnedModel) {
+                    setSessionMeta(tabId, { spawnedModel: stdinModel });
+                  }
+                } catch (stdinErr) {
+                  console.warn('[BLACKBOX] pre-init sendStdin failed, spawning new process:', stdinErr);
+                  cleanupStdinRoute(stdinId);
+                  setSessionMeta(tabId, {
+                    stdinId: undefined,
+                    stdinReady: false,
+                    pendingReadyMessage: undefined,
+                  });
+                  setActivityStatus(tabId, { phase: 'idle' });
+                  stdinId = undefined;
+                  stdinReady = false;
                 }
-              } catch (stdinErr) {
-                // stdin write failed (broken pipe — process already exited).
-                // Drop the stale stdin route via lifecycle helpers, then spawn fresh.
-                console.warn('[BLACKBOX] sendStdin failed, spawning new process:', stdinErr);
-                cleanupStdinRoute(stdinId);
-                setSessionMeta(tabId, {
-                  stdinId: undefined,
-                  stdinReady: false,
-                  pendingReadyMessage: undefined,
-                });
-                setActivityStatus(tabId, { phase: 'idle' });
-                stdinId = undefined;
-                stdinReady = false;
+              } else {
+                try {
+                  const stdinModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
+                  markTurnThinking();
+                  await bridge.sendStdin(stdinId, text);
+                  sentViaStdin = true;
+                  // Defensive: ensure spawnedModel is always recorded after first successful stdin send
+                  if (!getActiveTabState().sessionMeta.spawnedModel) {
+                    setSessionMeta(tabId, { spawnedModel: stdinModel });
+                  }
+                } catch (stdinErr) {
+                  // stdin write failed (broken pipe — process already exited).
+                  // Drop the stale stdin route via lifecycle helpers, then spawn fresh.
+                  console.warn('[BLACKBOX] sendStdin failed, spawning new process:', stdinErr);
+                  cleanupStdinRoute(stdinId);
+                  setSessionMeta(tabId, {
+                    stdinId: undefined,
+                    stdinReady: false,
+                    pendingReadyMessage: undefined,
+                  });
+                  setActivityStatus(tabId, { phase: 'idle' });
+                  stdinId = undefined;
+                  stdinReady = false;
+                }
               }
             } // close spawnConfigHash-mismatch else
           } // close spawnedModel-mismatch else

@@ -23,6 +23,10 @@ import { UserAvatar } from '../shared/UserAvatar';
 import { useFindInPage } from '../../hooks/useFindInPage';
 import { FindBar } from './FindBar';
 import { formatElapsedCompact } from '../../lib/elapsed-time';
+import {
+  loadChatScrollPosition,
+  saveChatScrollPosition,
+} from '../../lib/conversation-view-state';
 import { formatRetryDelaySeconds, isRateLimitRetry, type ApiRetryStatus } from '../../lib/api-retry';
 import { TaskLocationControl } from './TaskLocationControl';
 import { GoalControl } from './GoalControl';
@@ -779,6 +783,8 @@ export function ChatPanel() {
   const isNearBottomRef = useRef(true);
   // When user scrolls up via wheel, suppress auto-scroll until they return to bottom
   const userScrollingUpRef = useRef(false);
+  const restoringScrollRef = useRef(false);
+  const pendingScrollRestoreRef = useRef<string | null>(null);
   // Show "scroll to bottom" button when user is far from bottom
   const [showScrollBtn, setShowScrollBtn] = useState(false);
 
@@ -789,13 +795,55 @@ export function ChatPanel() {
     // Consider "near bottom" if within 80px of the end
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     isNearBottomRef.current = nearBottom;
+    if (selectedSessionId && !restoringScrollRef.current) {
+      saveChatScrollPosition(selectedSessionId, {
+        top: el.scrollTop,
+        atBottom: nearBottom,
+      });
+    }
     // Show scroll-to-bottom button when far from bottom (>300px)
     setShowScrollBtn(el.scrollHeight - el.scrollTop - el.clientHeight > 300);
     // Reset the scroll-up lock once user returns to bottom
     if (nearBottom) {
       userScrollingUpRef.current = false;
     }
-  }, []);
+  }, [selectedSessionId]);
+
+  // Each conversation owns its reading position. Switching tabs restores the
+  // exact scroll offset instead of treating every return as a new load.
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    pendingScrollRestoreRef.current = selectedSessionId;
+    restoringScrollRef.current = true;
+    const saved = loadChatScrollPosition(selectedSessionId);
+    isNearBottomRef.current = saved?.atBottom ?? true;
+    userScrollingUpRef.current = saved ? !saved.atBottom : false;
+  }, [selectedSessionId]);
+
+  // Disk-backed conversations hydrate after selection. Keep the restoration
+  // pending until the rendered content is tall enough for the saved offset.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !selectedSessionId || pendingScrollRestoreRef.current !== selectedSessionId) return;
+    const frame = requestAnimationFrame(() => {
+      const target = loadChatScrollPosition(selectedSessionId);
+      if (target) {
+        el.scrollTop = target.atBottom ? el.scrollHeight : target.top;
+      } else {
+        el.scrollTop = el.scrollHeight;
+      }
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      setShowScrollBtn(distance > 300);
+      const contentReady = !target
+        || target.atBottom
+        || el.scrollHeight >= target.top + el.clientHeight;
+      if (contentReady) {
+        pendingScrollRestoreRef.current = null;
+        restoringScrollRef.current = false;
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages.length, selectedSessionId]);
 
   // Detect intentional upward scroll via wheel event
   useEffect(() => {
@@ -813,7 +861,11 @@ export function ChatPanel() {
 
   // Auto-scroll to bottom only when already near bottom and user isn't scrolling up
   useEffect(() => {
-    if (isNearBottomRef.current && !userScrollingUpRef.current && scrollRef.current) {
+    if (!restoringScrollRef.current
+      && pendingScrollRestoreRef.current !== selectedSessionId
+      && isNearBottomRef.current
+      && !userScrollingUpRef.current
+      && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, partialText, partialThinking, activityStatus]);

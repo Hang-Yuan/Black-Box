@@ -16,6 +16,11 @@ import { xml } from '@codemirror/lang-xml';
 import { yaml } from '@codemirror/lang-yaml';
 import { StreamLanguage } from '@codemirror/language';
 import { EditorView } from '@codemirror/view';
+import { useSessionStore } from '../../stores/sessionStore';
+import {
+  loadFileScrollPosition,
+  saveFileScrollPosition,
+} from '../../lib/conversation-view-state';
 import { go } from '@codemirror/legacy-modes/mode/go';
 import { shell } from '@codemirror/legacy-modes/mode/shell';
 import { ruby } from '@codemirror/legacy-modes/mode/ruby';
@@ -148,7 +153,9 @@ export function FilePreview() {
   const confirmSaveAndSwitch = useFileStore((s) => s.confirmSaveAndSwitch);
   const cancelNavigation = useFileStore((s) => s.cancelNavigation);
   const editorViewRef = useRef<EditorView | null>(null);
+  const editorScrollCleanupRef = useRef<(() => void) | null>(null);
   const markdownPreviewRef = useRef<HTMLDivElement | null>(null);
+  const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
 
   // Auto-refresh preview when the selected file is modified externally
   const reloadRef = useRef(reloadContent);
@@ -162,9 +169,56 @@ export function FilePreview() {
   }, [selectedFile, changedFiles]);
 
   const handleEditorCreate = useCallback((view: EditorView) => {
+    editorScrollCleanupRef.current?.();
     editorViewRef.current = view;
     if (previewLocation?.line) revealEditorLocation(view, previewLocation);
-  }, [previewLocation]);
+    if (selectedSessionId && selectedFile) {
+      const saved = loadFileScrollPosition(selectedSessionId, selectedFile, previewMode);
+      if (saved !== null && !previewLocation?.line) {
+        requestAnimationFrame(() => {
+          view.scrollDOM.scrollTop = saved;
+        });
+      }
+      const remember = () => {
+        saveFileScrollPosition(
+          selectedSessionId,
+          selectedFile,
+          previewMode,
+          view.scrollDOM.scrollTop,
+        );
+      };
+      view.scrollDOM.addEventListener('scroll', remember, { passive: true });
+      editorScrollCleanupRef.current = () => {
+        remember();
+        view.scrollDOM.removeEventListener('scroll', remember);
+      };
+    }
+  }, [previewLocation, previewMode, selectedFile, selectedSessionId]);
+
+  useEffect(() => () => editorScrollCleanupRef.current?.(), []);
+
+  useEffect(() => {
+    if (
+      previewMode !== 'preview'
+      || previewLocation?.anchor
+      || !selectedSessionId
+      || !selectedFile
+      || !fileContent
+    ) return;
+    const root = markdownPreviewRef.current;
+    if (!root) return;
+    const frame = requestAnimationFrame(() => {
+      const saved = loadFileScrollPosition(selectedSessionId, selectedFile, previewMode);
+      if (saved !== null) root.scrollTop = saved;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [selectedSessionId, selectedFile, fileContent, previewMode, previewLocation]);
+
+  const handleMarkdownScroll = useCallback(() => {
+    const root = markdownPreviewRef.current;
+    if (!root || !selectedSessionId || !selectedFile) return;
+    saveFileScrollPosition(selectedSessionId, selectedFile, previewMode, root.scrollTop);
+  }, [previewMode, selectedFile, selectedSessionId]);
 
   useEffect(() => {
     if (previewMode !== 'source' || !previewLocation?.line || !fileContent) return;
@@ -484,7 +538,11 @@ export function FilePreview() {
           </div>
         ) : previewMode === 'preview' && isMarkdown && fileContent !== null ? (
           /* Markdown preview: rendered */
-          <div ref={markdownPreviewRef} className="overflow-auto h-full p-4">
+          <div
+            ref={markdownPreviewRef}
+            onScroll={handleMarkdownScroll}
+            className="overflow-auto h-full p-4"
+          >
             <div className="text-sm leading-relaxed selectable max-w-3xl mx-auto">
               {(() => {
                 // Extract YAML frontmatter if present

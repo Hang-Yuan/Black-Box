@@ -48,6 +48,12 @@ describe('stdin route regressions', () => {
     expect(chatPanelSource).toContain('sessionModeSnapshot: settings.sessionMode');
   });
 
+  it('sends the first pre-warm prompt before system:init to avoid the Claude 2.1.220 deadlock', () => {
+    expect(inputBarSource).toContain('Claude Code 2.1.220 no longer emits system:init');
+    expect(inputBarSource).toContain('await bridge.sendStdin(stdinId, text);');
+    expect(inputBarSource).not.toContain('holding first message until system:init');
+  });
+
   it('sessionMeta.sessionId only stores the real CLI session id', () => {
     expect(chatPanelSource).toContain('sessionId: spawnResult.sessionInfo.cli_session_id ?? undefined');
     expect(inputBarSource).toContain('const nextSessionId = spawnResult.sessionInfo.cli_session_id');

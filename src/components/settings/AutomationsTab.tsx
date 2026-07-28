@@ -784,7 +784,7 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   }}
                   className="w-full rounded-md border border-border-subtle bg-bg-card px-3 py-2 text-text-primary"
                 >
-                  <option value="">{t('provider.inherit')}</option>
+                  <option value="">{t('automation.provider.native')}</option>
                   {providers.map((provider) => (
                     <option key={provider.id} value={provider.id}>
                       {provider.name || t('provider.unnamed')} · {provider.credentialHint || t('provider.noStoredKey')}
