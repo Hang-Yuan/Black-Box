@@ -468,14 +468,16 @@ export function ConversationList() {
     }
 
     // Preserve the complete reading surface per conversation: the open file,
-    // preview mode, unsaved edit buffer, and the component-level scroll state.
+    // preview mode, unsaved edit buffer, file-tree expansion, and scroll state.
     if (currentTabId) {
       useFileStore.getState().savePreviewState(currentTabId);
+      useFileStore.getState().saveExplorerState(currentTabId);
     }
 
     // Switch selection
     setSelected(sessionId);
     useFileStore.getState().restorePreviewState(sessionId);
+    useFileStore.getState().restoreExplorerState(sessionId);
 
     // Try cache first
     const restored = useChatStore.getState().restoreFromCache(sessionId);

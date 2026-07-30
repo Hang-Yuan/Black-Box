@@ -2640,23 +2640,61 @@ fn rollback_prepared_execution_directory(
     Ok(())
 }
 
+fn split_native_skill_invocation(prompt: &str) -> Option<(String, String)> {
+    let trimmed = prompt.trim_start();
+    let skill_start = if trimmed.starts_with('/') {
+        1
+    } else if trimmed.starts_with("Use $") {
+        "Use $".len()
+    } else {
+        return None;
+    };
+    let skill_len = trimmed[skill_start..]
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if skill_len == 0 {
+        return None;
+    }
+    let skill_end = skill_start + skill_len;
+    let next = trimmed[skill_end..].chars().next();
+    if next.is_some_and(|character| !character.is_whitespace()) {
+        return None;
+    }
+    Some((
+        format!("/{}", &trimmed[skill_start..skill_end]),
+        trimmed[skill_end..].trim_start().to_string(),
+    ))
+}
+
+fn prepend_native_skill_invocation(invocation: Option<String>, body: String) -> String {
+    match invocation {
+        Some(invocation) => format!("{invocation}\n\n{body}"),
+        None => body,
+    }
+}
+
 fn automation_prompt(
     definition: &AutomationDefinition,
     scheduled_at: Option<i64>,
 ) -> Result<String, String> {
+    let (native_skill_invocation, prompt) = split_native_skill_invocation(&definition.prompt)
+        .map(|(invocation, prompt)| (Some(invocation), prompt))
+        .unwrap_or_else(|| (None, definition.prompt.clone()));
     let team_contract = if definition.agent_teams_enabled {
         "\n<agent_teams_authorization>Agent Teams is explicitly authorized for this run. Use teammates only when parallel, independently scoped work materially helps; spawn at most 3 teammates, wait for them to finish, keep the shared task list accurate, and synthesize their results before returning. Do not use legacy TeamCreate or TeamDelete tools.</agent_teams_authorization>"
     } else {
         ""
     };
     if definition.kind == "heartbeat" {
-        return Ok(format!(
+        return Ok(prepend_native_skill_invocation(native_skill_invocation, format!(
             "<heartbeat>\n  <automation_id>{}</automation_id>\n  <current_time_iso>{}</current_time_iso>\n  <instructions>\n{}\n  </instructions>\n</heartbeat>{}",
             definition.id,
             Utc::now().to_rfc3339(),
-            definition.prompt,
+            prompt,
             team_contract,
-        ));
+        )));
     }
     let memory = memory_path(&definition.id)?;
     let memory_text = if memory.is_file() {
@@ -2664,7 +2702,7 @@ fn automation_prompt(
     } else {
         String::new()
     };
-    Ok(format!(
+    Ok(prepend_native_skill_invocation(native_skill_invocation, format!(
         "Automation: {name}\nAutomation ID: {id}\nAutomation memory: {memory}\nScheduled at: {scheduled}\n\n{prompt}\n\n{memory_block}{team_contract}",
         name = definition.name,
         id = definition.id,
@@ -2673,14 +2711,14 @@ fn automation_prompt(
             .and_then(|value| local_from_ms(value).ok())
             .map(|value| value.to_rfc3339())
             .unwrap_or_else(|| "manual".to_string()),
-        prompt = definition.prompt,
+        prompt = prompt,
         memory_block = if memory_text.is_empty() {
             "The automation memory file does not exist yet. Create or update it only when a compact durable note will help the next run.".to_string()
         } else {
             format!("Existing automation memory:\n{memory_text}")
         },
         team_contract = team_contract,
-    ))
+    )))
 }
 
 fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, AutomationExecutionError> {
@@ -5255,6 +5293,46 @@ mod tests {
         assert!(prompt.contains("<agent_teams_authorization>"));
         assert!(prompt.contains("spawn at most 3 teammates"));
         assert!(prompt.contains("Do not use legacy TeamCreate or TeamDelete"));
+    }
+
+    #[test]
+    fn scheduled_native_skill_invocations_stay_at_the_start_of_the_prompt() {
+        let definition = AutomationDefinition {
+            kind: "cron".to_string(),
+            id: "native-skill-test".to_string(),
+            prompt: "/reporting\n\nClose the latest work window.".to_string(),
+            ..Default::default()
+        };
+        let prompt = automation_prompt(&definition, None).unwrap();
+        assert!(prompt.starts_with("/reporting\n\nAutomation:"));
+        assert!(prompt.contains("Close the latest work window."));
+    }
+
+    #[test]
+    fn scheduled_legacy_skill_hints_are_normalized_to_native_invocations() {
+        let definition = AutomationDefinition {
+            kind: "cron".to_string(),
+            id: "legacy-skill-test".to_string(),
+            prompt: "Use $reporting to close the latest work window.".to_string(),
+            ..Default::default()
+        };
+        let prompt = automation_prompt(&definition, None).unwrap();
+        assert!(prompt.starts_with("/reporting\n\nAutomation:"));
+        assert!(prompt.contains("to close the latest work window."));
+        assert!(!prompt.contains("Use $reporting"));
+    }
+
+    #[test]
+    fn scheduled_plain_prompts_keep_their_existing_envelope() {
+        let definition = AutomationDefinition {
+            kind: "cron".to_string(),
+            id: "plain-prompt-test".to_string(),
+            prompt: "Inspect the latest build.".to_string(),
+            ..Default::default()
+        };
+        let prompt = automation_prompt(&definition, None).unwrap();
+        assert!(prompt.starts_with("Automation:"));
+        assert!(prompt.contains("Inspect the latest build."));
     }
 
     #[test]

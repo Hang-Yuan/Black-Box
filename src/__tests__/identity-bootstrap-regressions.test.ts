@@ -20,6 +20,12 @@ describe('private identity bootstrap regressions', () => {
     expect(main).toContain('blackbox_lib::run_identity_bootstrap_hook()');
   });
 
+  it('preserves native system hooks and reserves private injection for isolated mode', () => {
+    expect(backend).toContain('read_system_claude_hooks()');
+    expect(backend).toContain('build_auxiliary_model_hook_settings(&model, &current_exe, hooks, !use_system_hooks)');
+    expect(backend).toContain('include_private_runtime_hooks');
+  });
+
   it('keeps identity runtime state private and integrity checked', () => {
     expect(bootstrap).toContain('client_runtime::private_claude_config_dir()?.join("identity-bootstrap")');
     expect(bootstrap).toContain('Identity snapshot changed');

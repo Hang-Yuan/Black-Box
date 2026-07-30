@@ -41,7 +41,6 @@ const providersFile = join(resolve(isolatedHome), '.blackbox', 'providers.json')
 const providerId = 'provider-persistence-relay';
 const historicalPresetId = 'provider-persistence-qwen-historical';
 const customizedPresetId = 'provider-persistence-minimax-customized';
-const credentialRef = `provider-api-key:${providerId}`;
 const marker = `NEW_PROVIDER_ROUTE_${Date.now()}`;
 const oldKey = `bbx-smoke-old-${Date.now()}-key`;
 const newKey = `bbx-smoke-new-${Date.now()}-key`;
@@ -255,9 +254,9 @@ function writeRuntimeFixtures(oldBaseUrl) {
         name: 'Provider persistence smoke relay',
         baseUrl: oldBaseUrl,
         apiFormat: 'openai',
-        credentialRef,
+        apiKey: oldKey,
         credentialHint: `•••• ${oldKey.slice(-4)}`,
-        credentialState: 'keychain',
+        credentialState: 'local_file',
         revision: 1,
         modelMappings: [
           { tier: 'fable', providerModel: 'smoke-old-fable-model' },
@@ -309,7 +308,7 @@ function writeRuntimeFixtures(oldBaseUrl) {
   writeFileSync(providersFile, `${JSON.stringify(providers, null, 2)}\n`, 'utf8');
   writeFileSync(credentialStoreFile, `${JSON.stringify({
     version: 1,
-    secrets: { [credentialRef]: oldKey },
+    secrets: {},
   }, null, 2)}\n`, 'utf8');
   chmodSync(credentialStoreFile, 0o600);
 }
@@ -444,11 +443,11 @@ try {
     && persistedProvider?.modelMappings?.some(
       (mapping) => mapping.tier === 'haiku' && mapping.providerModel === newModel,
     );
-  report.checks.providersJsonContainsNoPlaintextKey = !Object.prototype.hasOwnProperty.call(
-    persistedProvider || {},
-    'apiKey',
-  );
-  report.checks.isolatedCredentialStoreHasNewKey = credentialFile.secrets?.[credentialRef] === newKey;
+  report.checks.providersJsonContainsCurrentLocalKey = persistedProvider?.apiKey === newKey
+    && persistedProvider?.credentialState === 'local_file';
+  report.checks.legacyCredentialStoreRemainsUnused = Object.keys(
+    credentialFile.secrets || {},
+  ).length === 0;
   report.checks.historicalPresetMigrationPersisted = persistedHistoricalPreset?.baseUrl
       === 'https://coding.dashscope.aliyuncs.com/apps/anthropic'
     && persistedHistoricalPreset?.authScheme === 'bearer'

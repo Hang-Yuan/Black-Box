@@ -87,5 +87,7 @@ stop temporarily.
   button exits Blackbox and stops scheduling. Use the explicit login-start
   option when the user wants the scheduler restored automatically after login.
 - Test a complex prompt manually before scheduling it when practical.
-- Use `$skill-name` explicitly inside a scheduled prompt when its workflow must
-  not rely on automatic skill selection.
+- Put `/<skill-name>` at the very start of a scheduled prompt when its workflow
+  must invoke a native Claude Code skill. Blackbox keeps that invocation ahead
+  of the automation envelope. Legacy prompts beginning with `Use $skill-name`
+  are normalized to the same native form for compatibility.

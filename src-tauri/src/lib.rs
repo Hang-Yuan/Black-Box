@@ -2909,18 +2909,72 @@ pub(crate) fn auxiliary_model_hook_settings(
     let current_exe = std::env::current_exe().map_err(|error| {
         format!("Cannot resolve Black Box executable for model routing: {error}")
     })?;
-    Ok(serde_json::json!({
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "Agent",
-                "hooks": [{
-                    "type": "command",
-                    "command": current_exe.to_string_lossy(),
-                    "args": ["--auxiliary-model-hook", model],
-                    "timeout": 10
-                }]
-            }],
-            "UserPromptSubmit": [{
+    let use_system_hooks = client_runtime::uses_system_environment()?;
+    let hooks = if use_system_hooks {
+        read_system_claude_hooks()?
+    } else {
+        serde_json::Map::new()
+    };
+    build_auxiliary_model_hook_settings(&model, &current_exe, hooks, !use_system_hooks)
+}
+
+fn read_system_claude_hooks() -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let path = client_runtime::claude_config_dir()?.join("settings.json");
+    if !path.is_file() {
+        return Ok(serde_json::Map::new());
+    }
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|error| format!("Cannot read system Claude settings: {error}"))?,
+    )
+    .map_err(|error| format!("Cannot parse system Claude settings: {error}"))?;
+    let Some(hooks) = settings.get("hooks") else {
+        return Ok(serde_json::Map::new());
+    };
+    hooks
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "System Claude settings hooks must be an object".to_string())
+}
+
+fn append_runtime_hook(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    definition: serde_json::Value,
+) -> Result<(), String> {
+    let entries = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| format!("Claude hook event {event} must be an array"))?;
+    entries.push(definition);
+    Ok(())
+}
+
+fn build_auxiliary_model_hook_settings(
+    model: &str,
+    current_exe: &std::path::Path,
+    mut hooks: serde_json::Map<String, serde_json::Value>,
+    include_private_runtime_hooks: bool,
+) -> Result<serde_json::Value, String> {
+    append_runtime_hook(
+        &mut hooks,
+        "PreToolUse",
+        serde_json::json!({
+            "matcher": "Agent",
+            "hooks": [{
+                "type": "command",
+                "command": current_exe.to_string_lossy(),
+                "args": ["--auxiliary-model-hook", model],
+                "timeout": 10
+            }]
+        }),
+    )?;
+    if include_private_runtime_hooks {
+        append_runtime_hook(
+            &mut hooks,
+            "UserPromptSubmit",
+            serde_json::json!({
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
@@ -2928,8 +2982,12 @@ pub(crate) fn auxiliary_model_hook_settings(
                     "args": ["--time-context-hook"],
                     "timeout": 5
                 }]
-            }],
-            "SessionStart": [{
+            }),
+        )?;
+        append_runtime_hook(
+            &mut hooks,
+            "SessionStart",
+            serde_json::json!({
                 "matcher": "startup|resume|clear|compact|fork",
                 "hooks": [{
                     "type": "command",
@@ -2937,9 +2995,66 @@ pub(crate) fn auxiliary_model_hook_settings(
                     "args": ["--identity-bootstrap-hook"],
                     "timeout": 10
                 }]
-            }]
-        }
-    }))
+            }),
+        )?;
+    }
+    Ok(serde_json::json!({ "hooks": hooks }))
+}
+
+#[cfg(test)]
+mod native_hook_merge_tests {
+    use super::*;
+
+    #[test]
+    fn system_hooks_are_preserved_without_private_hook_replacements() {
+        let mut hooks = serde_json::Map::new();
+        hooks.insert(
+            "SessionStart".to_string(),
+            serde_json::json!([{
+                "matcher": "startup|resume|clear|compact|fork",
+                "hooks": [{"type": "command", "command": "native-identity"}]
+            }]),
+        );
+        hooks.insert(
+            "UserPromptSubmit".to_string(),
+            serde_json::json!([{
+                "matcher": "",
+                "hooks": [{"type": "command", "command": "native-time"}]
+            }]),
+        );
+
+        let settings = build_auxiliary_model_hook_settings(
+            "sonnet",
+            std::path::Path::new("/Applications/Black Box.app/blackbox"),
+            hooks,
+            false,
+        )
+        .unwrap();
+        let encoded = settings.to_string();
+
+        assert!(encoded.contains("native-identity"));
+        assert!(encoded.contains("native-time"));
+        assert!(encoded.contains("--auxiliary-model-hook"));
+        assert!(!encoded.contains("--identity-bootstrap-hook"));
+        assert!(!encoded.contains("--time-context-hook"));
+    }
+
+    #[test]
+    fn isolated_runtime_registers_its_private_identity_and_time_hooks() {
+        let settings = build_auxiliary_model_hook_settings(
+            "haiku",
+            std::path::Path::new("/Applications/Black Box.app/blackbox"),
+            serde_json::Map::new(),
+            true,
+        )
+        .unwrap();
+        let encoded = settings.to_string();
+
+        assert!(encoded.contains("--auxiliary-model-hook"));
+        assert!(encoded.contains("--identity-bootstrap-hook"));
+        assert!(encoded.contains("--time-context-hook"));
+        assert!(encoded.contains("startup|resume|clear|compact|fork"));
+    }
 }
 
 #[tauri::command]

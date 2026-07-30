@@ -3,13 +3,25 @@ import {
   clearConversationViewStateForTests,
   loadChatScrollPosition,
   loadFileScrollPosition,
+  loadFileTreeScrollPosition,
   saveChatScrollPosition,
   saveFileScrollPosition,
+  saveFileTreeScrollPosition,
 } from '../lib/conversation-view-state';
 import { useFileStore } from '../stores/fileStore';
 
 describe('conversation reading position', () => {
-  beforeEach(clearConversationViewStateForTests);
+  beforeEach(() => {
+    clearConversationViewStateForTests();
+    useFileStore.setState({
+      rootPath: '',
+      tree: [],
+      expandedFolders: new Set(),
+      loadingFolders: new Set(),
+      previewSnapshots: {},
+      explorerSnapshots: {},
+    });
+  });
 
   it('keeps independent chat positions for each conversation', () => {
     saveChatScrollPosition('session-a', { top: 420, atBottom: false });
@@ -25,6 +37,15 @@ describe('conversation reading position', () => {
     expect(loadFileScrollPosition('session-a', '/tmp/report.md', 'preview')).toBe(360);
     expect(loadFileScrollPosition('session-a', '/tmp/report.md', 'source')).toBe(48);
     expect(loadFileScrollPosition('session-b', '/tmp/report.md', 'preview')).toBe(900);
+  });
+
+  it('keeps file-tree positions scoped by conversation and project root', () => {
+    saveFileTreeScrollPosition('session-a', '/tmp/project', 680);
+    saveFileTreeScrollPosition('session-b', '/tmp/project', 120);
+    saveFileTreeScrollPosition('session-a', '/tmp/other', 42);
+    expect(loadFileTreeScrollPosition('session-a', '/tmp/project')).toBe(680);
+    expect(loadFileTreeScrollPosition('session-b', '/tmp/project')).toBe(120);
+    expect(loadFileTreeScrollPosition('session-a', '/tmp/other')).toBe(42);
   });
 
   it('restores each conversation open document and unsaved edit buffer', () => {
@@ -68,5 +89,33 @@ describe('conversation reading position', () => {
       editContent: null,
       revealTarget: '/tmp/other.md',
     });
+  });
+
+  it('restores each conversation file-tree root and expanded folders', () => {
+    useFileStore.setState({
+      rootPath: '/tmp/project-a',
+      expandedFolders: new Set(['/tmp/project-a/docs', '/tmp/project-a/src']),
+      explorerSnapshots: {},
+    });
+    useFileStore.getState().saveExplorerState('session-a');
+
+    useFileStore.setState({
+      rootPath: '/tmp/project-b',
+      expandedFolders: new Set(['/tmp/project-b/research']),
+    });
+    useFileStore.getState().saveExplorerState('session-b');
+
+    useFileStore.getState().restoreExplorerState('session-a');
+    expect(useFileStore.getState().rootPath).toBe('/tmp/project-a');
+    expect(Array.from(useFileStore.getState().expandedFolders)).toEqual([
+      '/tmp/project-a/docs',
+      '/tmp/project-a/src',
+    ]);
+
+    useFileStore.getState().restoreExplorerState('session-b');
+    expect(useFileStore.getState().rootPath).toBe('/tmp/project-b');
+    expect(Array.from(useFileStore.getState().expandedFolders)).toEqual([
+      '/tmp/project-b/research',
+    ]);
   });
 });

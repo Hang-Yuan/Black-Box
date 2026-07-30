@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useState, useCallback, useMemo, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { FileNode, FileSearchResponse } from '../../lib/tauri-bridge';
 import { useFileStore, FileChangeKind } from '../../stores/fileStore';
@@ -12,6 +12,10 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { FileIcon } from '../shared/FileIcon';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { showToast } from '../shared/Toast';
+import {
+  loadFileTreeScrollPosition,
+  saveFileTreeScrollPosition,
+} from '../../lib/conversation-view-state';
 
 function getChangeBadge(kind: FileChangeKind | undefined) {
   if (!kind) return null;
@@ -492,7 +496,10 @@ export function FileExplorer() {
   const isLoading = useFileStore((s) => s.isLoading);
   const rootPath = useFileStore((s) => s.rootPath);
   const revealTarget = useFileStore((s) => s.revealTarget);
+  const expandedFolders = useFileStore((s) => s.expandedFolders);
+  const loadingFolderCount = useFileStore((s) => s.loadingFolders.size);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
+  const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
 
   const refreshTree = useFileStore((s) => s.refreshTree);
   const createFile = useFileStore((s) => s.createFile);
@@ -511,6 +518,16 @@ export function FileExplorer() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const searchRequestRef = useRef(0);
+  const treeScrollRef = useRef<HTMLDivElement>(null);
+  const restoringTreeScrollRef = useRef(false);
+  const treeRootPath = rootPath || workingDirectory;
+  const treeViewKey = selectedSessionId && treeRootPath
+    ? `${selectedSessionId}\u0000${treeRootPath}`
+    : '';
+  const expandedFolderSignature = useMemo(
+    () => Array.from(expandedFolders).sort().join('\u0000'),
+    [expandedFolders],
+  );
 
   // Right-click menu state
   const [clipboardPath, setClipboardPath] = useState<string | null>(null);
@@ -525,6 +542,71 @@ export function FileExplorer() {
   useEffect(() => {
     if (revealTarget) setSearchQuery('');
   }, [revealTarget]);
+
+  useEffect(() => () => {
+    const element = treeScrollRef.current;
+    if (element && selectedSessionId && treeRootPath && !searchQuery) {
+      saveFileTreeScrollPosition(selectedSessionId, treeRootPath, element.scrollTop);
+    }
+  }, [treeViewKey, selectedSessionId, treeRootPath, searchQuery]);
+
+  useLayoutEffect(() => {
+    const element = treeScrollRef.current;
+    if (!element || !selectedSessionId || !treeRootPath || searchQuery) return;
+    const saved = loadFileTreeScrollPosition(selectedSessionId, treeRootPath);
+    if (saved === null) return;
+
+    // Restoring the session and its expanded folders happens in the same React
+    // transition. Nested TreeNode subscriptions can increase scrollHeight for
+    // another couple of frames after this parent layout effect has run. Keep
+    // the restoration guard active while that layout settles; otherwise the
+    // intermediate scrollTop=0 event overwrites the saved position.
+    restoringTreeScrollRef.current = true;
+    let remainingFrames = 3;
+    let frame = 0;
+    const restore = () => {
+      if (treeScrollRef.current !== element) {
+        restoringTreeScrollRef.current = false;
+        return;
+      }
+      element.scrollTop = saved;
+      remainingFrames -= 1;
+      if (remainingFrames > 0) {
+        frame = requestAnimationFrame(restore);
+      } else {
+        restoringTreeScrollRef.current = false;
+      }
+    };
+    restore();
+    return () => {
+      cancelAnimationFrame(frame);
+      restoringTreeScrollRef.current = false;
+    };
+  }, [
+    treeViewKey,
+    tree.length,
+    expandedFolderSignature,
+    loadingFolderCount,
+    isLoading,
+    searchQuery,
+    selectedSessionId,
+    treeRootPath,
+  ]);
+
+  const handleTreeScroll = useCallback(() => {
+    if (
+      restoringTreeScrollRef.current
+      || searchQuery
+      || !selectedSessionId
+      || !treeRootPath
+      || !treeScrollRef.current
+    ) return;
+    saveFileTreeScrollPosition(
+      selectedSessionId,
+      treeRootPath,
+      treeScrollRef.current.scrollTop,
+    );
+  }, [searchQuery, selectedSessionId, treeRootPath]);
 
   useEffect(() => {
     const query = searchQuery.trim();
@@ -744,7 +826,11 @@ export function FileExplorer() {
             </span>
           </div>
         )}
-        <div className="h-full overflow-y-auto py-1">
+        <div
+          ref={treeScrollRef}
+          onScroll={handleTreeScroll}
+          className="h-full overflow-y-auto py-1"
+        >
         {searchQuery ? (
           isDeepSearching ? (
             <div className="flex items-center justify-center py-8">

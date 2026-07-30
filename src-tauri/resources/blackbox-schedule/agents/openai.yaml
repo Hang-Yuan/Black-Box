@@ -1,4 +1,4 @@
 interface:
   display_name: "Blackbox Scheduled Tasks"
   short_description: "Create and manage persistent Blackbox automations"
-  default_prompt: "Use $blackbox-schedule to schedule this work persistently in Blackbox."
+  default_prompt: "/blackbox-schedule\n\nSchedule this work persistently in Blackbox."

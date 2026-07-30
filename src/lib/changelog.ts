@@ -19,6 +19,24 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.18',
+    date: '2026-07-28',
+    highlights: {
+      zh: [
+        '系统 Claude 环境会完整保留 ~/.claude 中的原生 SessionStart 与 UserPromptSubmit hooks，Black Box 只追加辅助模型路由，不再覆盖身份与时间上下文',
+        '隔离环境与系统环境会双向补齐 Black Box 已跟踪但目标侧缺失的会话，切换环境后历史对话不再消失；已有文件永不覆盖、移动或删除',
+        '交互会话与自动任务共用当前系统环境的原生 hooks，避免定时运行与手动对话出现身份、时间上下文或登录状态分叉',
+        '切换会话后恢复聊天阅读位置、已打开文件、预览模式与文件滚动位置，返回长对话或文档时保持离开前的阅读点',
+      ],
+      en: [
+        'Preserves native SessionStart and UserPromptSubmit hooks from ~/.claude in the system Claude environment, while Black Box adds only auxiliary-model routing instead of replacing identity and time context',
+        'Synchronizes missing Black Box-owned conversations in both directions between isolated and system environments without overwriting, moving, or deleting existing state',
+        'Uses the active system environment’s native hooks for both interactive sessions and automations so identity, time context, and login state do not diverge',
+        'Restores chat reading position, open file, preview mode, and file scroll position when returning to a conversation',
+      ],
+    },
+  },
+  {
     version: '0.14.16',
     date: '2026-07-28',
     highlights: {

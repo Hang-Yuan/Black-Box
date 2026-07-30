@@ -357,6 +357,24 @@ fn copy_runtime_directories(
     Ok(copied)
 }
 
+fn synchronize_tracked_state(
+    source: &Path,
+    destination: &Path,
+    tracked: &BTreeSet<String>,
+) -> Result<(usize, usize, bool), String> {
+    let copied_transcripts = copy_tracked_transcripts(source, destination, tracked)?;
+    let copied_runtime_directories = copy_runtime_directories(source, destination, tracked)?;
+    let copied_names_file = copy_file_if_missing(
+        &source.join("blackbox_session_names.json"),
+        &destination.join("blackbox_session_names.json"),
+    )?;
+    Ok((
+        copied_transcripts,
+        copied_runtime_directories,
+        copied_names_file,
+    ))
+}
+
 fn write_receipt(path: &Path, receipt: &IsolationMigrationReceipt) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|error| format!("Cannot encode Black Box isolation receipt: {error}"))?;
@@ -368,10 +386,16 @@ fn write_receipt(path: &Path, receipt: &IsolationMigrationReceipt) -> Result<(),
         .map_err(|error| format!("Cannot commit Black Box isolation receipt: {error}"))
 }
 
-/// Initialize the private root and import only sessions that Black Box already
-/// owns. The legacy source is copied, never moved or deleted.
+/// Initialize the selected Claude root and merge missing Black Box-owned
+/// sessions from the other root. Switching environments must not make tracked
+/// conversations disappear. The source is copied, never moved, deleted, or
+/// allowed to overwrite an existing destination transcript.
 pub(crate) fn initialize() -> Result<PathBuf, String> {
     let destination = claude_config_dir()?;
+    let blackbox = blackbox_dir()?;
+    protect_directory(&blackbox)?;
+    let tracked = tracked_session_ids(&blackbox)?;
+
     if uses_system_environment()? {
         if !destination.is_dir() {
             return Err(format!(
@@ -379,6 +403,8 @@ pub(crate) fn initialize() -> Result<PathBuf, String> {
                 destination.display()
             ));
         }
+        let source = private_claude_config_dir()?;
+        let _ = synchronize_tracked_state(&source, &destination, &tracked)?;
         return Ok(destination);
     }
     protect_directory(&destination)?;
@@ -388,33 +414,24 @@ pub(crate) fn initialize() -> Result<PathBuf, String> {
         return Ok(destination);
     }
 
-    let blackbox = blackbox_dir()?;
-    protect_directory(&blackbox)?;
     let receipt_path = blackbox.join(MIGRATION_RECEIPT);
-    if receipt_path.exists() {
-        return Ok(destination);
-    }
-
     let source = home_dir()?.join(".claude");
-    let tracked = tracked_session_ids(&blackbox)?;
-    let copied_transcripts = copy_tracked_transcripts(&source, &destination, &tracked)?;
-    let copied_runtime_directories = copy_runtime_directories(&source, &destination, &tracked)?;
-    let copied_names_file = copy_file_if_missing(
-        &source.join("blackbox_session_names.json"),
-        &destination.join("blackbox_session_names.json"),
-    )?;
-    write_receipt(
-        &receipt_path,
-        &IsolationMigrationReceipt {
-            version: 1,
-            source: source.to_string_lossy().into_owned(),
-            destination: destination.to_string_lossy().into_owned(),
-            tracked_sessions: tracked.len(),
-            copied_transcripts,
-            copied_runtime_directories,
-            copied_names_file,
-        },
-    )?;
+    let (copied_transcripts, copied_runtime_directories, copied_names_file) =
+        synchronize_tracked_state(&source, &destination, &tracked)?;
+    if !receipt_path.exists() {
+        write_receipt(
+            &receipt_path,
+            &IsolationMigrationReceipt {
+                version: 1,
+                source: source.to_string_lossy().into_owned(),
+                destination: destination.to_string_lossy().into_owned(),
+                tracked_sessions: tracked.len(),
+                copied_transcripts,
+                copied_runtime_directories,
+                copied_names_file,
+            },
+        )?;
+    }
     Ok(destination)
 }
 
@@ -447,6 +464,97 @@ mod tests {
             .join("projects/-tmp-workspace")
             .join(format!("{foreign}.jsonl"))
             .exists());
+    }
+
+    #[test]
+    fn tracked_state_can_follow_the_selected_environment_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = temp.path().join("system");
+        let isolated = temp.path().join("isolated");
+        let project = "-tmp-workspace";
+        let system_only = uuid::Uuid::new_v4().to_string();
+        let isolated_only = uuid::Uuid::new_v4().to_string();
+        let shared = uuid::Uuid::new_v4().to_string();
+        let tracked = BTreeSet::from([system_only.clone(), isolated_only.clone(), shared.clone()]);
+
+        std::fs::create_dir_all(system.join("projects").join(project)).unwrap();
+        std::fs::create_dir_all(isolated.join("projects").join(project)).unwrap();
+        std::fs::write(
+            system
+                .join("projects")
+                .join(project)
+                .join(format!("{system_only}.jsonl")),
+            "system-only",
+        )
+        .unwrap();
+        std::fs::write(
+            isolated
+                .join("projects")
+                .join(project)
+                .join(format!("{isolated_only}.jsonl")),
+            "isolated-only",
+        )
+        .unwrap();
+        std::fs::write(
+            system
+                .join("projects")
+                .join(project)
+                .join(format!("{shared}.jsonl")),
+            "system-authority",
+        )
+        .unwrap();
+        std::fs::write(
+            isolated
+                .join("projects")
+                .join(project)
+                .join(format!("{shared}.jsonl")),
+            "isolated-authority",
+        )
+        .unwrap();
+
+        synchronize_tracked_state(&isolated, &system, &tracked).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                system
+                    .join("projects")
+                    .join(project)
+                    .join(format!("{isolated_only}.jsonl"))
+            )
+            .unwrap(),
+            "isolated-only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                system
+                    .join("projects")
+                    .join(project)
+                    .join(format!("{shared}.jsonl"))
+            )
+            .unwrap(),
+            "system-authority"
+        );
+
+        synchronize_tracked_state(&system, &isolated, &tracked).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                isolated
+                    .join("projects")
+                    .join(project)
+                    .join(format!("{system_only}.jsonl"))
+            )
+            .unwrap(),
+            "system-only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                isolated
+                    .join("projects")
+                    .join(project)
+                    .join(format!("{shared}.jsonl"))
+            )
+            .unwrap(),
+            "isolated-authority"
+        );
     }
 
     #[cfg(unix)]

@@ -36,6 +36,11 @@ interface FilePreviewSnapshot {
   revealTarget: string | null;
 }
 
+interface FileExplorerSnapshot {
+  rootPath: string;
+  expandedFolders: string[];
+}
+
 // Batch buffer for markFileChanged — collect changes within a single frame, flush once via rAF
 const _pendingChanges = new Map<string, FileChangeKind>();
 let _changeFlushRaf = 0;
@@ -58,6 +63,7 @@ interface FileState {
   // 当前被定位高亮的路径（文件或文件夹，与「预览选中」解耦）
   revealTarget: string | null;
   previewSnapshots: Record<string, FilePreviewSnapshot>;
+  explorerSnapshots: Record<string, FileExplorerSnapshot>;
 
   // Editing state
   editContent: string | null;     // buffer for edits (null = not dirty)
@@ -88,6 +94,8 @@ interface FileState {
   closePreview: () => void;
   savePreviewState: (sessionId: string) => void;
   restorePreviewState: (sessionId: string) => void;
+  saveExplorerState: (sessionId: string) => void;
+  restoreExplorerState: (sessionId: string) => void;
   setPreviewMode: (mode: PreviewMode) => void;
   setEditContent: (content: string) => void;
   saveFile: () => Promise<void>;
@@ -142,17 +150,25 @@ export const useFileStore = create<FileState>()((set, get) => ({
   loadingFolders: new Set<string>(),
   revealTarget: null,
   previewSnapshots: {},
+  explorerSnapshots: {},
 
   loadTree: async (path: string) => {
     if (!path) return;
     const prevRoot = get().rootPath;
     const isNewDir = path !== prevRoot;
+    const expandedFolders = isNewDir
+      ? new Set(
+        Array.from(get().expandedFolders).filter(
+          (folder) => folder === path || folder.startsWith(`${path}/`),
+        ),
+      )
+      : get().expandedFolders;
     // Always show loading on first load or directory change
     set({
       rootPath: path,
       isLoading: true,
       // Clear stale tree immediately when switching directories
-      ...(isNewDir ? { tree: [], expandedFolders: new Set<string>(), loadingFolders: new Set<string>() } : {}),
+      ...(isNewDir ? { tree: [], expandedFolders, loadingFolders: new Set<string>() } : {}),
     });
     try {
       const tree = await bridge.readFileTree(path, 8);
@@ -345,6 +361,35 @@ export const useFileStore = create<FileState>()((set, get) => ({
       revealTarget: snapshot.revealTarget,
       pendingNavigation: null,
       showUnsavedDialog: false,
+    };
+  }),
+
+  saveExplorerState: (sessionId: string) => set((state) => ({
+    explorerSnapshots: {
+      ...state.explorerSnapshots,
+      [sessionId]: {
+        rootPath: state.rootPath,
+        expandedFolders: Array.from(state.expandedFolders),
+      },
+    },
+  })),
+
+  restoreExplorerState: (sessionId: string) => set((state) => {
+    const snapshot = state.explorerSnapshots[sessionId];
+    if (!snapshot) {
+      return { expandedFolders: new Set<string>() };
+    }
+    const rootChanged = snapshot.rootPath !== state.rootPath;
+    return {
+      rootPath: snapshot.rootPath,
+      expandedFolders: new Set(snapshot.expandedFolders),
+      ...(rootChanged
+        ? {
+          tree: [],
+          loadingFolders: new Set<string>(),
+          isLoading: false,
+        }
+        : {}),
     };
   }),
 
