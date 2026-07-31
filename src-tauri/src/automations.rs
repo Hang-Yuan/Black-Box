@@ -5,7 +5,7 @@
 //! hosted by the desktop app, matching Codex's documented app-running model.
 
 use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc, Weekday};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -65,6 +65,10 @@ pub struct AutomationDefinition {
     /// Explicit opt-in for Claude Code Agent Teams. Disabled by default because
     /// each teammate has an independent context and materially increases cost.
     pub agent_teams_enabled: bool,
+    /// Automation-owned durable output roots under Black Box's data directory.
+    /// Values must remain relative so task definitions cannot grant arbitrary
+    /// host filesystem write access.
+    pub data_write_subdirectories: Vec<String>,
     pub execution_environment: Option<String>,
     pub target: Option<AutomationTarget>,
     pub cwds: Vec<String>,
@@ -94,6 +98,7 @@ impl Default for AutomationDefinition {
             auxiliary_model: Some("sonnet".to_string()),
             reasoning_effort: None,
             agent_teams_enabled: false,
+            data_write_subdirectories: vec![],
             execution_environment: Some("worktree".to_string()),
             target: None,
             cwds: vec![],
@@ -427,6 +432,7 @@ fn memory_path(id: &str) -> Result<PathBuf, String> {
 fn build_automation_security_settings(
     run_id: &str,
     auxiliary_model: &str,
+    additional_write_paths: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let directory = automation_data_dir()?.join("run-settings");
     fs::create_dir_all(&directory)
@@ -437,7 +443,13 @@ fn build_automation_security_settings(
         "enabled": true,
         "autoAllowBashIfSandboxed": true,
         "allowUnsandboxedCommands": false,
-        "failIfUnavailable": true
+        "failIfUnavailable": true,
+        "filesystem": {
+            "allowWrite": additional_write_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        }
     });
     fs::write(
         &path,
@@ -446,6 +458,60 @@ fn build_automation_security_settings(
     )
     .map_err(|error| format!("Cannot write automation security settings: {error}"))?;
     Ok(path)
+}
+
+fn validate_data_write_subdirectories(definition: &AutomationDefinition) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for subdirectory in &definition.data_write_subdirectories {
+        if subdirectory.trim().is_empty()
+            || subdirectory.trim() != subdirectory
+            || !safe_relative_path(Path::new(subdirectory))
+        {
+            return Err(
+                "dataWriteSubdirectories must contain safe relative paths under Black Box data"
+                    .to_string(),
+            );
+        }
+        if !seen.insert(subdirectory) {
+            return Err("dataWriteSubdirectories cannot contain duplicates".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn prepare_automation_write_paths(
+    definition: &AutomationDefinition,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    validate_data_write_subdirectories(definition)?;
+    fs::create_dir_all(data_dir)
+        .map_err(|error| format!("Cannot prepare Black Box data directory: {error}"))?;
+    let canonical_data_dir = fs::canonicalize(data_dir)
+        .map_err(|error| format!("Cannot resolve Black Box data directory: {error}"))?;
+    let mut paths = Vec::with_capacity(definition.data_write_subdirectories.len());
+    for subdirectory in &definition.data_write_subdirectories {
+        let path = data_dir.join(subdirectory);
+        fs::create_dir_all(&path).map_err(|error| {
+            format!(
+                "Cannot prepare automation write path {}: {error}",
+                path.display()
+            )
+        })?;
+        let canonical_path = fs::canonicalize(&path).map_err(|error| {
+            format!(
+                "Cannot resolve automation write path {}: {error}",
+                path.display()
+            )
+        })?;
+        if !canonical_path.starts_with(&canonical_data_dir) {
+            return Err(format!(
+                "Automation write path escaped Black Box data: {}",
+                path.display()
+            ));
+        }
+        paths.push(canonical_path);
+    }
+    Ok(paths)
 }
 
 fn cleanup_automation_security_settings(path: &Path) {
@@ -468,6 +534,75 @@ fn mcp_permission_rules(path: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     rules.sort();
     rules
+}
+
+fn open_database_read_only() -> Result<Connection, String> {
+    let path = database_path()?;
+    open_database_read_only_at(&path)
+}
+
+fn open_database_read_only_at(path: &Path) -> Result<Connection, String> {
+    if !path.is_file() {
+        return Err(format!(
+            "Automations database does not exist: {}",
+            path.display()
+        ));
+    }
+    let ordinary = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(configure_read_only_connection);
+    let ordinary_error = match ordinary {
+        Ok(connection) => return Ok(connection),
+        Err(error) => error,
+    };
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal_path = PathBuf::from(wal_name);
+    if wal_path
+        .metadata()
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "Cannot open active WAL automations database read-only: {ordinary_error}"
+        ));
+    }
+
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) && !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    let mut encoded = String::with_capacity(normalized.len());
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    let immutable_uri = format!("file:{encoded}?mode=ro&immutable=1");
+    Connection::open_with_flags(
+        immutable_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .and_then(configure_read_only_connection)
+    .map_err(|immutable_error| {
+        format!(
+            "Cannot open automations database read-only: {ordinary_error}; immutable fallback failed: {immutable_error}"
+        )
+    })
+}
+
+fn configure_read_only_connection(connection: Connection) -> rusqlite::Result<Connection> {
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .and_then(|_| connection.execute_batch("PRAGMA query_only=ON;"))?;
+    connection.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |_| Ok(()))?;
+    Ok(connection)
 }
 
 fn open_database() -> Result<Connection, String> {
@@ -1030,6 +1165,7 @@ fn validate_definition(definition: &AutomationDefinition) -> Result<(), String> 
     if definition.kind == "heartbeat" && execution_environment == "worktree" {
         return Err("heartbeat automations cannot use a worktree".to_string());
     }
+    validate_data_write_subdirectories(definition)?;
     parse_rrule(&definition.rrule)?;
     if definition.kind == "cron" {
         let project = definition
@@ -1275,6 +1411,62 @@ fn query_summary(
         running: active_run_id.is_some(),
         unread_runs,
     })
+}
+
+fn verify_definition_is_indexed(
+    connection: &Connection,
+    definition: &AutomationDefinition,
+) -> Result<(), String> {
+    let indexed: Option<(String, String, i64)> = connection
+        .query_row(
+            "SELECT rrule,status,updated_at FROM automations WHERE id=?1",
+            params![definition.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            format!(
+                "Cannot inspect indexed automation {}: {error}",
+                definition.id
+            )
+        })?;
+    match indexed {
+        Some((rrule, status, updated_at))
+            if rrule == definition.rrule
+                && status == definition.status
+                && updated_at == definition.updated_at =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(format!(
+            "Automation {} definition/index mismatch; reopen Black Box to reconcile it",
+            definition.id
+        )),
+        None => Err(format!(
+            "Automation {} is not indexed; reopen Black Box to reconcile it",
+            definition.id
+        )),
+    }
+}
+
+fn list_automations_read_only() -> Result<Vec<AutomationSummary>, String> {
+    let connection = open_database_read_only()?;
+    load_all_definitions()?
+        .into_iter()
+        .map(|definition| {
+            validate_definition(&definition)?;
+            verify_definition_is_indexed(&connection, &definition)?;
+            query_summary(&connection, definition)
+        })
+        .collect()
+}
+
+fn get_automation_read_only(id: &str) -> Result<AutomationSummary, String> {
+    let definition = load_definition(id)?;
+    validate_definition(&definition)?;
+    let connection = open_database_read_only()?;
+    verify_definition_is_indexed(&connection, &definition)?;
+    query_summary(&connection, definition)
 }
 
 #[tauri::command]
@@ -3090,6 +3282,14 @@ fn automation_session_target(
     })
 }
 
+fn automation_trigger(scheduled_at: Option<i64>) -> &'static str {
+    if scheduled_at.is_some() {
+        "scheduled"
+    } else {
+        "manual"
+    }
+}
+
 async fn invoke_claude(
     definition: &AutomationDefinition,
     scheduled_at: Option<i64>,
@@ -3127,6 +3327,9 @@ async fn invoke_claude(
         &mut provider_remove,
     );
     let prompt = automation_prompt(definition, scheduled_at)?;
+    let data_dir = automation_data_dir().map_err(AutomationExecutionError::new)?;
+    let additional_write_paths = prepare_automation_write_paths(definition, &data_dir)
+        .map_err(AutomationExecutionError::new)?;
     let mut args = vec![
         "-p".to_string(),
         prompt,
@@ -3144,6 +3347,10 @@ async fn invoke_claude(
         "--max-turns".to_string(),
         "240".to_string(),
     ];
+    for path in &additional_write_paths {
+        args.push("--add-dir".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
     args.extend(session_target.arguments.clone());
     if let Some(effort) = &definition.reasoning_effort {
         args.push("--effort".to_string());
@@ -3216,14 +3423,17 @@ async fn invoke_claude(
     }
     args.push("--allowedTools".to_string());
     args.push(allowed_tools.join(","));
-    let security_settings_path =
-        match build_automation_security_settings(run_id, &auxiliary_model_tier) {
-            Ok(path) => path,
-            Err(error) => {
-                crate::cleanup_mcp_scratch_config(&mcp_scratch_id);
-                return Err(AutomationExecutionError::new(error));
-            }
-        };
+    let security_settings_path = match build_automation_security_settings(
+        run_id,
+        &auxiliary_model_tier,
+        &additional_write_paths,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            crate::cleanup_mcp_scratch_config(&mcp_scratch_id);
+            return Err(AutomationExecutionError::new(error));
+        }
+    };
     args.push("--settings".to_string());
     args.push(security_settings_path.to_string_lossy().to_string());
 
@@ -3243,6 +3453,12 @@ async fn invoke_claude(
     command
         .args(args)
         .current_dir(execution_cwd)
+        .env("BLACKBOX_AUTOMATION_ID", &definition.id)
+        .env("BLACKBOX_AUTOMATION_RUN_ID", run_id)
+        .env(
+            "BLACKBOX_AUTOMATION_TRIGGER",
+            automation_trigger(scheduled_at),
+        )
         .env_remove("CLAUDECODE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3797,6 +4013,22 @@ pub fn list_automation_runs(
     limit: Option<u32>,
 ) -> Result<Vec<AutomationRun>, String> {
     let connection = open_database()?;
+    query_automation_runs(&connection, automation_id, limit)
+}
+
+fn list_automation_runs_read_only(
+    automation_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<AutomationRun>, String> {
+    let connection = open_database_read_only()?;
+    query_automation_runs(&connection, automation_id, limit)
+}
+
+fn query_automation_runs(
+    connection: &Connection,
+    automation_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<AutomationRun>, String> {
     let limit = limit.unwrap_or(100).min(500);
     let sql = if automation_id.is_some() {
         "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason FROM automation_runs WHERE automation_id=?1 ORDER BY started_at DESC LIMIT ?2"
@@ -4864,12 +5096,14 @@ pub fn restore_automation_worktree(run_id: String) -> Result<(), String> {
 pub fn run_cli(arguments: &[String]) -> Result<String, String> {
     let command = arguments.first().map(String::as_str).unwrap_or("list");
     match command {
-        "list" => serde_json::to_string_pretty(&list_automations()?).map_err(|e| e.to_string()),
+        "list" => {
+            serde_json::to_string_pretty(&list_automations_read_only()?).map_err(|e| e.to_string())
+        }
         "get" => {
             let id = arguments
                 .get(1)
                 .ok_or_else(|| "get requires an automation id".to_string())?;
-            serde_json::to_string_pretty(&get_automation(id.clone())?).map_err(|e| e.to_string())
+            serde_json::to_string_pretty(&get_automation_read_only(id)?).map_err(|e| e.to_string())
         }
         "upsert" => {
             let path = arguments
@@ -4917,7 +5151,7 @@ pub fn run_cli(arguments: &[String]) -> Result<String, String> {
         }
         "runs" => {
             let automation_id = arguments.get(1).cloned();
-            serde_json::to_string_pretty(&list_automation_runs(automation_id, Some(50))?)
+            serde_json::to_string_pretty(&list_automation_runs_read_only(automation_id, Some(50))?)
                 .map_err(|e| e.to_string())
         }
         "review" => {
@@ -4934,6 +5168,105 @@ pub fn run_cli(arguments: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_database_connection_cannot_mutate_state() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let path = sandbox.path().join("automations.sqlite");
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute_batch(
+                "CREATE TABLE probe (id INTEGER PRIMARY KEY); INSERT INTO probe (id) VALUES (1);",
+            )
+            .unwrap();
+        drop(writable);
+
+        let read_only = open_database_read_only_at(&path).unwrap();
+        let query_only: i64 = read_only
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .unwrap();
+        let count: i64 = read_only
+            .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(query_only, 1);
+        assert_eq!(count, 1);
+        assert!(read_only
+            .execute("INSERT INTO probe (id) VALUES (2)", [])
+            .is_err());
+    }
+
+    #[test]
+    fn read_only_database_connection_observes_an_active_wal() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let path = sandbox.path().join("automations.sqlite");
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE probe (id INTEGER PRIMARY KEY); INSERT INTO probe (id) VALUES (1);",
+            )
+            .unwrap();
+
+        let read_only = open_database_read_only_at(&path).unwrap();
+        let count: i64 = read_only
+            .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn manual_and_scheduled_automation_triggers_are_distinct() {
+        assert_eq!(automation_trigger(None), "manual");
+        assert_eq!(automation_trigger(Some(1_785_363_000_000)), "scheduled");
+    }
+
+    #[test]
+    fn configured_automation_write_paths_stay_under_the_data_root() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let data_dir = sandbox.path().join("blackbox-data");
+        let definition = AutomationDefinition {
+            data_write_subdirectories: vec!["task-artifacts".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_automation_write_paths(&definition, &data_dir).unwrap(),
+            vec![fs::canonicalize(data_dir.join("task-artifacts")).unwrap()]
+        );
+        assert!(
+            prepare_automation_write_paths(&AutomationDefinition::default(), &data_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn automation_write_paths_reject_parent_traversal() {
+        let definition = AutomationDefinition {
+            data_write_subdirectories: vec!["../escape".to_string()],
+            ..Default::default()
+        };
+        assert!(validate_data_write_subdirectories(&definition).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automation_write_paths_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let data_dir = sandbox.path().join("blackbox-data");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        symlink(outside.path(), data_dir.join("escape")).unwrap();
+        let definition = AutomationDefinition {
+            data_write_subdirectories: vec!["escape".to_string()],
+            ..Default::default()
+        };
+
+        let error = prepare_automation_write_paths(&definition, &data_dir).unwrap_err();
+        assert!(error.contains("escaped Black Box data"));
+    }
 
     #[test]
     fn automation_activity_summary_query_reads_metadata_only() {

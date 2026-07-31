@@ -535,6 +535,12 @@ export interface ProvidersFile {
   }[];
 }
 
+export interface ConversationRuntimePreference {
+  providerId: string | null;
+  selectedModel: 'fable' | 'opus' | 'sonnet' | 'haiku';
+  customModelId: string | null;
+}
+
 export interface UnifiedCommand {
   name: string;
   description: string;
@@ -572,6 +578,7 @@ export interface AutomationDefinition {
   auxiliary_model: string | null;
   reasoning_effort: string | null;
   agent_teams_enabled: boolean;
+  data_write_subdirectories: string[];
   execution_environment: 'local' | 'worktree' | null;
   target: { type: 'project'; projectId: string } | null;
   cwds: string[];
@@ -1156,6 +1163,12 @@ export const bridge = {
 
   saveCustomPreviews: (data: Record<string, string>) =>
     invoke<void>('save_custom_previews', { data }),
+
+  loadConversationRuntimePreferences: () =>
+    invoke<Record<string, ConversationRuntimePreference>>('load_conversation_runtime_preferences'),
+
+  saveConversationRuntimePreferences: (data: Record<string, ConversationRuntimePreference>) =>
+    invoke<void>('save_conversation_runtime_preferences', { data }),
 
   // Session metadata projections. The Rust side reads/writes the single
   // versioned ~/.blackbox/session_metadata.json authority atomically.

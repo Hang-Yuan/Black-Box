@@ -20,6 +20,7 @@ const cliPath = join(projectRoot, 'scripts', 'blackbox-cli.mjs');
 const isolationRoot = process.env.BLACKBOX_DEV_ISOLATION_ROOT;
 const reportHome = process.env.BLACKBOX_SMOKE_REPORT_HOME || process.env.BLACKBOX_AUTOMATION_HOME;
 const timeoutMs = Number(process.env.BLACKBOX_SMOKE_TIMEOUT_MS || 120_000);
+const toolbarOnly = process.env.BLACKBOX_SMOKE_TOOLBAR_ONLY === '1';
 
 if (!isolationRoot || !reportHome) {
   throw new Error('Run extension navigation smoke through scripts/run-isolated.sh');
@@ -89,7 +90,7 @@ function sleep(ms) {
 }
 
 async function waitForHarness() {
-  const deadline = Date.now() + 90_000;
+  const deadline = Date.now() + timeoutMs;
   let lastError = null;
   while (Date.now() < deadline) {
     try { return cli(['status'], { timeout: 5_000 }); } catch (error) {
@@ -150,6 +151,26 @@ function click(selector) {
 
 function inspect(expression) {
   return cli(['exec', expression]).result;
+}
+
+async function maximizeWindow() {
+  const marker = `maximize_${Date.now()}`;
+  const started = inspect(
+    `window.__blackbox_test.toggleWindowMaximize(${JSON.stringify(marker)})`,
+  );
+  if (!started?.started) throw new Error(started?.error || 'Window maximize did not start');
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const state = inspect(`window[${JSON.stringify(marker)}]`);
+    if (state?.done) {
+      inspect(`(()=>{delete window[${JSON.stringify(marker)}];return true})()`);
+      if (state.error) throw new Error(`Window maximize failed: ${state.error}`);
+      await sleep(250);
+      return inspect('({width:innerWidth,height:innerHeight})');
+    }
+    await sleep(100);
+  }
+  throw new Error('Window maximize timed out');
 }
 
 const report = {
@@ -219,10 +240,10 @@ try {
   inspect(`(()=>{document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));return true})()`);
 
   const popoverContracts = [];
-  for (const [buttonSelector, explainerSelector, popupSelector] of [
-    ['[data-testid="workflow-manage"]', '[data-testid="workflow-explainer"]', '[data-testid="workflow-popover"]'],
-    ['[data-testid="loop-manage"]', '[data-testid="loop-explainer"]', null],
-    ['[data-testid="goal-manage"]', '[data-testid="goal-explainer"]', null],
+  for (const [buttonSelector, explainerSelector, popupSelector, activateSelector] of [
+    ['[data-testid="workflow-manage"]', '[data-testid="workflow-explainer"]', '[data-testid="workflow-popover"]', '[data-testid="workflow-activate-option"]'],
+    ['[data-testid="loop-manage"]', '[data-testid="loop-explainer"]', null, '[data-testid="loop-activate-option"]'],
+    ['[data-testid="goal-manage"]', '[data-testid="goal-explainer"]', null, '[data-testid="goal-create-option"]'],
   ]) {
     click(buttonSelector);
     cli(['wait-for', '--selector', explainerSelector, '--timeout', '10000']);
@@ -234,6 +255,7 @@ try {
       const rect=popup?.getBoundingClientRect();
       return {
         explanation:(explainer?.textContent||'').trim(),
+        activateAction:Boolean(document.querySelector(${JSON.stringify(activateSelector)})),
         rect:rect?{left:rect.left,top:rect.top,right:rect.right,bottom:rect.bottom,width:rect.width,height:rect.height}:null,
         fits:Boolean(rect&&rect.left>=0&&rect.top>=0&&rect.right<=innerWidth&&rect.bottom<=innerHeight),
       };
@@ -243,7 +265,11 @@ try {
   click('[data-testid="goal-manage"]');
   report.domGeometry.popovers = popoverContracts;
   report.checks.longChainPopoversExplainThemselvesAndFit = popoverContracts.length === 3
-    && popoverContracts.every((contract) => contract.fits && contract.explanation.length >= 40);
+    && popoverContracts.every((contract) => (
+      contract.fits
+      && contract.explanation.length >= 40
+      && contract.activateAction
+    ));
 
   inspect(`(()=>{window.confirm=()=>true;return true})()`);
   click('[data-testid="agent-panel-toggle"]');
@@ -288,25 +314,43 @@ try {
     && teamOn.knob.left > teamOff.knob.left;
   click('[data-testid="agent-panel-toggle"]');
 
+  const wideViewport = await maximizeWindow();
   click('[data-testid="activity-panel-toggle"]');
   cli(['wait-for', '--selector', '[data-testid="activity-panel"]', '--timeout', '10000']);
   const activityGeometry = inspect(`(()=>{
     const panel=document.querySelector('[data-testid="activity-panel"]');
+    const toolbar=document.querySelector('[data-testid="chat-top-bar"]');
+    const fullLabel=document.querySelector('[data-testid="workflow-button"] .blackbox-toolbar-full-label');
+    const compactLabel=document.querySelector('[data-testid="workflow-button"] .blackbox-toolbar-compact-label');
     let animated=panel?.parentElement;
     while(animated&&!String(animated.className).includes('transition-all'))animated=animated.parentElement;
     if(animated)animated.style.transition='none';
     const rect=panel?.getBoundingClientRect();
-    return rect?{left:rect.left,top:rect.top,right:rect.right,bottom:rect.bottom,width:rect.width,height:rect.height,viewportHeight:innerHeight,fits:rect.left>=0&&rect.top>=0&&rect.right<=innerWidth&&rect.bottom<=innerHeight}:null;
+    return rect?{
+      left:rect.left,top:rect.top,right:rect.right,bottom:rect.bottom,width:rect.width,height:rect.height,
+      viewportHeight:innerHeight,
+      toolbarWidth:toolbar?.getBoundingClientRect().width||0,
+      fullLabelDisplay:fullLabel?getComputedStyle(fullLabel).display:null,
+      compactLabelDisplay:compactLabel?getComputedStyle(compactLabel).display:null,
+      fits:rect.left>=0&&rect.top>=0&&rect.right<=innerWidth&&rect.bottom<=innerHeight,
+    }:null;
   })()`);
-  report.domGeometry.activityPanel = activityGeometry;
+  report.domGeometry.activityPanel = { ...activityGeometry, requestedViewport: wideViewport };
   report.checks.activityPanelFitsTheWindow = Boolean(
     activityGeometry?.fits
       && activityGeometry.width >= 280
       && activityGeometry.bottom === activityGeometry.viewportHeight
       && activityGeometry.height >= activityGeometry.viewportHeight - 80,
   );
+  report.checks.wideHeaderStaysExpandedWithSecondaryPanel = Boolean(
+    wideViewport?.width >= 1400
+      && activityGeometry?.toolbarWidth > 820
+      && activityGeometry.fullLabelDisplay !== 'none'
+      && activityGeometry.compactLabelDisplay === 'none',
+  );
   click('[data-testid="activity-panel-toggle"]');
 
+  if (!toolbarOnly) {
   cli(['wait-for', '--selector', '[data-testid="extensions-button"]', '--timeout', '30000']);
   click('[data-testid="extensions-button"]');
   cli(['wait-for', '--selector', '[data-testid="extension-center"]', '--timeout', '30000']);
@@ -315,7 +359,7 @@ try {
     '--selector',
     '[data-testid="extension-plugin-catalog"][data-plugin-loaded="true"]',
     '--timeout',
-    '30000',
+    '60000',
   ]);
 
   const extensionNav = inspect(`(()=>({tabs:[...document.querySelectorAll('[data-testid^="extension-tab-"]')].map((element)=>element.getAttribute('data-testid')),capabilityBadges:document.querySelectorAll('[data-testid="extension-center"] header span.rounded-full').length}))()`);
@@ -376,6 +420,7 @@ try {
       'settings-tab-desktopPet',
     ]);
   report.checks.noReactFatalBoundary = !inspect(`(()=>document.body.innerText.includes('Maximum update depth exceeded')||document.body.innerText.includes('Something went wrong'))()`);
+  }
 
   report.passed = Object.values(report.checks).every(Boolean);
 } catch (error) {

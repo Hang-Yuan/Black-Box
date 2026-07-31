@@ -61,7 +61,9 @@ describe('auxiliary model routing regressions', () => {
     expect(automations).toContain('CLAUDE_CODE_SUBAGENT_MODEL');
     expect(automations).toContain('apply_provider_model_aliases(');
     expect(automations).toContain('build_mcp_scratch_config(&mcp_scratch_id, mcp_cwd)');
-    expect(automations).toContain('build_automation_security_settings(run_id, &auxiliary_model_tier)');
+    expect(automations).toContain('build_automation_security_settings(');
+    expect(automations).toContain('&auxiliary_model_tier');
+    expect(automations).toContain('&additional_write_paths');
     expect(automations).toContain('"--tools".to_string()');
     expect(automations).toContain('"default".to_string()');
   });

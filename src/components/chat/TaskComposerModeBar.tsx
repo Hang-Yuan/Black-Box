@@ -74,8 +74,8 @@ export function TaskComposerModeBar({
                 className="min-w-0 flex-1 rounded-md border border-border-subtle bg-bg-input px-2 py-1.5
                   text-[11px] text-text-primary outline-none focus:border-border-focus"
               >
-                <option data-testid="workflow-select-placeholder" value="">
-                  {t('workflow.select')}
+                <option data-testid="workflow-auto-option" value="">
+                  {t('workflow.auto')}
                 </option>
                 {effectiveWorkflows.map((workflow) => (
                   <option key={`${workflow.scope}:${workflow.path}`} value={workflow.name} disabled={!workflow.valid}>
@@ -93,6 +93,15 @@ export function TaskComposerModeBar({
               </button>
               {loading && <span className="text-[10px] text-text-tertiary">{t('workflow.loading')}</span>}
               {workflowError && <span className="text-[10px] text-error">{workflowError}</span>}
+            </div>
+          )}
+
+          {mode === 'workflow' && !selectedWorkflow && (
+            <div
+              data-testid="workflow-auto-hint"
+              className="mt-1 text-[10px] leading-relaxed text-text-tertiary"
+            >
+              {t('workflow.autoHint')}
             </div>
           )}
 

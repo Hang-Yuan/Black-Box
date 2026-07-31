@@ -37,15 +37,17 @@ describe('long-task activity panel', () => {
     expect(chatPanel).toContain("openSecondaryTab('files')");
   });
 
-  it('compacts header controls while the secondary panel consumes chat width', () => {
-    expect(chatPanel).toContain('<ProviderQuickSelector compact={secondaryPanelOpen} />');
-    expect(chatPanel).toContain('<ModeSelector placement="down" compact iconOnly={secondaryPanelOpen} />');
+  it('keeps header labels independent from the secondary-panel open state', () => {
+    expect(chatPanel).toContain('<ProviderQuickSelector />');
+    expect(chatPanel).toContain('<ModeSelector placement="down" compact />');
     expect(chatPanel).toContain('<WorkflowControl');
     expect(chatPanel).toContain('<LoopControl');
     expect(chatPanel).toContain('<GoalControl');
     expect(chatPanel).toContain("active={taskComposerMode === 'workflow'}");
     expect(chatPanel).toContain("active={taskComposerMode === 'loop'}");
     expect(chatPanel).toContain("active={taskComposerMode === 'goal'}");
+    expect(chatPanel).not.toContain('compact={secondaryPanelOpen}');
+    expect(chatPanel).not.toContain('iconOnly={secondaryPanelOpen}');
   });
 
   it('mounts a bounded visible shell instead of exposing a zero-width panel to macOS', () => {

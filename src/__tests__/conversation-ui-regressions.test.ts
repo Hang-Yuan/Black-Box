@@ -56,21 +56,27 @@ describe('top status model and unbounded visible file depth', () => {
   it('shows the resolved concrete model in the header', () => {
     expect(chat).toContain('data-testid="current-resolved-model"');
     expect(chat).toContain('getResolvedModelDisplayName(resolvedHeaderModel)');
-    expect(chat).toContain('<ProviderQuickSelector compact={secondaryPanelOpen} />');
+    expect(chat).toContain('<ProviderQuickSelector />');
     expect(chat).not.toContain('workingDirectory.split(/[\\\\/]/).pop()');
     expect(chat.indexOf('data-testid="current-resolved-model"'))
       .toBeLessThan(chat.indexOf('title={t(\'agents.toggle\')}'));
   });
 
-  it('keeps the right-side controls compact at the minimum supported window width', () => {
+  it('compacts toolbar labels from the available header width', () => {
+    const css = source('App.css');
+    expect(chat).toContain('className="chat-toolbar');
+    expect(css).toContain('container-name: chat-toolbar');
+    expect(css).toContain('@container chat-toolbar (max-width: 820px)');
     for (const path of [
       'components/chat/WorkflowControl.tsx',
       'components/chat/LoopControl.tsx',
       'components/chat/GoalControl.tsx',
     ]) {
-      expect(source(path)).toContain('max-[1040px]:hidden');
-      expect(source(path)).toContain('hidden max-[1040px]:inline');
+      expect(source(path)).toContain('blackbox-toolbar-full-label');
+      expect(source(path)).toContain('blackbox-toolbar-compact-label');
     }
+    expect(chat).not.toContain('compact={secondaryPanelOpen}');
+    expect(chat).not.toContain('iconOnly={secondaryPanelOpen}');
   });
 
   it('keeps the main/auxiliary model menu exclusive with every top-level popover', () => {

@@ -7,7 +7,11 @@ import {
   NATIVE_LOOP_PROMPT_MAX_LENGTH,
   validateNativeLoopInterval,
 } from './native-loop';
-import { buildNativeWorkflowCommand, NATIVE_WORKFLOW_ARGS_MAX_LENGTH } from './native-workflow';
+import {
+  buildAutoWorkflowCommand,
+  buildNativeWorkflowCommand,
+  NATIVE_WORKFLOW_ARGS_MAX_LENGTH,
+} from './native-workflow';
 
 export type TaskComposerMode = 'goal' | 'workflow' | 'loop';
 export type BusyDeliveryMode = 'steer' | 'queue';
@@ -29,6 +33,7 @@ export type TaskComposerError =
 
 export type TaskComposerSubmission =
   | { kind: 'goal'; command: string }
+  | { kind: 'workflow-auto'; command: string }
   | { kind: 'workflow'; workflowName: string; command: string }
   | { kind: 'loop'; command: string };
 
@@ -64,7 +69,19 @@ export function buildTaskComposerSubmission(
     if (input.length > NATIVE_WORKFLOW_ARGS_MAX_LENGTH) {
       return { ok: false, error: 'workflow_input_too_long' };
     }
-    if (!workflowName) return { ok: false, error: 'workflow_invalid' };
+    if (!workflowName) {
+      try {
+        return {
+          ok: true,
+          value: {
+            kind: 'workflow-auto',
+            command: buildAutoWorkflowCommand(input),
+          },
+        };
+      } catch {
+        return { ok: false, error: 'workflow_input_too_long' };
+      }
+    }
     if (!options.workflowValid) return { ok: false, error: 'workflow_invalid' };
     try {
       return {

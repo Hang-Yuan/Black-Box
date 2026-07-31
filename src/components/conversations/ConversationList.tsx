@@ -2,7 +2,11 @@ import { useEffect, useMemo, useCallback, useState } from 'react';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSettingsStore } from '../../stores/settingsStore';
-import { useFileStore } from '../../stores/fileStore';
+import {
+  restoreConversationFileState,
+  saveConversationFileState,
+  useFileStore,
+} from '../../stores/fileStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { bridge, SessionListItem } from '../../lib/tauri-bridge';
 import { listen } from '@tauri-apps/api/event';
@@ -27,6 +31,10 @@ import {
   toggleArchivedSession,
   type ConversationView,
 } from '../../lib/conversation-archive';
+import {
+  forgetConversationRuntimePreference,
+  restoreConversationRuntimePreference,
+} from '../../lib/conversation-runtime-preferences';
 
 function closePlanPanelForComparison() {
   window.dispatchEvent(new CustomEvent('blackbox:close-plan-panel'));
@@ -470,14 +478,18 @@ export function ConversationList() {
     // Preserve the complete reading surface per conversation: the open file,
     // preview mode, unsaved edit buffer, file-tree expansion, and scroll state.
     if (currentTabId) {
-      useFileStore.getState().savePreviewState(currentTabId);
-      useFileStore.getState().saveExplorerState(currentTabId);
+      saveConversationFileState(currentTabId);
     }
 
     // Switch selection
     setSelected(sessionId);
-    useFileStore.getState().restorePreviewState(sessionId);
-    useFileStore.getState().restoreExplorerState(sessionId);
+    restoreConversationFileState(sessionId);
+    try {
+      await restoreConversationRuntimePreference(sessionId);
+    } catch (error) {
+      console.error('[conversation-runtime] restore failed:', error);
+    }
+    if (useSessionStore.getState().selectedSessionId !== sessionId) return;
 
     // Try cache first
     const restored = useChatStore.getState().restoreFromCache(sessionId);
@@ -644,6 +656,7 @@ export function ConversationList() {
       } else {
         useSessionStore.getState().removeDraft(sessionId);
       }
+      await forgetConversationRuntimePreference(sessionId);
       if (selectedId === sessionId) {
         setSelected('');
         useChatStore.getState().resetTab(sessionId);

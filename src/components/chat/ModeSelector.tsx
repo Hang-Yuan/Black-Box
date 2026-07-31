@@ -64,12 +64,10 @@ export function ModeSelector({
   disabled = false,
   placement = 'up',
   compact = false,
-  iconOnly = false,
 }: {
   disabled?: boolean;
   placement?: 'up' | 'down';
   compact?: boolean;
-  iconOnly?: boolean;
 }) {
   const t = useT();
   const sessionMode = useSettingsStore((s) => s.sessionMode);
@@ -137,7 +135,7 @@ export function ModeSelector({
           }`}
       >
         {current.icon}
-        {!iconOnly && <span className="font-medium">{t(current.labelKey)}</span>}
+        <span className="blackbox-toolbar-full-label font-medium">{t(current.labelKey)}</span>
         <svg width="8" height="8" viewBox="0 0 8 8" fill="none"
           stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"
           className={`transition-transform duration-150 ${open ? 'rotate-180' : ''}`}>

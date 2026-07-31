@@ -22,7 +22,7 @@ function KeyIcon() {
   );
 }
 
-export function ProviderQuickSelector({ compact = false }: { compact?: boolean }) {
+export function ProviderQuickSelector() {
   const t = useT();
   const providers = useProviderStore((state) => state.providers);
   const activeProviderId = useProviderStore((state) => state.activeProviderId);
@@ -62,7 +62,7 @@ export function ProviderQuickSelector({ compact = false }: { compact?: boolean }
   };
 
   return (
-    <div ref={ref} className={`relative min-w-0 ${compact ? 'max-w-[92px]' : 'max-w-[190px]'}`}>
+    <div ref={ref} className="blackbox-toolbar-provider relative min-w-0 max-w-[190px]">
       <button
         type="button"
         data-testid="provider-quick-selector"
@@ -73,9 +73,9 @@ export function ProviderQuickSelector({ compact = false }: { compact?: boolean }
           if (next) announceHeaderPopover('provider');
           return next;
         })}
-        className={`inline-flex w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5
+        className="inline-flex w-full min-w-0 max-w-[190px] items-center gap-1.5 rounded-md px-1.5 py-0.5
           text-[9px] text-text-tertiary transition-smooth hover:bg-bg-secondary/50
-          hover:text-text-primary ${compact ? 'max-w-[92px]' : 'max-w-[190px]'}`}
+          hover:text-text-primary"
         title={activeLabel}
       >
         <span className="flex-shrink-0 text-text-tertiary"><KeyIcon /></span>

@@ -20,12 +20,10 @@ function statusTone(status: string | undefined): string {
 }
 
 export function WorkflowControl({
-  compact = false,
   active = false,
   disabled = false,
   onSelect,
 }: {
-  compact?: boolean;
   active?: boolean;
   disabled?: boolean;
   onSelect: () => void;
@@ -38,7 +36,7 @@ export function WorkflowControl({
   const activeCwd = useCommandStore((state) => state.activeCwd);
   const runtimeInventory = useCommandStore((state) => state.runtimeByCwd[activeCwd]);
   const commands = useCommandStore((state) => state.commands);
-  const nativeAvailable = Boolean(
+  const nativeWorkflowAvailable = Boolean(
     runtimeInventory?.capabilities?.some((capability) => capability === 'Workflow')
     || commands.some((command) => (
       ['/workflow-launch-exec', '/__remote-workflow'].includes(command.name.toLowerCase())
@@ -88,19 +86,19 @@ export function WorkflowControl({
         data-active={active ? 'true' : 'false'}
         data-workflow-status={latestRun?.status || 'idle'}
         onClick={selectMode}
-        disabled={disabled || !nativeAvailable}
-        data-runtime-available={nativeAvailable ? 'true' : 'false'}
+        disabled={disabled}
+        data-runtime-available={nativeWorkflowAvailable ? 'true' : 'false'}
         className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px]
           transition-smooth disabled:cursor-not-allowed disabled:opacity-40 ${active
             ? 'border-accent/40 bg-accent/15 text-accent'
             : latestRun?.status === 'running' || latestRun?.status === 'launching'
             ? 'border-accent/25 bg-accent/10 text-accent'
             : 'border-border-subtle text-text-tertiary hover:bg-bg-secondary hover:text-text-primary'}`}
-        title={nativeAvailable ? t('workflow.title') : t('workflow.unavailable')}
+        title={t('workflow.title')}
       >
         <span className={`h-1.5 w-1.5 rounded-full ${statusTone(latestRun?.status)}`} />
-        <span className={compact ? 'hidden' : 'max-[1040px]:hidden'}>Workflow</span>
-        <span className={compact ? 'inline' : 'hidden max-[1040px]:inline'} aria-hidden="true">W</span>
+        <span className="blackbox-toolbar-full-label">Workflow</span>
+        <span className="blackbox-toolbar-compact-label" aria-hidden="true">W</span>
       </button>
 
       <button
@@ -112,6 +110,8 @@ export function WorkflowControl({
           return next;
         })}
         aria-label={t('workflow.manage')}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         className="ml-0.5 rounded-md p-1 text-text-tertiary hover:bg-bg-secondary hover:text-text-primary"
       >
         <svg width="9" height="9" viewBox="0 0 10 10" fill="none"
@@ -127,8 +127,13 @@ export function WorkflowControl({
             <div>
               <div className="text-sm font-semibold text-text-primary">{t('workflow.run')}</div>
               <div data-testid="workflow-explainer" className="mt-1 text-xs leading-relaxed text-text-tertiary">
-                {nativeAvailable ? t('workflow.nativeHint') : t('workflow.unavailable')}
+                {t('workflow.autoExplainer')}
               </div>
+              {!nativeWorkflowAvailable && (
+                <div className="mt-1 text-[10px] leading-relaxed text-warning">
+                  {t('workflow.nativeUnavailableFallback')}
+                </div>
+              )}
             </div>
             <button type="button" onClick={openManager} className="text-[10px] text-accent hover:underline">
               {t('workflow.manage')}
@@ -136,6 +141,32 @@ export function WorkflowControl({
           </div>
 
           <div className="mt-3 space-y-3">
+            <button
+              type="button"
+              data-testid="workflow-activate-option"
+              data-active={active ? 'true' : 'false'}
+              onClick={selectMode}
+              disabled={active || disabled}
+              className="flex w-full items-center justify-between rounded-lg border
+                border-border-subtle bg-bg-secondary px-3 py-2 text-left text-[11px]
+                text-text-primary hover:border-border-focus hover:bg-bg-tertiary
+                disabled:cursor-default disabled:opacity-60"
+            >
+              <span>
+                <span className="block font-medium">
+                  {t(active ? 'workflow.modeActive' : 'workflow.useMode')}
+                </span>
+                <span className="mt-0.5 block text-[10px] text-text-tertiary">
+                  {t('workflow.useModeHint')}
+                </span>
+              </span>
+              {!active && (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+                  stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 2l4 4-4 4" />
+                </svg>
+              )}
+            </button>
             <div className="rounded-lg border border-accent/15 bg-accent/[0.05] px-3 py-2
               text-[10px] leading-relaxed text-text-muted">
               {t('composerMode.useMainInput')}

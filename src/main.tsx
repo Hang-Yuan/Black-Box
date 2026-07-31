@@ -4,9 +4,11 @@ import App from "./App";
 import { DesktopPet } from "./components/desktop-pet/DesktopPet";
 import { DesktopPetStateBridge } from "./components/desktop-pet/DesktopPetStateBridge";
 import { bootstrapAppearance } from "./lib/appearance";
+import { initializeConversationRuntimePreferences } from "./lib/conversation-runtime-preferences";
 
 bootstrapAppearance();
 const isDesktopPetWindow = new URLSearchParams(window.location.search).has("desktop-pet");
+if (!isDesktopPetWindow) initializeConversationRuntimePreferences();
 if (isDesktopPetWindow) {
   document.documentElement.classList.add("desktop-pet-document");
   document.body.classList.add("desktop-pet-document");

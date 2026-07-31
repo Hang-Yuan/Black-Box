@@ -28,12 +28,21 @@ describe('task composer modes', () => {
       .toEqual({ ok: false, error: 'goal_too_long' });
   });
 
-  it('requires a real saved native Workflow instead of inventing auto orchestration', () => {
-    expect(buildTaskComposerSubmission('workflow', 'audit every package', {
+  it('uses automatic orchestration when no saved Workflow is selected', () => {
+    const result = buildTaskComposerSubmission('workflow', 'audit every package', {
       ...base,
       workflowName: '',
       workflowValid: false,
-    })).toEqual({ ok: false, error: 'workflow_invalid' });
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.value.kind !== 'workflow-auto') {
+      throw new Error('expected automatic orchestration');
+    }
+    expect(result.value.command).toContain('audit every package');
+    expect(result.value.command).toContain('Interpret the user task semantically');
+    expect(result.value.command).toContain('durable goal');
+    expect(result.value.command).toContain('wait for confirmation');
+    expect(result.value.command).not.toContain('Call the Workflow tool exactly once');
   });
 
   it('keeps a saved native Workflow as an optional advanced path', () => {

@@ -40,9 +40,28 @@ describe('first-class native Workflow regressions', () => {
     expect(input).toContain('pendingWorkflowSubmission');
     expect(input).toContain('consumeSubmission(selectedSessionId)');
     expect(input).toContain('buildTaskComposerSubmission(taskComposer.taskMode, rawInput');
+    expect(input).toContain("planned.value.kind === 'workflow-auto'");
     expect(workflow).toContain('data-testid="workflow-explainer"');
+    expect(workflow).toContain('data-testid="workflow-activate-option"');
     expect(workflow).toContain('text-xs leading-relaxed');
     expect(workflow).not.toContain('<textarea');
+  });
+
+  it('defaults to semantic orchestration and remains selectable while a turn is running', () => {
+    const chat = read('components/chat/ChatPanel.tsx');
+    const input = read('components/chat/InputBar.tsx');
+    const composer = read('components/chat/TaskComposerModeBar.tsx');
+    const composerContract = read('lib/composer-mode.ts');
+    const nativeWorkflow = read('lib/native-workflow.ts');
+    expect(composer).toContain('data-testid="workflow-auto-option"');
+    expect(composer).toContain('data-testid="workflow-auto-hint"');
+    expect(composerContract).toContain("kind: 'workflow-auto'");
+    expect(nativeWorkflow).toContain('export function buildAutoWorkflowCommand');
+    expect(nativeWorkflow).toContain('Interpret the user task semantically');
+    expect(chat).not.toContain('disabled={isSessionBusy(sessionStatus)}');
+    expect(chat).not.toContain('if (!selectedSessionId || isSessionBusy(sessionStatus)) return;');
+    expect(input).toContain('{selectedSessionId && composerModeTab.taskMode && !floatingCard && (');
+    expect(input).not.toContain('taskComposer.taskMode && !isSessionBusy');
   });
 
   it('shows native workflows in the extension center and binds real stream receipts', () => {

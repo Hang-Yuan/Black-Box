@@ -42,6 +42,7 @@ describe('native Loop control', () => {
     expect(loopControl).toContain('data-testid="loop-explainer"');
     expect(loopControl).toContain('text-xs leading-relaxed');
     expect(loopControl).toContain("t('loop.sessionHint')");
+    expect(loopControl).toContain('data-testid="loop-activate-option"');
   });
 
   it('uses Claude native minimum cadence instead of advertising seconds', () => {

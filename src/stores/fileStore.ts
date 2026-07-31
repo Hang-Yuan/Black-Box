@@ -699,3 +699,15 @@ export const useFileStore = create<FileState>()((set, get) => ({
     set({ expandedFolders: next, revealTarget: target });
   },
 }));
+
+export function saveConversationFileState(sessionId: string): void {
+  const state = useFileStore.getState();
+  state.savePreviewState(sessionId);
+  state.saveExplorerState(sessionId);
+}
+
+export function restoreConversationFileState(sessionId: string): void {
+  const state = useFileStore.getState();
+  state.restorePreviewState(sessionId);
+  state.restoreExplorerState(sessionId);
+}

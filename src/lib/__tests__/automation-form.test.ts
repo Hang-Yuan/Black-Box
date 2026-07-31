@@ -11,6 +11,7 @@ describe('scheduled-task form contract', () => {
 
     expect(draft.model).toBe('sonnet');
     expect(draft.agent_teams_enabled).toBe(false);
+    expect(draft.data_write_subdirectories).toEqual([]);
     expect(draft.execution_environment).toBe('worktree');
     expect(draft.target).toEqual({ type: 'project', projectId: '/tmp/project' });
     expect(draft.cwds).toEqual(['/tmp/project']);

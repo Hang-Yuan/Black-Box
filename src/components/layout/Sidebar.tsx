@@ -5,7 +5,10 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { ConversationList } from '../conversations/ConversationList';
 import { useT } from '../../lib/i18n';
 import { useAgentStore } from '../../stores/agentStore';
-import { useFileStore } from '../../stores/fileStore';
+import {
+  saveConversationFileState,
+  useFileStore,
+} from '../../stores/fileStore';
 import { bridge } from '../../lib/tauri-bridge';
 
 export function Sidebar() {
@@ -67,6 +70,7 @@ export function Sidebar() {
         if (currentTabId) {
           useChatStore.getState().saveToCache(currentTabId);
           useAgentStore.getState().saveToCache(currentTabId);
+          saveConversationFileState(currentTabId);
         }
         useAgentStore.getState().clearAgents();
         useSessionStore.getState().setSelectedSession(null);

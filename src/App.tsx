@@ -13,7 +13,11 @@ import { ChangelogModal } from './components/shared/ChangelogModal';
 import { Toast } from './components/shared/Toast';
 import { useSettingsStore } from './stores/settingsStore';
 import { useProviderStore, type ApiProvider } from './stores/providerStore';
-import { useFileStore } from './stores/fileStore';
+import {
+  restoreConversationFileState,
+  saveConversationFileState,
+  useFileStore,
+} from './stores/fileStore';
 import { useChatStore } from './stores/chatStore';
 import { useSessionStore } from './stores/sessionStore';
 import { useAgentStore } from './stores/agentStore';
@@ -33,6 +37,10 @@ import { useT } from './lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { applyAppearanceClasses } from './lib/appearance';
+import {
+  forgetConversationRuntimePreference,
+  restoreConversationRuntimePreference,
+} from './lib/conversation-runtime-preferences';
 import './App.css';
 
 function App() {
@@ -378,6 +386,17 @@ function App() {
         else (window as any).__blackbox_test_auto_compact_threshold = value;
         return { value: (window as any).__blackbox_test_auto_compact_threshold ?? null };
       },
+      toggleWindowMaximize(marker: string) {
+        if (!/^[A-Za-z0-9_]+$/.test(marker)) return { started: false, error: 'invalid marker' };
+        (window as any)[marker] = { done: false, error: null };
+        getCurrentWindow()
+          .toggleMaximize()
+          .then(() => { (window as any)[marker] = { done: true, error: null }; })
+          .catch((error) => {
+            (window as any)[marker] = { done: true, error: String(error) };
+          });
+        return { started: true };
+      },
       setSessionLoadDelay(value?: number) {
         if (value == null || value <= 0) delete (window as any).__blackbox_test_load_session_delay_ms;
         else (window as any).__blackbox_test_load_session_delay_ms = value;
@@ -413,9 +432,14 @@ function App() {
         if (currentId) {
           useChatStore.getState().saveToCache(currentId);
           useAgentStore.getState().saveToCache(currentId);
+          saveConversationFileState(currentId);
         }
-        useFileStore.getState().closePreview();
         useSessionStore.getState().setSelectedSession(sessionId);
+        restoreConversationFileState(sessionId);
+        await restoreConversationRuntimePreference(sessionId);
+        if (useSessionStore.getState().selectedSessionId !== sessionId) {
+          return { switchedTo: sessionId, aborted: true, note: 'User switched away during runtime restore' };
+        }
         const restored = useChatStore.getState().restoreFromCache(sessionId);
         if (restored) {
           useAgentStore.getState().restoreFromCache(sessionId);
@@ -470,17 +494,22 @@ function App() {
           return { switchedTo: sessionId, error: `Failed to load: ${(error as Error).message}` };
         }
       },
-      switchSession(sessionId: string) {
+      async switchSession(sessionId: string) {
         const sessionState = useSessionStore.getState();
         const currentId = sessionState.selectedSessionId;
         if (currentId) {
           useChatStore.getState().saveToCache(currentId);
           useAgentStore.getState().saveToCache(currentId);
+          saveConversationFileState(currentId);
         }
         sessionState.setSelectedSession(sessionId);
+        restoreConversationFileState(sessionId);
+        await restoreConversationRuntimePreference(sessionId);
+        if (useSessionStore.getState().selectedSessionId !== sessionId) {
+          return { switchedTo: sessionId, aborted: true, restored: false };
+        }
         const restored = useChatStore.getState().restoreFromCache(sessionId);
         if (restored) useAgentStore.getState().restoreFromCache(sessionId);
-        useFileStore.getState().closePreview();
         return { switchedTo: sessionId, restored };
       },
       newSession(cwd?: string) {
@@ -488,6 +517,7 @@ function App() {
         if (currentTabId) {
           useChatStore.getState().saveToCache(currentTabId);
           useAgentStore.getState().saveToCache(currentTabId);
+          saveConversationFileState(currentTabId);
           if (currentTabId.startsWith('draft_')) {
             const tabState = useChatStore.getState().tabs.get(currentTabId);
             if (!tabState || tabState.messages.length === 0) {
@@ -503,6 +533,7 @@ function App() {
         }
         const newId = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         useSessionStore.getState().setSelectedSession(newId);
+        restoreConversationFileState(newId);
         useSettingsStore.getState().setWorkingDirectory(cwd);
         useChatStore.getState().restoreFromCache(newId);
         // A fresh conversation cannot inherit persistent teammates or team
@@ -620,6 +651,7 @@ function App() {
           useSessionStore.getState().removeDraft(sessionId);
         }
         useChatStore.getState().removeFromCache(sessionId);
+        await forgetConversationRuntimePreference(sessionId);
         useAgentStore.getState().clearCacheForTab(sessionId);
         useAgentStore.getState().clearAgents();
         useSessionStore.getState().setSelectedSession(null);
@@ -754,7 +786,7 @@ function App() {
 
   // Ctrl+Tab: quick-switch between the two most recent sessions
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
+    const handler = async (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === 'Tab') {
         e.preventDefault();
         const sessionState = useSessionStore.getState();
@@ -768,13 +800,18 @@ function App() {
         if (selectedSessionId) {
           useChatStore.getState().saveToCache(selectedSessionId);
           useAgentStore.getState().saveToCache(selectedSessionId);
+          saveConversationFileState(selectedSessionId);
         }
-
-        // Close file preview
-        useFileStore.getState().closePreview();
 
         // Switch selection (this also updates previousSessionId)
         sessionState.setSelectedSession(previousSessionId);
+        restoreConversationFileState(previousSessionId);
+        try {
+          await restoreConversationRuntimePreference(previousSessionId);
+        } catch (error) {
+          console.error('[conversation-runtime] Ctrl+Tab restore failed:', error);
+        }
+        if (useSessionStore.getState().selectedSessionId !== previousSessionId) return;
 
         // Restore from cache
         const restored = useChatStore.getState().restoreFromCache(previousSessionId);

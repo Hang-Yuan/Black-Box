@@ -11547,6 +11547,18 @@ async fn save_custom_previews(data: Value) -> Result<(), String> {
     session_metadata::save_custom_previews(data)
 }
 
+/// Load the last provider/key route and main-model choice for each conversation.
+#[tauri::command]
+async fn load_conversation_runtime_preferences() -> Result<Value, String> {
+    session_metadata::load_conversation_runtime_preferences()
+}
+
+/// Persist per-conversation runtime choices without ever copying credentials.
+#[tauri::command]
+async fn save_conversation_runtime_preferences(data: Value) -> Result<(), String> {
+    session_metadata::save_conversation_runtime_preferences(data)
+}
+
 fn blackbox_data_path(filename: &str) -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     let dir = home.join(".blackbox");
@@ -12437,6 +12449,8 @@ pub fn run() {
             open_terminal_login,
             load_custom_previews,
             save_custom_previews,
+            load_conversation_runtime_preferences,
+            save_conversation_runtime_preferences,
             load_pinned_sessions,
             save_pinned_sessions,
             load_archived_sessions,

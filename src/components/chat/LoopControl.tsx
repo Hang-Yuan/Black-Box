@@ -13,12 +13,10 @@ function submitLoopCommand(tabId: string, command: string): void {
 }
 
 export function LoopControl({
-  compact = false,
   active = false,
   disabled = false,
   onSelect,
 }: {
-  compact?: boolean;
   active?: boolean;
   disabled?: boolean;
   onSelect: () => void;
@@ -106,8 +104,8 @@ export function LoopControl({
         <span className={`w-1.5 h-1.5 rounded-full ${jobsRunning
           ? 'bg-accent animate-pulse-soft'
           : hasJobs ? 'bg-warning' : 'bg-text-tertiary/40'}`} />
-        <span className={compact ? 'hidden' : 'max-[1040px]:hidden'}>Loop</span>
-        <span className={compact ? 'inline' : 'hidden max-[1040px]:inline'} aria-hidden="true">L</span>
+        <span className="blackbox-toolbar-full-label">Loop</span>
+        <span className="blackbox-toolbar-compact-label" aria-hidden="true">L</span>
         {jobs.length > 0 && <span>{jobs.length}</span>}
       </button>
 
@@ -120,6 +118,8 @@ export function LoopControl({
           return next;
         })}
         aria-label={t('loop.confirmedJobs')}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         className="ml-0.5 rounded-md p-1 text-text-tertiary hover:bg-bg-secondary hover:text-text-primary"
       >
         <svg width="9" height="9" viewBox="0 0 10 10" fill="none"
@@ -139,6 +139,34 @@ export function LoopControl({
                 {nativeAvailable ? t('loop.sessionHint') : t('loop.unavailable')}
               </div>
             </div>
+
+            <button
+              type="button"
+              data-testid="loop-activate-option"
+              data-active={active ? 'true' : 'false'}
+              data-runtime-available={nativeAvailable ? 'true' : 'false'}
+              onClick={selectMode}
+              disabled={active || disabled || !nativeAvailable}
+              className="flex w-full items-center justify-between rounded-lg border
+                border-border-subtle bg-bg-secondary px-3 py-2 text-left text-[11px]
+                text-text-primary hover:border-border-focus hover:bg-bg-tertiary
+                disabled:cursor-default disabled:opacity-60"
+            >
+              <span>
+                <span className="block font-medium">
+                  {t(active ? 'loop.modeActive' : 'loop.useMode')}
+                </span>
+                <span className="mt-0.5 block text-[10px] text-text-tertiary">
+                  {t('loop.useModeHint')}
+                </span>
+              </span>
+              {!active && nativeAvailable && (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
+                  stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 2l4 4-4 4" />
+                </svg>
+              )}
+            </button>
 
             <div className="rounded-lg border border-accent/15 bg-accent/[0.05] px-3 py-2
               text-[10px] leading-relaxed text-text-muted">

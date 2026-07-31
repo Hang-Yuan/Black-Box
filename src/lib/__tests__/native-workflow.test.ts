@@ -1,12 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatMessage } from '../../stores/chatStore';
 import {
+  buildAutoWorkflowCommand,
   buildNativeWorkflowCommand,
   deriveNativeWorkflowRuns,
   parseNativeWorkflowReceipt,
 } from '../native-workflow';
 
 describe('native Claude workflows', () => {
+  it('builds a capability-negotiated automatic orchestration prompt', () => {
+    const command = buildAutoWorkflowCommand('Investigate and fix the release failures');
+    expect(command).toContain('Interpret the user task semantically');
+    expect(command).toContain('direct task, a multi-phase workflow, a durable goal');
+    expect(command).toContain('capabilities actually exposed by the current runtime');
+    expect(command).toContain('wait for confirmation');
+    expect(command).toContain('Investigate and fix the release failures');
+    expect(command).not.toContain('Call the Workflow tool exactly once');
+  });
+
   it('builds an explicit native Workflow tool request without aliasing another mode', () => {
     const command = buildNativeWorkflowCommand('release-review', 'Review v0.13.1');
     expect(command).toContain('saved native Claude Code workflow');

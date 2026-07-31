@@ -19,6 +19,26 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.19',
+    date: '2026-07-31',
+    highlights: {
+      zh: [
+        '每条对话独立记住 Provider 钥匙与模型；鼠标、快捷键和内部切换都会先恢复目标会话偏好，草稿晋升、Provider 删除和快速切换也保持一致',
+        '聊天阅读点、文件预览、编辑缓冲、文件树展开与文档滚动统一通过逐会话事务保存；侧栏时间按本地自然日显示，昨天明确标注“昨天 HH:mm”',
+        'Workflow 默认提供自然语言自动编排：AI 先判断直接任务、分阶段工作、持久 Goal 或周期请求，再使用当前 Claude runtime 真实提供的能力；周期任务创建前必须回显定义并确认',
+        '右侧 Activity 或文件栏打开时，顶栏依据真实剩余宽度响应；Workflow、Loop、Goal 的箭头菜单均可进入模式，会话运行中也能通过 Steer 或 Queue 追加任务',
+        'Scheduled 运行补齐 automation/run 身份、只读查询与受控写目录合同；当前任务定义保持空列表，任何新排程都需经对话确认',
+      ],
+      en: [
+        'Remembers the provider route and model independently for every conversation, restoring the target preference before mouse, keyboard, or internal switches while preserving draft promotion, provider deletion, and rapid-switch consistency',
+        'Saves chat position, file preview, edit buffers, expanded file-tree state, and document scroll through one per-conversation transaction, while sidebar timestamps now follow local calendar days and label yesterday explicitly',
+        'Makes natural-language automatic orchestration the default Workflow path: the agent first classifies a direct task, staged workflow, durable Goal, or recurring request, then uses only capabilities exposed by the active Claude runtime and confirms every recurring definition before creation',
+        'Keeps full header labels while the Activity or file panel is open whenever real space remains; Workflow, Loop, and Goal dropdowns can enter their modes, including during an active turn through Steer or Queue',
+        'Adds automation/run identity, read-only queries, and controlled write-directory contracts to Scheduled execution while keeping the current definition list empty until a new schedule is confirmed in conversation',
+      ],
+    },
+  },
+  {
     version: '0.14.18',
     date: '2026-07-28',
     highlights: {

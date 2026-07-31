@@ -6,6 +6,7 @@ import { useForkStore } from '../stores/forkStore';
 import { useWorkflowStore } from '../stores/workflowStore';
 import { useComposerModeStore } from '../stores/composerModeStore';
 import { useLoopStore } from '../stores/loopStore';
+import { moveConversationRuntimePreference } from './conversation-runtime-preferences';
 
 /**
  * Adopt Claude Code's durable session UUID as the single Black Box thread key.
@@ -52,6 +53,7 @@ export function adoptCliSessionIdentity(
   }
 
   sessions.promoteDraft(currentTabId, durableId);
+  void moveConversationRuntimePreference(currentTabId, durableId);
   if (stdinId && sessions.getTabForStdin(stdinId) !== durableId) {
     sessions.registerStdinTab(stdinId, durableId);
   }

@@ -81,6 +81,23 @@ function readProductTree(root: string): string {
 }
 
 describe('automation runtime regressions', () => {
+  it('keeps scheduled self-inspection read-only and exposes the active run identity', () => {
+    expect(automationBackendSource).toContain('SQLITE_OPEN_READ_ONLY');
+    expect(automationBackendSource).toContain('PRAGMA query_only=ON');
+    expect(automationBackendSource).toContain('get_automation_read_only');
+    expect(automationBackendSource).toContain('list_automation_runs_read_only');
+    expect(automationBackendSource).toContain('BLACKBOX_AUTOMATION_ID');
+    expect(automationBackendSource).toContain('BLACKBOX_AUTOMATION_RUN_ID');
+    expect(automationBackendSource).toContain('BLACKBOX_AUTOMATION_TRIGGER');
+    expect(automationBackendSource).toContain('"scheduled"');
+    expect(automationBackendSource).toContain('"manual"');
+    expect(automationBackendSource).toContain('"filesystem"');
+    expect(automationBackendSource).toContain('"allowWrite"');
+    expect(automationBackendSource).toContain('"--add-dir"');
+    expect(automationBackendSource).toContain('data_write_subdirectories');
+    expect(automationBackendSource).toContain('prepare_automation_write_paths');
+  });
+
   it('treats the macOS red close button as an explicit app quit', () => {
     expect(appSource).not.toContain('await win.hide();');
     expect(rustEntrySource).toContain('WindowEvent::CloseRequested');

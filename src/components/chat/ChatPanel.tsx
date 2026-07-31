@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
-import { useChatStore, useActiveTab, isSessionBusy, type ChatMessage } from '../../stores/chatStore';
+import { useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
 import { ToolGroup } from './ToolGroup';
 import { InputBar } from './InputBar';
@@ -702,10 +702,10 @@ export function ChatPanel() {
   }, [secondaryPanelOpen, secondaryPanelTab, setSecondaryTab, toggleSecondaryPanel]);
 
   const selectTaskMode = useCallback((mode: TaskComposerMode) => {
-    if (!selectedSessionId || isSessionBusy(sessionStatus)) return;
+    if (!selectedSessionId) return;
     useCommandStore.getState().clearPrefix();
     selectTaskComposerMode(selectedSessionId, mode);
-  }, [selectedSessionId, selectTaskComposerMode, sessionStatus]);
+  }, [selectedSessionId, selectTaskComposerMode]);
 
   const showPlanPanel = usePlanPanelStore((s) => s.open);
   const closePlanPanel = usePlanPanelStore((s) => s.close);
@@ -882,8 +882,10 @@ export function ChatPanel() {
     <div className="flex flex-col h-full">
       {/* Top Bar — with extra top padding for macOS traffic lights */}
       <div
-        className="flex items-center h-[68px] pt-[20px] px-5 border-b border-border-subtle
-        flex-shrink-0 bg-bg-chat cursor-default">
+        data-testid="chat-top-bar"
+        data-secondary-panel-open={secondaryPanelOpen ? 'true' : 'false'}
+        className="chat-toolbar flex h-[68px] flex-shrink-0 items-center border-b
+        border-border-subtle bg-bg-chat px-5 pt-[20px] cursor-default">
         {/* Show sidebar toggle when sidebar is not visible:
             either user closed it, or it's hidden by file preview mode */}
         {(!sidebarOpen || isFilePreviewMode) && (
@@ -899,7 +901,7 @@ export function ChatPanel() {
         {/* Primary identity: the concrete model actually used by this task. */}
         <div
           data-testid="current-resolved-model"
-          className="min-w-0 max-w-[220px] flex-shrink-0 truncate text-xl font-medium
+          className="blackbox-toolbar-model min-w-0 max-w-[220px] flex-shrink-0 truncate text-xl font-medium
             tracking-[-0.02em] text-text-primary"
           title={resolvedHeaderModel}
         >
@@ -929,10 +931,10 @@ export function ChatPanel() {
             </span>
           </button>
 
-          <ProviderQuickSelector compact={secondaryPanelOpen} />
+          <ProviderQuickSelector />
 
           {/* Current session mode — visible and switchable in place. */}
-          <ModeSelector placement="down" compact iconOnly={secondaryPanelOpen} />
+          <ModeSelector placement="down" compact />
 
           {/* Floating agent panel popover — anchored to agent button */}
           {agentPanelOpen && (
@@ -950,24 +952,18 @@ export function ChatPanel() {
         {/* Spacer + right-side actions */}
         <div className="ml-auto flex items-center" />
         <WorkflowControl
-          compact={secondaryPanelOpen}
           active={taskComposerMode === 'workflow'}
-          disabled={isSessionBusy(sessionStatus)}
           onSelect={() => selectTaskMode('workflow')}
         />
         <LoopControl
-          compact={secondaryPanelOpen}
           active={taskComposerMode === 'loop'}
-          disabled={isSessionBusy(sessionStatus)}
           onSelect={() => selectTaskMode('loop')}
         />
         <GoalControl
-          compact={secondaryPanelOpen}
           active={taskComposerMode === 'goal'}
-          disabled={isSessionBusy(sessionStatus)}
           onSelect={() => selectTaskMode('goal')}
         />
-        <TaskLocationControl compact={secondaryPanelOpen} />
+        <TaskLocationControl />
         <button onClick={() => openSecondaryTab('activity')}
           data-testid="activity-panel-toggle"
           className={`p-1.5 rounded-md text-text-tertiary transition-smooth

@@ -22,6 +22,7 @@ export function createAutomationDraft(
     auxiliary_model: auxiliaryModel,
     reasoning_effort: 'high',
     agent_teams_enabled: false,
+    data_write_subdirectories: [],
     execution_environment: 'worktree',
     target: { type: 'project', projectId: projectDirectory },
     cwds: projectDirectory ? [projectDirectory] : [],

@@ -40,7 +40,7 @@ function LocationIcon({ location }: { location: TaskRunLocation }) {
   );
 }
 
-export function TaskLocationControl({ compact = false }: { compact?: boolean }) {
+export function TaskLocationControl() {
   const t = useT();
   const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
   const sessions = useSessionStore((state) => state.sessions);
@@ -147,14 +147,20 @@ export function TaskLocationControl({ compact = false }: { compact?: boolean }) 
           transition-smooth disabled:opacity-50 disabled:cursor-wait"
       >
         <LocationIcon location={status.currentLocation} />
-        {!compact && (
-          <>
-            <span>{t(status.currentLocation === 'local' ? 'handoff.local' : 'handoff.worktree')}</span>
-            <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.2">
-              <path d="m2 3 2 2 2-2" />
-            </svg>
-          </>
-        )}
+        <span className="blackbox-toolbar-full-label">
+          {t(status.currentLocation === 'local' ? 'handoff.local' : 'handoff.worktree')}
+        </span>
+        <svg
+          className="blackbox-toolbar-full-label"
+          width="8"
+          height="8"
+          viewBox="0 0 8 8"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.2"
+        >
+          <path d="m2 3 2 2 2-2" />
+        </svg>
       </button>
 
       {open && (

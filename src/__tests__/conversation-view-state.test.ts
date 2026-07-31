@@ -8,7 +8,11 @@ import {
   saveFileScrollPosition,
   saveFileTreeScrollPosition,
 } from '../lib/conversation-view-state';
-import { useFileStore } from '../stores/fileStore';
+import {
+  restoreConversationFileState,
+  saveConversationFileState,
+  useFileStore,
+} from '../stores/fileStore';
 
 describe('conversation reading position', () => {
   beforeEach(() => {
@@ -116,6 +120,38 @@ describe('conversation reading position', () => {
     expect(useFileStore.getState().rootPath).toBe('/tmp/project-b');
     expect(Array.from(useFileStore.getState().expandedFolders)).toEqual([
       '/tmp/project-b/research',
+    ]);
+  });
+
+  it('switches preview and explorer state as one conversation transaction', () => {
+    useFileStore.setState({
+      selectedFile: '/tmp/project-a/report.md',
+      fileContent: 'draft A',
+      previewMode: 'edit',
+      editContent: 'draft A edited',
+      revealTarget: '/tmp/project-a/report.md',
+      rootPath: '/tmp/project-a',
+      expandedFolders: new Set(['/tmp/project-a/docs']),
+    });
+    saveConversationFileState('session-a');
+
+    useFileStore.setState({
+      selectedFile: '/tmp/project-b/notes.md',
+      fileContent: 'notes B',
+      previewMode: 'preview',
+      editContent: null,
+      revealTarget: '/tmp/project-b/notes.md',
+      rootPath: '/tmp/project-b',
+      expandedFolders: new Set(['/tmp/project-b/src']),
+    });
+    saveConversationFileState('session-b');
+
+    restoreConversationFileState('session-a');
+    expect(useFileStore.getState().selectedFile).toBe('/tmp/project-a/report.md');
+    expect(useFileStore.getState().editContent).toBe('draft A edited');
+    expect(useFileStore.getState().rootPath).toBe('/tmp/project-a');
+    expect(Array.from(useFileStore.getState().expandedFolders)).toEqual([
+      '/tmp/project-a/docs',
     ]);
   });
 });

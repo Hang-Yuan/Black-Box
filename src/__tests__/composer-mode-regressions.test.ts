@@ -48,19 +48,29 @@ describe('single task composer modes', () => {
     expect(modeBar).not.toContain('<textarea');
     expect(input).toContain('<TaskComposerModeBar');
     expect(input).toContain('<TiptapEditor');
-    expect(modeBar).toContain('data-testid="workflow-select-placeholder"');
-    expect(modeBar).toContain("t('workflow.select')");
+    expect(modeBar).toContain('data-testid="workflow-auto-option"');
+    expect(modeBar).toContain("t('workflow.auto')");
   });
 
-  it('hands each mode only to its native Claude pipeline', () => {
+  it('hands each mode to the runtime-authoritative Claude pipeline', () => {
     expect(input).toContain('text = planned.value.command;');
     expect(input).not.toContain("new CustomEvent('blackbox:goal-create'");
     expect(input).toContain('useWorkflowStore.getState().requestRun(tabId, selectedWorkflow)');
     expect(input).toContain('useWorkflowStore.getState().queueSubmission(');
-    expect(input).not.toContain("planned.value.kind === 'workflow-auto'");
+    expect(input).toContain("planned.value.kind === 'workflow-auto'");
     expect(input).toContain('let submittedUserText = rawInput.trim();');
     expect(input).toContain('content: submittedUserText,');
     expect(input).toContain("new CustomEvent('blackbox:loop-submit'");
+  });
+
+  it('offers the same activate action from every split-button menu', () => {
+    expect(workflow).toContain('data-testid="workflow-activate-option"');
+    expect(loop).toContain('data-testid="loop-activate-option"');
+    expect(goal).toContain('data-testid="goal-create-option"');
+    for (const source of [workflow, loop, goal]) {
+      expect(source).toContain('data-active={active');
+      expect(source).toContain('disabled={active || disabled');
+    }
   });
 
   it('shows an explicit Steer/Queue choice only when no interaction owns input', () => {

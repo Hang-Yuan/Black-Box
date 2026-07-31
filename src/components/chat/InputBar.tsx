@@ -882,11 +882,12 @@ export function InputBar() {
 
     if (!text) return;
 
-    // Goal, Workflow, and Loop are thin entry points into capabilities exposed
-    // by the active Claude runtime. Black Box owns no parallel execution
-    // protocol for them.
+    // Goal, Workflow, and Loop remain thin entry points into capabilities
+    // exposed by the active Claude runtime. Automatic Workflow is an ordinary
+    // prompt that asks that runtime to choose from its real capabilities; it
+    // does not create local state or fabricate a receipt.
     const taskComposer = getComposerModeTab(tabId);
-    if (taskComposer.taskMode && !isSessionBusy(tabState.sessionStatus)) {
+    if (taskComposer.taskMode) {
       const selectedWorkflow = useWorkflowStore.getState().workflows.find(
         (workflow) => workflow.name === taskComposer.workflowName,
       );
@@ -912,6 +913,13 @@ export function InputBar() {
           planned.value.command,
         );
         return;
+      }
+
+      if (planned.value.kind === 'workflow-auto') {
+        // Keep the visible user bubble as the original task while the runtime
+        // receives the explicit orchestration contract. Any real Workflow or
+        // Goal state still comes exclusively from the stream.
+        text = planned.value.command;
       }
 
       if (planned.value.kind === 'loop') {
@@ -1889,7 +1897,7 @@ export function InputBar() {
           </div>
         )}
 
-        {selectedSessionId && composerModeTab.taskMode && !isRunning && !floatingCard && (
+        {selectedSessionId && composerModeTab.taskMode && !floatingCard && (
           <TaskComposerModeBar tabId={selectedSessionId} mode={composerModeTab.taskMode} />
         )}
 

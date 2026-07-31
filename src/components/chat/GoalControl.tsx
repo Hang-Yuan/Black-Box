@@ -9,12 +9,10 @@ import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-
  * persistence semantics.
  */
 export function GoalControl({
-  compact = false,
   active = false,
   disabled = false,
   onSelect,
 }: {
-  compact?: boolean;
   active?: boolean;
   disabled?: boolean;
   onSelect: () => void;
@@ -64,8 +62,8 @@ export function GoalControl({
         title={nativeAvailable ? t('goal.nativeHint') : t('goal.unavailable')}
       >
         <span className={`h-1.5 w-1.5 rounded-full ${active ? 'bg-accent' : 'bg-text-tertiary/40'}`} />
-        <span className={compact ? 'hidden' : 'max-[1040px]:hidden'}>Goal</span>
-        <span className={compact ? 'inline' : 'hidden max-[1040px]:inline'} aria-hidden="true">G</span>
+        <span className="blackbox-toolbar-full-label">Goal</span>
+        <span className="blackbox-toolbar-compact-label" aria-hidden="true">G</span>
       </button>
 
       <button
@@ -77,6 +75,8 @@ export function GoalControl({
           return next;
         })}
         aria-label={t('goal.title')}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         className="ml-0.5 rounded-md p-1 text-text-tertiary hover:bg-bg-secondary hover:text-text-primary"
       >
         <svg width="9" height="9" viewBox="0 0 10 10" fill="none"
@@ -92,27 +92,33 @@ export function GoalControl({
           <div data-testid="goal-explainer" className="mt-1 text-xs leading-relaxed text-text-tertiary">
             {nativeAvailable ? t('goal.nativeHint') : t('goal.unavailable')}
           </div>
-          {nativeAvailable && (
-            <button
-              type="button"
-              data-testid="goal-create-option"
-              onClick={selectMode}
-              className="mt-3 flex w-full items-center justify-between rounded-lg border
-                border-border-subtle bg-bg-secondary px-3 py-2 text-left text-[11px]
-                text-text-primary hover:border-border-focus hover:bg-bg-hover"
-            >
-              <span>
-                <span className="block font-medium">{t('goal.create')}</span>
-                <span className="mt-0.5 block text-[10px] text-text-tertiary">
-                  {t('composerMode.useMainInput')}
-                </span>
+          <button
+            type="button"
+            data-testid="goal-create-option"
+            data-active={active ? 'true' : 'false'}
+            data-runtime-available={nativeAvailable ? 'true' : 'false'}
+            onClick={selectMode}
+            disabled={active || disabled || !nativeAvailable}
+            className="mt-3 flex w-full items-center justify-between rounded-lg border
+              border-border-subtle bg-bg-secondary px-3 py-2 text-left text-[11px]
+              text-text-primary hover:border-border-focus hover:bg-bg-tertiary
+              disabled:cursor-default disabled:opacity-60"
+          >
+            <span>
+              <span className="block font-medium">
+                {t(active ? 'goal.modeActive' : 'goal.useMode')}
               </span>
+              <span className="mt-0.5 block text-[10px] text-text-tertiary">
+                {t('goal.useModeHint')}
+              </span>
+            </span>
+            {!active && nativeAvailable && (
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
                 stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M4 2l4 4-4 4" />
               </svg>
-            </button>
-          )}
+            )}
+          </button>
         </div>
       )}
     </div>

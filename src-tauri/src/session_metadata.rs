@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const AUTHORITY_VERSION: u32 = 2;
+const AUTHORITY_VERSION: u32 = 3;
 const PORTABLE_BUNDLE_FORMAT: &str = "blackbox-session-organization";
 const PORTABLE_BUNDLE_VERSION: u32 = 1;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -95,6 +95,18 @@ struct SessionMetadataImports {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ConversationRuntimePreference {
+    /// `None` means the conversation explicitly uses the native Claude login.
+    provider_id: Option<String>,
+    /// Stable logical tier; provider-specific model IDs remain in providers.json.
+    selected_model: String,
+    /// Native-only exact model override from ANTHROPIC_CUSTOM_MODEL_OPTION.
+    #[serde(default)]
+    custom_model_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionMetadataAuthority {
     version: u32,
     #[serde(default)]
@@ -110,6 +122,10 @@ struct SessionMetadataAuthority {
     /// and cross-computer restore transactional instead of best-effort.
     #[serde(default)]
     custom_previews: BTreeMap<String, String>,
+    /// Last explicitly selected provider/key route and main model for each
+    /// conversation. Credentials stay exclusively in providers.json.
+    #[serde(default)]
+    conversation_runtime_preferences: BTreeMap<String, ConversationRuntimePreference>,
     #[serde(default)]
     tombstones: SessionMetadataTombstones,
     #[serde(default)]
@@ -125,6 +141,7 @@ impl Default for SessionMetadataAuthority {
             pinned_session_ids: BTreeSet::new(),
             archived_session_ids: BTreeSet::new(),
             custom_previews: BTreeMap::new(),
+            conversation_runtime_preferences: BTreeMap::new(),
             tombstones: SessionMetadataTombstones::default(),
             imports: SessionMetadataImports::default(),
         }
@@ -353,10 +370,46 @@ fn normalize_groups(groups: Vec<SessionGroupMetadata>) -> Vec<SessionGroupMetada
     normalized
 }
 
+fn normalize_conversation_runtime_preferences(
+    preferences: BTreeMap<String, ConversationRuntimePreference>,
+) -> BTreeMap<String, ConversationRuntimePreference> {
+    preferences
+        .into_iter()
+        .filter_map(|(session_id, mut preference)| {
+            let session_id = session_id.trim().to_string();
+            if session_id.is_empty()
+                || session_id.starts_with("draft_")
+                || session_id.starts_with("desk_")
+            {
+                return None;
+            }
+
+            preference.selected_model = preference.selected_model.trim().to_lowercase();
+            if !matches!(
+                preference.selected_model.as_str(),
+                "fable" | "opus" | "sonnet" | "haiku"
+            ) {
+                return None;
+            }
+
+            preference.provider_id = preference.provider_id.and_then(|provider_id| {
+                let provider_id = provider_id.trim().to_string();
+                (!provider_id.is_empty() && provider_id.len() <= 256).then_some(provider_id)
+            });
+            preference.custom_model_id = preference.custom_model_id.and_then(|custom_model_id| {
+                let custom_model_id = custom_model_id.trim().to_string();
+                (!custom_model_id.is_empty() && custom_model_id.len() <= 256)
+                    .then_some(custom_model_id)
+            });
+            Some((session_id, preference))
+        })
+        .collect()
+}
+
 fn normalize_authority(
     mut authority: SessionMetadataAuthority,
 ) -> Result<SessionMetadataAuthority, String> {
-    if authority.version == 1 {
+    if matches!(authority.version, 1 | 2) {
         authority.version = AUTHORITY_VERSION;
     } else if authority.version != AUTHORITY_VERSION {
         return Err(format!(
@@ -375,10 +428,13 @@ fn normalize_authority(
                 .then_some((session_id, label))
         })
         .collect();
+    authority.conversation_runtime_preferences =
+        normalize_conversation_runtime_preferences(authority.conversation_runtime_preferences);
     for deleted in authority.tombstones.deleted_session_ids.clone() {
         authority.pinned_session_ids.remove(&deleted);
         authority.archived_session_ids.remove(&deleted);
         authority.custom_previews.remove(&deleted);
+        authority.conversation_runtime_preferences.remove(&deleted);
         for group in &mut authority.groups {
             group
                 .session_ids
@@ -399,15 +455,20 @@ fn read_authority_unlocked(home: &Path) -> Result<SessionMetadataAuthority, Stri
     if let Some(bytes) = read_optional_bytes(&path, "Black Box session metadata")? {
         let authority: SessionMetadataAuthority = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Failed to parse Black Box session metadata: {error}"))?;
-        let needs_v2_migration = authority.version == 1;
+        let needs_legacy_names_migration = authority.version == 1;
+        let needs_authority_migration = authority.version < AUTHORITY_VERSION;
         let mut authority = normalize_authority(authority)?;
-        if needs_v2_migration {
-            let names_bytes =
-                read_optional_bytes(&blackbox_names_path(home), "legacy Black Box session names")?;
-            let names: BTreeMap<String, String> =
-                parse_json_bytes(names_bytes.as_deref(), "legacy Black Box session names")?;
-            for (session_id, label) in names {
-                authority.custom_previews.entry(session_id).or_insert(label);
+        if needs_authority_migration {
+            if needs_legacy_names_migration {
+                let names_bytes = read_optional_bytes(
+                    &blackbox_names_path(home),
+                    "legacy Black Box session names",
+                )?;
+                let names: BTreeMap<String, String> =
+                    parse_json_bytes(names_bytes.as_deref(), "legacy Black Box session names")?;
+                for (session_id, label) in names {
+                    authority.custom_previews.entry(session_id).or_insert(label);
+                }
             }
             authority.revision = authority.revision.saturating_add(1);
             write_authority_unlocked(home, &authority)?;
@@ -651,6 +712,25 @@ fn save_custom_previews_in(home: &Path, data: Value) -> Result<(), String> {
     })
 }
 
+fn load_conversation_runtime_preferences_in(home: &Path) -> Result<Value, String> {
+    with_authority_lock(|| {
+        let authority = read_authority_unlocked(home)?;
+        serde_json::to_value(authority.conversation_runtime_preferences)
+            .map_err(|error| format!("Failed to encode conversation runtime preferences: {error}"))
+    })
+}
+
+fn save_conversation_runtime_preferences_in(home: &Path, data: Value) -> Result<(), String> {
+    let next: BTreeMap<String, ConversationRuntimePreference> = serde_json::from_value(data)
+        .map_err(|error| format!("Invalid conversation runtime preferences: {error}"))?;
+    let next = normalize_conversation_runtime_preferences(next);
+    with_authority_lock(|| {
+        let mut authority = read_authority_unlocked(home)?;
+        authority.conversation_runtime_preferences = next;
+        persist_authority_unlocked(home, &mut authority)
+    })
+}
+
 pub(crate) fn tombstone_deleted_session_in(home: &Path, session_id: &str) -> Result<(), String> {
     let session_id = session_id.trim();
     if session_id.is_empty() || session_id.starts_with("draft_") {
@@ -665,6 +745,9 @@ pub(crate) fn tombstone_deleted_session_in(home: &Path, session_id: &str) -> Res
         authority.pinned_session_ids.remove(session_id);
         authority.archived_session_ids.remove(session_id);
         authority.custom_previews.remove(session_id);
+        authority
+            .conversation_runtime_preferences
+            .remove(session_id);
         authority
             .tombstones
             .cleared_custom_preview_ids
@@ -700,6 +783,7 @@ pub(crate) fn recoverable_session_ids_in(home: &Path) -> Result<BTreeSet<String>
         let mut referenced = authority.pinned_session_ids.clone();
         referenced.extend(authority.archived_session_ids.iter().cloned());
         referenced.extend(authority.custom_previews.keys().cloned());
+        referenced.extend(authority.conversation_runtime_preferences.keys().cloned());
         for group in &authority.groups {
             referenced.extend(group.session_ids.iter().cloned());
             referenced.extend(group.pinned_in_group.iter().cloned());
@@ -739,6 +823,14 @@ pub(crate) fn load_custom_previews() -> Result<Value, String> {
 
 pub(crate) fn save_custom_previews(data: Value) -> Result<(), String> {
     save_custom_previews_in(&current_home()?, data)
+}
+
+pub(crate) fn load_conversation_runtime_preferences() -> Result<Value, String> {
+    load_conversation_runtime_preferences_in(&current_home()?)
+}
+
+pub(crate) fn save_conversation_runtime_preferences(data: Value) -> Result<(), String> {
+    save_conversation_runtime_preferences_in(&current_home()?, data)
 }
 
 pub(crate) fn save_session_groups(data: Value) -> Result<(), String> {
@@ -1777,6 +1869,51 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_v2_authority_without_dropping_runtime_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_fixture(
+            &authority_path(home),
+            serde_json::to_vec_pretty(&json!({
+                "version": 2,
+                "revision": 4,
+                "groups": [],
+                "pinnedSessionIds": [],
+                "archivedSessionIds": [],
+                "customPreviews": {},
+                "conversationRuntimePreferences": {
+                    FIRST: {
+                        "providerId": "relay",
+                        "selectedModel": "opus",
+                        "customModelId": null
+                    }
+                },
+                "tombstones": {},
+                "imports": {}
+            }))
+            .unwrap(),
+        );
+
+        let loaded = authority(home);
+        assert_eq!(loaded.version, AUTHORITY_VERSION);
+        assert_eq!(loaded.revision, 5);
+        assert_eq!(
+            loaded.conversation_runtime_preferences[FIRST].provider_id,
+            Some("relay".to_string())
+        );
+        assert_eq!(
+            loaded.conversation_runtime_preferences[FIRST].selected_model,
+            "opus"
+        );
+        let persisted: SessionMetadataAuthority =
+            serde_json::from_slice(&std::fs::read(authority_path(home)).unwrap()).unwrap();
+        assert_eq!(persisted.version, AUTHORITY_VERSION);
+        assert!(persisted
+            .conversation_runtime_preferences
+            .contains_key(FIRST));
+    }
+
+    #[test]
     fn portable_import_is_additive_keeps_local_conflicts_and_retains_missing_sessions() {
         let source = tempfile::tempdir().unwrap();
         save_session_groups_in(
@@ -1899,5 +2036,98 @@ mod tests {
         let error = import_session_organization_in(temp.path(), &path).unwrap_err();
         assert!(error.contains("Unsupported session organization file format"));
         assert!(!authority_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn conversation_runtime_preferences_round_trip_without_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        save_conversation_runtime_preferences_in(
+            temp.path(),
+            json!({
+                FIRST: {
+                    "providerId": "relay-key-route",
+                    "selectedModel": "opus",
+                    "customModelId": null
+                },
+                SECOND: {
+                    "providerId": null,
+                    "selectedModel": "sonnet",
+                    "customModelId": "claude-native-custom"
+                }
+            }),
+        )
+        .unwrap();
+
+        let loaded = load_conversation_runtime_preferences_in(temp.path()).unwrap();
+        assert_eq!(loaded[FIRST]["providerId"], "relay-key-route");
+        assert_eq!(loaded[FIRST]["selectedModel"], "opus");
+        assert_eq!(loaded[SECOND]["providerId"], Value::Null);
+        assert_eq!(loaded[SECOND]["customModelId"], "claude-native-custom");
+        let encoded = serde_json::to_string(&authority(temp.path())).unwrap();
+        assert!(!encoded.contains("apiKey"));
+        assert!(!encoded.contains("credential"));
+    }
+
+    #[test]
+    fn conversation_runtime_preferences_reject_ephemeral_and_invalid_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        save_conversation_runtime_preferences_in(
+            temp.path(),
+            json!({
+                "draft_123": {
+                    "providerId": "relay",
+                    "selectedModel": "sonnet",
+                    "customModelId": null
+                },
+                "desk_123": {
+                    "providerId": "relay",
+                    "selectedModel": "sonnet",
+                    "customModelId": null
+                },
+                FIRST: {
+                    "providerId": "relay",
+                    "selectedModel": "unknown-model",
+                    "customModelId": null
+                },
+                SECOND: {
+                    "providerId": "  relay  ",
+                    "selectedModel": "HAIKU",
+                    "customModelId": "  custom  "
+                }
+            }),
+        )
+        .unwrap();
+
+        let loaded = load_conversation_runtime_preferences_in(temp.path()).unwrap();
+        assert_eq!(loaded.as_object().unwrap().len(), 1);
+        assert_eq!(loaded[SECOND]["providerId"], "relay");
+        assert_eq!(loaded[SECOND]["selectedModel"], "haiku");
+        assert_eq!(loaded[SECOND]["customModelId"], "custom");
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_runtime_preference() {
+        let temp = tempfile::tempdir().unwrap();
+        save_conversation_runtime_preferences_in(
+            temp.path(),
+            json!({
+                FIRST: {
+                    "providerId": "relay",
+                    "selectedModel": "fable",
+                    "customModelId": null
+                }
+            }),
+        )
+        .unwrap();
+        assert!(recoverable_session_ids_in(temp.path())
+            .unwrap()
+            .contains(FIRST));
+
+        tombstone_deleted_session_in(temp.path(), FIRST).unwrap();
+        let loaded = load_conversation_runtime_preferences_in(temp.path()).unwrap();
+        assert!(loaded.as_object().unwrap().is_empty());
+        assert!(!recoverable_session_ids_in(temp.path())
+            .unwrap()
+            .contains(FIRST));
     }
 }

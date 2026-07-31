@@ -19,7 +19,7 @@ describe('interactive Claude Code permission modes', () => {
   });
 
   it('shows one clickable selector in the chat header with all five modes', () => {
-    expect(chatPanelSource).toContain('<ModeSelector placement="down" compact iconOnly={secondaryPanelOpen} />');
+    expect(chatPanelSource).toContain('<ModeSelector placement="down" compact />');
     for (const id of ['ask', 'code', 'plan', 'auto', 'bypass']) {
       expect(modeSelectorSource).toContain(`id: '${id}'`);
     }

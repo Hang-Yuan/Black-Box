@@ -2,24 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { SessionListItem } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { t as tStatic } from '../../lib/i18n';
-
-function formatRelativeTime(ms: number): string {
-  if (!ms) return '';
-  const now = Date.now();
-  const diff = now - ms;
-  const minutes = Math.floor(diff / 60000);
-  if (minutes < 1) return tStatic('conv.justNow');
-  if (minutes < 60) return `${minutes}${tStatic('conv.mAgo')}`;
-  const hours = Math.floor(minutes / 60);
-  // Within today: show HH:mm for precise differentiation (TK-332 fix)
-  if (hours < 24) {
-    const d = new Date(ms);
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-  }
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}${tStatic('conv.dAgo')}`;
-  return new Date(ms).toLocaleDateString();
-}
+import { formatSessionTime } from '../../lib/session-time';
 
 /** Renders snippet text with query matches highlighted in accent color */
 function HighlightedSnippet({ text, query }: { text: string; query: string }) {
@@ -211,7 +194,7 @@ export function SessionItem({
           </div>
         )}
         <span className="text-[10px] text-text-tertiary flex-shrink-0">
-          {formatRelativeTime(session.modifiedAt)}
+          {formatSessionTime(session.modifiedAt, tStatic)}
         </span>
         {isRunning && (
           <span className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-success
