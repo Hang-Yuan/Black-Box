@@ -18,4 +18,10 @@ describe('scheduled output presentation', () => {
   it('handles a directive-only result without leaving blank control syntax', () => {
     expect(stripFinalInboxDirective('::inbox-item{title="No findings"}')).toBe('');
   });
+
+  it('removes a final failure control directive while preserving the report', () => {
+    expect(stripFinalInboxDirective(
+      'The required lock could not be created.\n::automation-failed{summary="Lock denied"}',
+    )).toBe('The required lock could not be created.');
+  });
 });

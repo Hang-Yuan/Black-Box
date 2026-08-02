@@ -2894,8 +2894,9 @@ fn automation_prompt(
     } else {
         String::new()
     };
+    let result_contract = "\n<automation_result_contract>If every required step completes, end with ::inbox-item{title=\"short title\" summary=\"short factual summary\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, end with ::automation-failed{summary=\"short factual reason\"} on its own final line and do not emit a success directive.</automation_result_contract>";
     Ok(prepend_native_skill_invocation(native_skill_invocation, format!(
-        "Automation: {name}\nAutomation ID: {id}\nAutomation memory: {memory}\nScheduled at: {scheduled}\n\n{prompt}\n\n{memory_block}{team_contract}",
+        "Automation: {name}\nAutomation ID: {id}\nAutomation memory: {memory}\nScheduled at: {scheduled}\n\n{prompt}\n\n{memory_block}{team_contract}{result_contract}",
         name = definition.name,
         id = definition.id,
         memory = memory.display(),
@@ -2910,6 +2911,7 @@ fn automation_prompt(
             format!("Existing automation memory:\n{memory_text}")
         },
         team_contract = team_contract,
+        result_contract = result_contract,
     )))
 }
 
@@ -3594,6 +3596,51 @@ fn parse_inbox_directive(output: &str, fallback: &str) -> (String, String) {
     )
 }
 
+fn parse_automation_failure_directive(output: &str) -> Option<String> {
+    let marker = "::automation-failed{";
+    let start = final_automation_directive_start(output, marker)?;
+    let directive = output[start..].trim();
+    let summary_marker = "summary=\"";
+    let summary = directive
+        .split_once(summary_marker)?
+        .1
+        .split('"')
+        .next()?
+        .trim();
+    (!summary.is_empty()).then(|| summary.chars().take(1000).collect())
+}
+
+fn final_automation_directive_start(output: &str, marker: &str) -> Option<usize> {
+    let start = output.rfind(marker)?;
+    if start > 0 && output.as_bytes().get(start.wrapping_sub(1)) != Some(&b'\n') {
+        return None;
+    }
+    output[start..].trim().ends_with('}').then_some(start)
+}
+
+fn automation_reported_failure(execution: &AutomationExecution) -> Option<String> {
+    if let Some(reason) = parse_automation_failure_directive(&execution.output) {
+        return Some(reason);
+    }
+    if final_automation_directive_start(&execution.output, "::inbox-item{").is_some() {
+        return None;
+    }
+    let terminal_tool_failed = execution
+        .trace
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "tool_result")
+        .is_some_and(|event| event.summary == "Failed");
+    terminal_tool_failed.then(|| {
+        let summary = execution.output.trim();
+        if summary.is_empty() {
+            "The workflow stopped after a failed tool result".to_string()
+        } else {
+            summary.chars().take(1000).collect()
+        }
+    })
+}
+
 async fn execute_automation(
     definition: AutomationDefinition,
     run_id: String,
@@ -3715,17 +3762,30 @@ async fn execute_automation(
     if let Ok(connection) = open_database() {
         match result {
             Ok(execution) => {
-                let (title, summary) = parse_inbox_directive(&execution.output, &definition.name);
                 let trace_json =
                     serde_json::to_string(&execution.trace).unwrap_or_else(|_| "[]".to_string());
-                let _ = connection.execute(
-                    "UPDATE automation_runs SET status='PENDING_REVIEW',title=?2,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
-                    params![run_id, title, summary, execution.output, trace_json, finished_at],
-                );
-                let _ = connection.execute(
-                    "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
-                    params![run_id, title, summary, finished_at],
-                );
+                if let Some(reason) = automation_reported_failure(&execution) {
+                    let title = format!("{} failed", definition.name);
+                    let _ = connection.execute(
+                        "UPDATE automation_runs SET status='FAILED',title=?2,summary=?3,output=?4,error=?3,trace_json=?5,finished_at=?6 WHERE run_id=?1",
+                        params![run_id, title, reason, execution.output, trace_json, finished_at],
+                    );
+                    let _ = connection.execute(
+                        "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
+                        params![run_id, title, reason, finished_at],
+                    );
+                } else {
+                    let (title, summary) =
+                        parse_inbox_directive(&execution.output, &definition.name);
+                    let _ = connection.execute(
+                        "UPDATE automation_runs SET status='PENDING_REVIEW',title=?2,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
+                        params![run_id, title, summary, execution.output, trace_json, finished_at],
+                    );
+                    let _ = connection.execute(
+                        "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
+                        params![run_id, title, summary, finished_at],
+                    );
+                }
             }
             Err(error) => {
                 let trace_json =
@@ -5666,6 +5726,69 @@ mod tests {
         let prompt = automation_prompt(&definition, None).unwrap();
         assert!(prompt.starts_with("Automation:"));
         assert!(prompt.contains("Inspect the latest build."));
+        assert!(prompt.contains("<automation_result_contract>"));
+        assert!(prompt.contains("::automation-failed{summary="));
+    }
+
+    fn tool_result(sequence: u32, summary: &str) -> AutomationTraceEvent {
+        AutomationTraceEvent {
+            sequence,
+            event_type: "tool_result".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_use_id: Some(format!("tool-{sequence}")),
+            parent_tool_use_id: None,
+            agent_id: None,
+            agent_type: None,
+            agent_kind: None,
+            agent_depth: Some(0),
+            summary: summary.to_string(),
+        }
+    }
+
+    #[test]
+    fn scheduled_failure_directive_becomes_a_failed_run_reason() {
+        let execution = AutomationExecution {
+            output: "The lock was denied.\n::automation-failed{summary=\"Lock denied\"}"
+                .to_string(),
+            trace: vec![],
+            session_id: None,
+        };
+        assert_eq!(
+            automation_reported_failure(&execution).as_deref(),
+            Some("Lock denied")
+        );
+    }
+
+    #[test]
+    fn terminal_tool_failure_without_success_receipt_fails_closed() {
+        let failed = AutomationExecution {
+            output: "Stopped after the required lock command failed.".to_string(),
+            trace: vec![tool_result(1, "Failed")],
+            session_id: None,
+        };
+        assert!(automation_reported_failure(&failed).is_some());
+
+        let recovered = AutomationExecution {
+            output: "Recovered.\n::inbox-item{title=\"Done\" summary=\"Recovered\"}".to_string(),
+            trace: vec![tool_result(1, "Failed")],
+            session_id: None,
+        };
+        assert!(automation_reported_failure(&recovered).is_none());
+
+        let later_success = AutomationExecution {
+            output: "Recovered without a control record.".to_string(),
+            trace: vec![tool_result(1, "Failed"), tool_result(2, "Completed")],
+            session_id: None,
+        };
+        assert!(automation_reported_failure(&later_success).is_none());
+
+        let literal_success_example = AutomationExecution {
+            output: "Example: ::inbox-item{title=\"Done\"}\nThe required step still failed."
+                .to_string(),
+            trace: vec![tool_result(1, "Failed")],
+            session_id: None,
+        };
+        assert!(automation_reported_failure(&literal_success_example).is_some());
     }
 
     #[test]

@@ -67,9 +67,12 @@ const testSocket = `/tmp/blackbox-smoke-${process.pid}.sock`;
 process.env.BLACKBOX_AUTOMATION_HOME = automationHome;
 process.env.BLACKBOX_SOCKET = testSocket;
 process.env.CLAUDE_CONFIG_DIR = runClaudeConfig;
+process.env.BLACKBOX_CLAUDE_CONFIG_DIR = runClaudeConfig;
 process.env.BLACKBOX_SKILL_HOME = join(runClaudeConfig, 'skills');
 const skillDir = join(workspace, '.claude', 'skills', 'scheduler-smoke');
 const sourceResultFile = join(workspace, 'scheduler-smoke-result.txt');
+const dataWriteSubdirectory = 'smoke-artifacts';
+const dataResultFile = join(automationHome, dataWriteSubdirectory, 'scheduler-smoke-data-result.txt');
 const taskFile = join(runRoot, 'automation.json');
 const resumeTaskFile = join(runRoot, 'resume-automation.json');
 const appLog = join(runRoot, 'blackbox-app.log');
@@ -97,12 +100,36 @@ mkdirSync(claudeStateDirectory, { recursive: true });
 const claudeStateFile = join(claudeStateDirectory, '.claude.json');
 
 function cleanupRunConversations() {
-  for (const directory of ['projects', 'session-env', 'tasks', 'file-history']) {
+  for (const directory of [
+    'projects',
+    'sessions',
+    'session-env',
+    'shell-snapshots',
+    'tasks',
+    'file-history',
+  ]) {
     rmSync(join(runClaudeConfig, directory), { recursive: true, force: true });
   }
   for (const filename of ['history.jsonl', 'blackbox_session_names.json']) {
     rmSync(join(runClaudeConfig, filename), { force: true });
   }
+}
+
+async function stopChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolvePromise) => child.once('exit', resolvePromise));
+  child.kill('SIGTERM');
+  await Promise.race([exited, sleep(5_000)]);
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+}
+
+function cleanupRunArtifacts() {
+  cleanupRunConversations();
+  rmSync(workspace, { recursive: true, force: true });
+  rmSync(automationHome, { recursive: true, force: true });
+  rmSync(runClaudeConfig, { recursive: true, force: true });
+  rmSync(taskFile, { force: true });
+  rmSync(resumeTaskFile, { force: true });
 }
 
 let mcpServerProcess = null;
@@ -201,8 +228,8 @@ if (!pluginSubagentMode) {
   writeFileSync(
     join(skillDir, 'SKILL.md'),
     mcpMode
-      ? `---\nname: scheduler-smoke\ndescription: Isolated scheduled MCP acceptance skill.\n---\n\n# Scheduled MCP smoke\n\nCall mcp__scheduler_smoke__emit_marker with an empty input. Use the Write tool (not Bash) to create ${sourceResultFile} with the exact text returned by that MCP tool. Do not guess or invent the marker.\n\nAfter the write succeeds, finish with this directive on its own line:\n\n::inbox-item{title="Generic scheduler MCP smoke" summary="Scheduled MCP and Write tool completed in isolation"}\n`
-      : `---\nname: scheduler-smoke\ndescription: Isolated generic scheduler acceptance skill.\n---\n\n# Scheduler smoke\n\nWhen invoked, use the Write tool (not Bash) to create ${worktreeMode ? 'scheduler-smoke-result.txt in the current working directory' : `this exact file:\n\n${sourceResultFile}`} with these exact contents:\n\n${marker}\n\nAfter the write succeeds, finish with this directive on its own line:\n\n::inbox-item{title="Generic scheduler smoke" summary="Scheduled skill and Write tool completed in isolation"}\n`,
+      ? `---\nname: scheduler-smoke\ndescription: Isolated scheduled MCP acceptance skill.\n---\n\n# Scheduled MCP smoke\n\nCall mcp__scheduler_smoke__emit_marker with an empty input. Use the Write tool (not Bash) to create ${sourceResultFile} with the exact text returned by that MCP tool. Do not guess or invent the marker. Then use Write to create ${dataResultFile} with the same exact marker and a trailing newline.\n\nAfter both writes succeed, finish with this directive on its own line:\n\n::inbox-item{title="Generic scheduler MCP smoke" summary="Scheduled MCP and both Write scopes completed in isolation"}\n`
+      : `---\nname: scheduler-smoke\ndescription: Isolated generic scheduler acceptance skill.\n---\n\n# Scheduler smoke\n\nWhen invoked, use the Write tool (not Bash) to create ${worktreeMode ? 'scheduler-smoke-result.txt in the current working directory' : `this exact file:\n\n${sourceResultFile}`} with these exact contents:\n\n${marker}\n\nThen use Write to create this exact Black Box data file:\n\n${dataResultFile}\n\nwith the same exact marker and a trailing newline.\n\nAfter both writes succeed, finish with this directive on its own line:\n\n::inbox-item{title="Generic scheduler smoke" summary="Scheduled skill and both Write scopes completed in isolation"}\n`,
     'utf8',
   );
 }
@@ -289,11 +316,16 @@ const report = {
   sharedTaskToolsObserved: false,
   inboxCount: 0,
   resultFile: sourceResultFile,
+  dataWriteSubdirectory,
+  dataResultFile,
+  dataMarkerVerified: false,
   executionCwd: null,
   sessionId: null,
   sessionTracked: false,
   transcriptFile: null,
   transcriptVerified: false,
+  conversationArtifactsDeleted: false,
+  testArtifactsDeleted: false,
   resumeRunId: null,
   resumeStatus: null,
   resumeContextVerified: false,
@@ -321,15 +353,16 @@ try {
           ? 'Generic Scheduler MCP Smoke'
           : 'Generic Scheduler Smoke',
     prompt: agentTeamMode
-      ? `Run this Agent Teams acceptance literally. Create two shared tasks with TaskCreate. Spawn exactly two named teammates with Agent(name): reader-alpha must own its task, read ${teamAlphaFile}, and send its exact marker to reader-beta with SendMessage; reader-beta must own its task, read ${teamBetaFile}, and send its exact marker to reader-alpha with SendMessage. Use TaskUpdate so both tasks finish completed. The lead must wait for both teammates and must not read either input file itself. After receiving both findings, the lead must use Write to create ${sourceResultFile} containing exactly ${marker} and a trailing newline. Then emit this directive on its own line: ::inbox-item{title="Scheduled Agent Team smoke" summary="Scheduled shared tasks, named teammates, peer messaging, and nested reads completed in isolation"}`
+      ? `Run this Agent Teams acceptance literally. Create two shared tasks with TaskCreate. Spawn exactly two named teammates with Agent(name): reader-alpha must own its task, read ${teamAlphaFile}, and send its exact marker to reader-beta with SendMessage; reader-beta must own its task, read ${teamBetaFile}, and send its exact marker to reader-alpha with SendMessage. Use TaskUpdate so both tasks finish completed. The lead must wait for both teammates and must not read either input file itself. After receiving both findings, the lead must use Write to create ${sourceResultFile} and ${dataResultFile}, each containing exactly ${marker} and a trailing newline. Then emit this directive on its own line: ::inbox-item{title="Scheduled Agent Team smoke" summary="Scheduled shared tasks, named teammates, peer messaging, nested reads, and both Write scopes completed in isolation"}`
       : pluginSubagentMode
-      ? `Use the Skill tool to invoke blackbox-trace-plugin:delegated-write and follow it exactly. Delegate this exact output file to the plugin agent: ${sourceResultFile}\nThe exact marker is: ${marker}\nDo not write the file in the main agent. After the plugin skill completes, emit this directive on its own line: ::inbox-item{title="Scheduled plugin subagent smoke" summary="Scheduled Skill, Agent, and Write completed in isolation"}`
-      : 'Invoke the scheduler-smoke skill with the Skill tool and follow it exactly. Do not read or write outside the current isolated project.',
+      ? `Use the Skill tool to invoke blackbox-trace-plugin:delegated-write and follow it exactly. Delegate this exact output file to the plugin agent: ${sourceResultFile}\nThe exact marker is: ${marker}\nDo not write that source result in the main agent. After the plugin skill completes, the lead must use Write to create ${dataResultFile} with the exact marker and a trailing newline. Then emit this directive on its own line: ::inbox-item{title="Scheduled plugin subagent smoke" summary="Scheduled Skill, Agent, delegated Write, and Black Box data Write completed in isolation"}`
+      : 'Invoke the scheduler-smoke skill with the Skill tool and follow it exactly. Do not read or write outside the current isolated project and the explicitly granted Black Box data directory.',
     status: 'ACTIVE',
     rrule: `FREQ=MINUTELY;INTERVAL=1;BYSECOND=${second}`,
     model: smokeModel,
     reasoning_effort: 'low',
     agent_teams_enabled: agentTeamMode,
+    data_write_subdirectories: [dataWriteSubdirectory],
     execution_environment: worktreeMode ? 'worktree' : 'local',
     target: { type: 'project', projectId: workspace },
     cwds: [workspace],
@@ -447,6 +480,9 @@ try {
   if (!existsSync(resultFile)) throw new Error('Scheduled skill did not create its isolated result file');
   report.markerVerified = readFileSync(resultFile, 'utf8').trim() === marker;
   if (!report.markerVerified) throw new Error('Scheduled result marker did not match the skill-only marker');
+  if (!existsSync(dataResultFile)) throw new Error('Scheduled task did not write its granted Black Box data artifact');
+  report.dataMarkerVerified = readFileSync(dataResultFile, 'utf8').trim() === marker;
+  if (!report.dataMarkerVerified) throw new Error('Scheduled Black Box data marker did not match');
   if (worktreeMode) {
     if (!run.executionCwd || run.executionCwd === workspace) throw new Error('Worktree run did not record an isolated execution directory');
     if (existsSync(sourceResultFile)) throw new Error('Worktree run modified the source project');
@@ -501,20 +537,45 @@ try {
     }
   }
 
+  cleanupRunConversations();
+  const conversationRoots = [
+    'projects',
+    'sessions',
+    'session-env',
+    'shell-snapshots',
+    'tasks',
+    'file-history',
+  ];
+  report.conversationArtifactsDeleted = conversationRoots.every((directory) => (
+    !existsSync(join(runClaudeConfig, directory))
+  )) && ['history.jsonl', 'blackbox_session_names.json'].every((filename) => (
+    !existsSync(join(runClaudeConfig, filename))
+  ));
+  if (!report.conversationArtifactsDeleted) {
+    throw new Error('Scheduled smoke conversation artifacts were not deleted');
+  }
   report.passed = true;
-  writeFileSync(reportFile, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } catch (error) {
   report.error = error instanceof Error ? error.message : String(error);
-  writeFileSync(reportFile, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
-  process.stderr.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exitCode = 1;
 } finally {
   try { cli('pause', report.taskId); } catch { /* best-effort test cleanup */ }
   if (resumeMode) {
     try { cli('pause', resumeTaskId); } catch { /* best-effort test cleanup */ }
   }
-  if (app.exitCode === null) app.kill('SIGTERM');
-  if (mcpServerProcess?.exitCode === null) mcpServerProcess.kill('SIGTERM');
-  cleanupRunConversations();
+  await stopChild(app);
+  await stopChild(mcpServerProcess);
+  cleanupRunArtifacts();
+  report.conversationArtifactsDeleted = !existsSync(runClaudeConfig);
+  report.testArtifactsDeleted = [workspace, automationHome, runClaudeConfig, taskFile, resumeTaskFile]
+    .every((path) => !existsSync(path));
+  if (!report.conversationArtifactsDeleted || !report.testArtifactsDeleted) {
+    report.passed = false;
+    report.error = 'Scheduled smoke cleanup left test task, conversation, or output artifacts';
+    process.exitCode = 1;
+  }
+  writeFileSync(reportFile, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+  const reportOutput = `${JSON.stringify(report, null, 2)}\n`;
+  if (report.passed) process.stdout.write(reportOutput);
+  else process.stderr.write(reportOutput);
 }

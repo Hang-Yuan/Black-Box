@@ -53,6 +53,10 @@ const schedulerSmokeSource = readFileSync(
   resolve(__dirname, '../../scripts/scheduler-smoke.mjs'),
   'utf-8',
 );
+const bundledScheduleSkillSource = readFileSync(
+  resolve(__dirname, '../../src-tauri/resources/blackbox-schedule/SKILL.md'),
+  'utf-8',
+);
 const toolUseSmokeSource = readFileSync(
   resolve(__dirname, '../../scripts/tool-use-smoke.mjs'),
   'utf-8',
@@ -184,6 +188,16 @@ describe('automation runtime regressions', () => {
   it('ships only the generic scheduling skill in the public app', () => {
     expect(tauriConfig.bundle.resources['resources/blackbox-schedule']).toBe('blackbox-schedule');
     expect(Object.keys(tauriConfig.bundle.resources)).toHaveLength(3);
+  });
+
+  it('makes scheduled write scope and post-save smoke part of the creation contract', () => {
+    expect(bundledScheduleSkillSource).toContain('"data_write_subdirectories": []');
+    expect(bundledScheduleSkillSource).toContain('Resolve the write scope before upsert');
+    expect(bundledScheduleSkillSource).toContain('smallest common project directory');
+    expect(bundledScheduleSkillSource).toContain('Delete the smoke task');
+    expect(automationBackendSource).toContain('<automation_result_contract>');
+    expect(automationBackendSource).toContain('::automation-failed{');
+    expect(automationBackendSource).toContain('automation_reported_failure');
   });
 
   it('keeps private profile names and paths out of public product sources', () => {
@@ -460,8 +474,25 @@ describe('automation runtime regressions', () => {
   it('gives each scheduled smoke a clean Claude profile and removes its transcripts', () => {
     expect(schedulerSmokeSource).toContain("const runClaudeConfig = join(runRoot, 'claude-config')");
     expect(schedulerSmokeSource).toContain('process.env.CLAUDE_CONFIG_DIR = runClaudeConfig');
+    expect(schedulerSmokeSource).toContain('process.env.BLACKBOX_CLAUDE_CONFIG_DIR = runClaudeConfig');
     expect(schedulerSmokeSource).toContain('function cleanupRunConversations()');
-    expect(schedulerSmokeSource).toContain("['projects', 'session-env', 'tasks', 'file-history']");
+    for (const conversationArtifact of [
+      'projects',
+      'sessions',
+      'session-env',
+      'shell-snapshots',
+      'tasks',
+      'file-history',
+      'history.jsonl',
+      'blackbox_session_names.json',
+    ]) {
+      expect(schedulerSmokeSource).toContain(`'${conversationArtifact}'`);
+    }
     expect(schedulerSmokeSource).toContain('cleanupRunConversations();');
+    expect(schedulerSmokeSource).toContain('report.conversationArtifactsDeleted =');
+    expect(schedulerSmokeSource).toContain('report.testArtifactsDeleted =');
+    expect(schedulerSmokeSource).toContain('cleanupRunArtifacts();');
+    expect(schedulerSmokeSource).toContain('data_write_subdirectories: [dataWriteSubdirectory]');
+    expect(schedulerSmokeSource).toContain('report.dataMarkerVerified =');
   });
 });

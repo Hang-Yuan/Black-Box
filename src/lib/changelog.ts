@@ -19,6 +19,22 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.20',
+    date: '2026-08-01',
+    highlights: {
+      zh: [
+        '创建排程前会先读取目标 Skill、核对全部写入位置，并把最小共同项目根与 Black Box 数据写目录写入任务定义；保存后自动做一次可清理的隔离 smoke',
+        '排程中出现锁、写入或工具失败时，即使 Claude 进程正常退出也会记录为 FAILED；成功回执与失败回执均作为调度器控制记录处理，不再污染可见报告',
+        'Scheduled smoke 同时验证项目目录与受控数据目录，结束后删除测试任务、测试会话、历史索引和临时输出，并机械检查没有会话残留',
+      ],
+      en: [
+        'Inspects the target skill and every write location before creating a schedule, then records the smallest common project root and controlled Black Box data directories and performs a disposable isolated smoke after saving',
+        'Records lock, write, and tool failures as FAILED even when Claude exits normally, while treating both success and failure receipts as scheduler control records instead of visible report content',
+        'Validates both project and controlled data-directory writes in Scheduled smoke runs, then deletes test tasks, conversations, history indexes, and temporary outputs and mechanically checks for conversation residue',
+      ],
+    },
+  },
+  {
     version: '0.14.19',
     date: '2026-07-31',
     highlights: {
