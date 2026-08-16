@@ -42,6 +42,7 @@ const mockUnregisterStdinTab = vi.fn();
 const mockSetCliResumeId = vi.fn();
 const mockGetTabForStdin = vi.fn();
 const mockFetchSessions = vi.fn();
+let mockStdinToTab: Record<string, string> = {};
 
 vi.mock('../stores/sessionStore', () => ({
   useSessionStore: {
@@ -51,6 +52,7 @@ vi.mock('../stores/sessionStore', () => ({
       setCliResumeId: mockSetCliResumeId,
       getTabForStdin: mockGetTabForStdin,
       fetchSessions: mockFetchSessions,
+      stdinToTab: mockStdinToTab,
     }),
   },
 }));
@@ -109,6 +111,9 @@ import {
   clearFinalized,
   getRecentlyFinalizedStdin,
   planCliUpdateSessions,
+  sweepWarmBackendProcesses,
+  PREWARM_IDLE_TIMEOUT_MS,
+  WARM_SESSION_IDLE_TIMEOUT_MS,
   __sessionLifecycleTesting,
   type SpawnParams,
 } from '../lib/sessionLifecycle';
@@ -430,6 +435,103 @@ describe('planCliUpdateSessions', () => {
   });
 });
 
+describe('warm backend process reaper', () => {
+  const warmTab = (
+    stdinId: string,
+    used: boolean,
+    sessionStatus: 'completed' | 'running' = 'completed',
+    phase: 'completed' | 'thinking' | 'awaiting' = 'completed',
+  ) => ({
+    tabId: `tab-${stdinId}`,
+    messages: used
+      ? [{ id: `user-${stdinId}`, role: 'user', type: 'text', content: 'hello', timestamp: 1 }]
+      : [],
+    partialText: '',
+    partialThinking: '',
+    pendingUserMessages: [],
+    inputDraft: '',
+    sessionMeta: { stdinId },
+    sessionStatus,
+    activityStatus: { phase },
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __sessionLifecycleTesting.resetWarmIdleState();
+    mockGracefulStopSession.mockResolvedValue(undefined);
+    (window as any).__claudeUnlisteners = {};
+  });
+
+  afterEach(() => {
+    delete (window as any).__claudeUnlisteners;
+  });
+
+  it('expires an unused pre-warm after 30 minutes', async () => {
+    mockListActiveProcesses.mockResolvedValue(['desk-prewarm']);
+    mockGetTabForStdin.mockReturnValue('tab-desk-prewarm');
+    mockGetTab.mockReturnValue(warmTab('desk-prewarm', false));
+
+    await sweepWarmBackendProcesses(1_000);
+    expect(mockGracefulStopSession).not.toHaveBeenCalled();
+
+    const result = await sweepWarmBackendProcesses(1_000 + PREWARM_IDLE_TIMEOUT_MS);
+    expect(result.stoppedIds).toEqual(['desk-prewarm']);
+    expect(mockGracefulStopSession).toHaveBeenCalledWith('desk-prewarm');
+    clearFinalized('desk-prewarm');
+  });
+
+  it('keeps a used conversation for four hours', async () => {
+    mockListActiveProcesses.mockResolvedValue(['desk-used']);
+    mockGetTabForStdin.mockReturnValue('tab-desk-used');
+    mockGetTab.mockReturnValue(warmTab('desk-used', true));
+
+    await sweepWarmBackendProcesses(5_000);
+    await sweepWarmBackendProcesses(5_000 + PREWARM_IDLE_TIMEOUT_MS);
+    expect(mockGracefulStopSession).not.toHaveBeenCalled();
+
+    await sweepWarmBackendProcesses(5_000 + WARM_SESSION_IDLE_TIMEOUT_MS);
+    expect(mockGracefulStopSession).toHaveBeenCalledWith('desk-used');
+    clearFinalized('desk-used');
+  });
+
+  it('never reaps generating or awaiting-user conversations', async () => {
+    mockListActiveProcesses.mockResolvedValue(['desk-running', 'desk-awaiting']);
+    mockGetTabForStdin.mockImplementation((stdinId: string) => `tab-${stdinId}`);
+    mockGetTab.mockImplementation((tabId: string) => {
+      const stdinId = tabId.replace('tab-', '');
+      return stdinId === 'desk-running'
+        ? warmTab(stdinId, true, 'running', 'thinking')
+        : warmTab(stdinId, true, 'completed', 'awaiting');
+    });
+    __sessionLifecycleTesting.setWarmIdleSince('desk-running', 0);
+    __sessionLifecycleTesting.setWarmIdleSince('desk-awaiting', 0);
+
+    const result = await sweepWarmBackendProcesses(WARM_SESSION_IDLE_TIMEOUT_MS * 2);
+    expect(result.warmCount).toBe(0);
+    expect(result.stoppedIds).toEqual([]);
+    expect(mockGracefulStopSession).not.toHaveBeenCalled();
+  });
+
+  it('evicts the oldest idle process when a fifth warm connection appears', async () => {
+    const stdinIds = ['desk-1', 'desk-2', 'desk-3', 'desk-4', 'desk-5'];
+    mockListActiveProcesses.mockResolvedValue(stdinIds);
+    mockGetTabForStdin.mockImplementation((stdinId: string) => `tab-${stdinId}`);
+    mockGetTab.mockImplementation((tabId: string) => {
+      const stdinId = tabId.replace('tab-', '');
+      return warmTab(stdinId, true);
+    });
+    stdinIds.forEach((stdinId, index) => {
+      __sessionLifecycleTesting.setWarmIdleSince(stdinId, 100 + index);
+    });
+
+    const result = await sweepWarmBackendProcesses(1_000);
+    expect(result.stoppedIds).toEqual(['desk-1']);
+    expect(mockGracefulStopSession).toHaveBeenCalledTimes(1);
+    expect(mockGracefulStopSession).toHaveBeenCalledWith('desk-1');
+    clearFinalized('desk-1');
+  });
+});
+
 describe('hasRecoverableFrontendSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -479,7 +581,7 @@ describe('handleProcessExitFinalize', () => {
     expect(mockUnregisterStdinTab).toHaveBeenCalledWith('desk_OLD');
   });
 
-  it('flushes before reading partial text and thinking', () => {
+  it('flushes before preserving partial text and compact thinking', () => {
     mockGetTabForStdin.mockReturnValue('tab-1');
 
     let tab = {

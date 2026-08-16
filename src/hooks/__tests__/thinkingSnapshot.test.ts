@@ -53,7 +53,7 @@ describe('thinking snapshot coalescing', () => {
     expect(__streamThinkingTesting.shouldCreateStreamingToolPlaceholder('Bash')).toBe(true);
   });
 
-  it('materializes thinking once the assistant payload also contains text', () => {
+  it('recognizes the assistant text boundary that clears live thinking', () => {
     const shouldMaterialize = __streamThinkingTesting.shouldMaterializeThinkingSnapshot([
       { type: 'thinking', thinking: 'done thinking' },
       { type: 'text', text: 'final answer' },
@@ -62,17 +62,17 @@ describe('thinking snapshot coalescing', () => {
     expect(shouldMaterialize).toBe(true);
   });
 
-  it('falls back to streamed partial thinking when the final assistant payload has text but no thinking block', () => {
+  it('coalesces streamed partial thinking until the final assistant boundary', () => {
     const snapshot = __streamThinkingTesting.resolveThinkingPersistence(
       'msg-789',
       [{ type: 'text', text: 'final answer' }] as any[],
-      'streamed thinking that should persist direct',
+      'streamed thinking held live direct',
       'directly',
     );
 
     expect(snapshot).toEqual({
       id: 'msg-789_thinking',
-      content: 'streamed thinking that should persist directly',
+      content: 'streamed thinking held live directly',
     });
   });
 
@@ -90,7 +90,7 @@ describe('thinking snapshot coalescing', () => {
     });
   });
 
-  it('commits thinking once and clears live partial thinking', () => {
+  it('commits thinking once as a stable collapsed-history row', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-1');
     store.updatePartialThinking('tab-1', 'The user asked. Answer directly.');
@@ -125,6 +125,17 @@ describe('thinking snapshot coalescing', () => {
       }),
     ]);
     expect(tab?.partialThinking).toBe('');
+  });
+
+  it('uses the logical SDK message id across split wrapper records', () => {
+    expect(__streamThinkingTesting.logicalAssistantMessageId({
+      uuid: 'thinking-wrapper',
+      message: { id: 'logical-message' },
+    })).toBe('logical-message');
+    expect(__streamThinkingTesting.logicalAssistantMessageId({
+      uuid: 'text-wrapper',
+      message: { id: 'logical-message' },
+    })).toBe('logical-message');
   });
 
   it('suppresses provider thinking display when the effective thinking level is off', () => {
@@ -197,7 +208,7 @@ describe('thinking snapshot coalescing', () => {
     expect(useChatStore.getState().getTab('tab-overlap')?.partialThinking).toBe('reenterr');
   });
 
-  it('commits streamed thinking at a result-only turn boundary before partials clear', () => {
+  it('commits streamed thinking at a result-only turn boundary', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-result');
     store.updatePartialThinking('tab-result', 'result-only thinking');

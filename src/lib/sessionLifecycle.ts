@@ -16,19 +16,46 @@ import {
   type StartSessionParams,
   type SessionInfo,
 } from './tauri-bridge';
-import { useChatStore, generateInterruptedId, isSessionBusy } from '../stores/chatStore';
-import type { SessionStatus } from '../stores/chatStore';
+import {
+  useChatStore,
+  generateInterruptedId,
+  isSessionBusy,
+  type SessionStatus,
+  type TabSession,
+} from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { useProviderStore } from '../stores/providerStore';
 import { streamController } from '../stream/instance';
-import type { CliPermissionMode, SessionMode, ThinkingLevel } from '../stores/settingsStore';
+import {
+  getEffectiveThinking,
+  type CliPermissionMode,
+  type SessionMode,
+  type ThinkingLevel,
+} from '../stores/settingsStore';
 import { clearSessionPermissionGrants } from './session-permission-grants';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export type TeardownReason = 'stop' | 'rewind' | 'plan-approve' | 'delete' | 'switch';
+export type TeardownReason =
+  | 'stop'
+  | 'rewind'
+  | 'plan-approve'
+  | 'delete'
+  | 'archive'
+  | 'idle-timeout'
+  | 'switch';
+
+export const PREWARM_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+export const WARM_SESSION_IDLE_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+export const MAX_WARM_BACKEND_PROCESSES = 4;
+export const WARM_SESSION_REAPER_INTERVAL_MS = 60 * 1000;
+
+/** A follow-up turn clears this process-scoped clock; completion starts a new
+ * warm window. */
+const warmIdleSince = new Map<string, number>();
+const warmReapInFlight = new Set<string>();
 
 export interface SpawnParams {
   tabId: string;
@@ -166,6 +193,8 @@ export function cleanupListeners(stdinId: string): void {
 
 /** Drop the stdinId route and its listeners when a process is no longer valid. */
 export function cleanupStdinRoute(stdinId: string): void {
+  warmIdleSince.delete(stdinId);
+  warmReapInFlight.delete(stdinId);
   clearSessionPermissionGrants(stdinId);
   useSessionStore.getState().unregisterStdinTab(stdinId);
   cleanupListeners(stdinId);
@@ -218,6 +247,13 @@ export function settleOrphanedBackendProcesses(): Promise<void> {
 
 export const __sessionLifecycleTesting = {
   resetStartupRecovery: () => { startupRecoveryPromise = null; },
+  resetWarmIdleState: () => {
+    warmIdleSince.clear();
+    warmReapInFlight.clear();
+  },
+  setWarmIdleSince: (stdinId: string, timestamp: number) => {
+    warmIdleSince.set(stdinId, timestamp);
+  },
 };
 
 /** Gracefully finish every persistent CLI child before the native app exits. */
@@ -280,6 +316,162 @@ export function planCliUpdateSessions(activeIds: string[]): CliUpdateSessionPlan
     }
   }
   return plan;
+}
+
+function isWarmSessionProtected(tab: TabSession): boolean {
+  return isSessionBusy(tab.sessionStatus) || tab.activityStatus.phase === 'awaiting';
+}
+
+function hasSubmittedUserTurn(tab: TabSession): boolean {
+  return tab.messages.some((message) => message.role === 'user');
+}
+
+export interface WarmSessionReapResult {
+  activeCount: number;
+  warmCount: number;
+  stoppedIds: string[];
+}
+
+/** Close every CLI child owned by one conversation before archive/delete.
+ * Route lookup is included because a partially promoted draft can briefly own
+ * more than the stdinId currently visible in chat metadata. */
+export async function teardownTabBackendProcesses(
+  tabId: string,
+  reason: Extract<TeardownReason, 'archive' | 'delete'>,
+): Promise<string[]> {
+  const tab = useChatStore.getState().getTab(tabId);
+  const routedIds = Object.entries(useSessionStore.getState().stdinToTab)
+    .filter(([, ownerTabId]) => ownerTabId === tabId)
+    .map(([stdinId]) => stdinId);
+  const stdinIds = Array.from(new Set([
+    ...(tab?.sessionMeta.stdinId ? [tab.sessionMeta.stdinId] : []),
+    ...routedIds,
+  ]));
+
+  for (const stdinId of stdinIds) {
+    await teardownSession(stdinId, tabId, reason);
+    await waitForStdinCleared(tabId, stdinId).catch(() => {});
+  }
+  return stdinIds;
+}
+
+/** Apply the warm-process cache policy.
+ *
+ * - unused pre-warms expire after 30 minutes;
+ * - completed conversations expire after four hours;
+ * - at most four warm children survive (oldest-idle is evicted first);
+ * - generating/reconnecting/stopping/awaiting conversations are never touched.
+ */
+export async function sweepWarmBackendProcesses(
+  now = Date.now(),
+): Promise<WarmSessionReapResult> {
+  const activeIds = await bridge.listActiveProcesses();
+  const activeIdSet = new Set(activeIds);
+  for (const stdinId of warmIdleSince.keys()) {
+    if (!activeIdSet.has(stdinId)) warmIdleSince.delete(stdinId);
+  }
+
+  const warmCandidates: Array<{
+    stdinId: string;
+    tabId: string;
+    idleSince: number;
+    timeoutMs: number;
+  }> = [];
+
+  for (const stdinId of activeIds) {
+    const tabId = useSessionStore.getState().getTabForStdin(stdinId);
+    const tab = tabId ? useChatStore.getState().getTab(tabId) : undefined;
+    if (!tabId || !tab || tab.sessionMeta.stdinId !== stdinId) {
+      warmIdleSince.delete(stdinId);
+      continue;
+    }
+    if (isWarmSessionProtected(tab)) {
+      // A new turn resets the future warm window.
+      warmIdleSince.delete(stdinId);
+      continue;
+    }
+    const idleSince = warmIdleSince.get(stdinId) ?? now;
+    warmIdleSince.set(stdinId, idleSince);
+    warmCandidates.push({
+      stdinId,
+      tabId,
+      idleSince,
+      timeoutMs: hasSubmittedUserTurn(tab)
+        ? WARM_SESSION_IDLE_TIMEOUT_MS
+        : PREWARM_IDLE_TIMEOUT_MS,
+    });
+  }
+
+  const stopIds = new Set(
+    warmCandidates
+      .filter((candidate) => now - candidate.idleSince >= candidate.timeoutMs)
+      .map((candidate) => candidate.stdinId),
+  );
+  const nonExpired = warmCandidates
+    .filter((candidate) => !stopIds.has(candidate.stdinId))
+    .sort((a, b) => a.idleSince - b.idleSince);
+  const overflow = Math.max(0, nonExpired.length - MAX_WARM_BACKEND_PROCESSES);
+  for (const candidate of nonExpired.slice(0, overflow)) stopIds.add(candidate.stdinId);
+
+  const stoppedIds: string[] = [];
+  for (const candidate of warmCandidates) {
+    if (!stopIds.has(candidate.stdinId) || warmReapInFlight.has(candidate.stdinId)) continue;
+
+    // Revalidate immediately before shutdown so a prompt submitted during the
+    // sweep cannot lose its newly active process.
+    const ownerTabId = useSessionStore.getState().getTabForStdin(candidate.stdinId);
+    const freshTab = ownerTabId ? useChatStore.getState().getTab(ownerTabId) : undefined;
+    if (
+      ownerTabId !== candidate.tabId
+      || !freshTab
+      || freshTab.sessionMeta.stdinId !== candidate.stdinId
+      || isWarmSessionProtected(freshTab)
+    ) {
+      warmIdleSince.delete(candidate.stdinId);
+      continue;
+    }
+
+    warmReapInFlight.add(candidate.stdinId);
+    try {
+      await teardownSession(candidate.stdinId, candidate.tabId, 'idle-timeout');
+      stoppedIds.push(candidate.stdinId);
+    } catch (error) {
+      console.warn('[BLACKBOX] Failed to reap warm CLI process:', candidate.stdinId, error);
+    } finally {
+      warmReapInFlight.delete(candidate.stdinId);
+      warmIdleSince.delete(candidate.stdinId);
+    }
+  }
+
+  return {
+    activeCount: activeIds.length,
+    warmCount: warmCandidates.length,
+    stoppedIds,
+  };
+}
+
+export function startWarmBackendProcessReaper(
+  intervalMs = WARM_SESSION_REAPER_INTERVAL_MS,
+): () => void {
+  let disposed = false;
+  let sweepRunning = false;
+  const runSweep = async () => {
+    if (disposed || sweepRunning) return;
+    sweepRunning = true;
+    try {
+      await sweepWarmBackendProcesses();
+    } catch (error) {
+      console.warn('[BLACKBOX] Warm CLI reaper failed:', error);
+    } finally {
+      sweepRunning = false;
+    }
+  };
+  void runSweep();
+  const interval = setInterval(() => { void runSweep(); }, intervalMs);
+  return () => {
+    disposed = true;
+    clearInterval(interval);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -471,7 +663,7 @@ export async function teardownSession(
   }, 12_000);
   teardownTimeouts.set(stdinId, timeoutId);
 
-  const stopProcess = reason === 'stop' || reason === 'delete'
+  const stopProcess = reason === 'stop'
     ? bridge.killSession(stdinId)
     : bridge.gracefulStopSession(stdinId).then(() => undefined);
   try {
@@ -570,10 +762,12 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       finalizedAt: Date.now(),
     });
 
-    // 2. Save partial text/thinking as interrupted messages
+    // 2. Preserve interrupted assistant output. Thinking remains a compact,
+    // collapsed row and is suppressed only when this session explicitly runs
+    // with thinking disabled.
     const pThinking = tab.partialThinking ?? '';
     const pText = tab.partialText ?? '';
-    if (pThinking.trim().length > 0) {
+    if (pThinking.trim().length > 0 && getEffectiveThinking(tab.sessionMeta) !== 'off') {
       store.addMessage(tabId, {
         id: generateInterruptedId('thinking'),
         role: 'assistant',

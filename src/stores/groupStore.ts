@@ -25,6 +25,13 @@ interface GroupState {
   deleteGroup: (groupId: string) => void;
   addToGroup: (sessionId: string, groupId: string) => void;
   removeFromGroup: (sessionId: string) => void;
+  /** Move a conversation by drag-and-drop. `null` returns it to the ungrouped
+   *  bucket; `beforeSessionId` places it at a concrete row in the target group. */
+  moveSession: (
+    sessionId: string,
+    targetGroupId: string | null,
+    beforeSessionId?: string,
+  ) => void;
   reorderInGroup: (groupId: string, orderedSessionIds: string[]) => void;
   reorderGroups: (workspace: string, orderedGroupIds: string[]) => void;
   pinInGroup: (groupId: string, sessionId: string) => void;
@@ -97,6 +104,60 @@ export const useGroupStore = create<GroupState>()((set, get) => ({
 
   removeFromGroup: (sessionId) => {
     set({ groups: get().groups.map((g) => detachSession(g, sessionId)) });
+  },
+
+  moveSession: (sessionId, targetGroupId, beforeSessionId) => {
+    const all = get().groups;
+    const source = all.find((group) => group.sessionIds.includes(sessionId));
+
+    // Dropping on the ungrouped bucket is an explicit detach. An already
+    // ungrouped conversation is a clean no-op.
+    if (targetGroupId === null) {
+      if (!source) return;
+      set({ groups: all.map((group) => detachSession(group, sessionId)) });
+      return;
+    }
+
+    const target = all.find((group) => group.id === targetGroupId);
+    // Never detach from the source if the drop target has gone stale.
+    if (!target) return;
+
+    if (source?.id === targetGroupId) {
+      if (
+        !beforeSessionId
+        || beforeSessionId === sessionId
+        || !target.sessionIds.includes(beforeSessionId)
+      ) return;
+
+      const from = target.sessionIds.indexOf(sessionId);
+      const to = target.sessionIds.indexOf(beforeSessionId);
+      if (from === -1 || to === -1 || from === to) return;
+      const ordered = target.sessionIds.slice();
+      const [moved] = ordered.splice(from, 1);
+      ordered.splice(to, 0, moved);
+      set({
+        groups: all.map((group) => (
+          group.id === targetGroupId ? { ...group, sessionIds: ordered } : group
+        )),
+      });
+      return;
+    }
+
+    // Cross-group and ungrouped-to-group moves are committed as one snapshot,
+    // preserving single membership and avoiding an intermediate detached save.
+    const detached = all.map((group) => detachSession(group, sessionId));
+    set({
+      groups: detached.map((group) => {
+        if (group.id !== targetGroupId) return group;
+        const ordered = group.sessionIds.slice();
+        const targetIndex = beforeSessionId
+          ? ordered.indexOf(beforeSessionId)
+          : -1;
+        if (targetIndex === -1) ordered.push(sessionId);
+        else ordered.splice(targetIndex, 0, sessionId);
+        return { ...group, sessionIds: ordered };
+      }),
+    });
   },
 
   reorderInGroup: (groupId, orderedSessionIds) => {

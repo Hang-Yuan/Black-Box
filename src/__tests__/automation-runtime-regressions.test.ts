@@ -27,6 +27,18 @@ const automationCenterSource = readFileSync(
   resolve(__dirname, '../components/automations/AutomationCenter.tsx'),
   'utf-8',
 );
+const automationSessionMonitorSource = readFileSync(
+  resolve(__dirname, '../components/automations/AutomationSessionMonitor.tsx'),
+  'utf-8',
+);
+const chatPanelSource = readFileSync(
+  resolve(__dirname, '../components/chat/ChatPanel.tsx'),
+  'utf-8',
+);
+const inputBarSource = readFileSync(
+  resolve(__dirname, '../components/chat/InputBar.tsx'),
+  'utf-8',
+);
 const rustEntrySource = readFileSync(
   resolve(__dirname, '../../src-tauri/src/lib.rs'),
   'utf-8',
@@ -102,12 +114,17 @@ describe('automation runtime regressions', () => {
     expect(automationBackendSource).toContain('prepare_automation_write_paths');
   });
 
-  it('treats the macOS red close button as an explicit app quit', () => {
-    expect(appSource).not.toContain('await win.hide();');
+  it('keeps the macOS app resident when the red close button hides the window', () => {
     expect(rustEntrySource).toContain('WindowEvent::CloseRequested');
     expect(rustEntrySource).toContain('api.prevent_close();');
-    expect(rustEntrySource).toContain('graceful_stop_session_inner');
-    expect(rustEntrySource).toContain('native close settled CLI sessions; exiting application');
+    expect(rustEntrySource).toContain('window.hide()');
+    const closePath = rustEntrySource.split('WindowEvent::CloseRequested')[1]
+      ?.split('.setup(|app|')[0] ?? '';
+    expect(closePath).not.toContain('graceful_stop_all_sessions_inner');
+    expect(closePath).not.toContain('app.exit(0)');
+    expect(rustEntrySource).toContain('TrayIconBuilder::with_id("blackbox-menu-bar")');
+    expect(rustEntrySource).toContain('"blackbox-show"');
+    expect(rustEntrySource).toContain('"blackbox-quit"');
   });
 
   it('keeps native macOS traffic lights in both formal and isolated development windows', () => {
@@ -120,10 +137,10 @@ describe('automation runtime regressions', () => {
     expect(tauriDevConfig.identifier).toBe('com.blackbox.app.dev');
   });
 
-  it('states that quitting stops local scheduling', () => {
-    expect(i18nSource).toContain('Black Box 退出后本地调度停止');
-    expect(i18nSource).toContain('Local scheduling stops when Black Box quits');
-    expect(i18nSource).not.toContain('窗口关闭后，Black Box 仍会在后台保持调度');
+  it('distinguishes closing the window from explicitly quitting the app', () => {
+    expect(i18nSource).toContain('关闭窗口后 Black Box 继续在后台调度');
+    expect(i18nSource).toContain('Closing the window keeps Black Box scheduling in the background');
+    expect(i18nSource).toContain('仅明确退出应用时停止');
   });
 
   it('offers explicit login startup and keeps login-item launches hidden', () => {
@@ -182,7 +199,48 @@ describe('automation runtime regressions', () => {
     expect(sidebarSource).toContain('total + item.unreadRuns');
     expect(sidebarSource).not.toContain("'99+'");
     expect(automationUiSource).toContain('bridge.markAllAutomationRunsRead()');
+    expect(automationUiSource).not.toContain('if (standalone) await bridge.markAllAutomationRunsRead()');
+    expect(automationUiSource).toContain("t('automations.markAllRead')");
     expect(sidebarSource).toContain("'data-testid': 'scheduled-button'");
+  });
+
+  it('separates scheduled result severity from read state', () => {
+    expect(automationBackendSource).toContain("status='SUCCEEDED'");
+    expect(automationBackendSource).toContain("status='NEEDS_ATTENTION'");
+    expect(automationBackendSource).toContain('::automation-needs-attention{');
+    expect(automationBackendSource).toContain('migrate_legacy_run_statuses');
+    expect(automationUiSource).toContain("case 'SUCCEEDED':");
+    expect(automationUiSource).toContain("case 'NEEDS_ATTENTION':");
+    expect(automationUiSource).toContain('isUnreadAutomationResult(run)');
+    expect(i18nSource).toContain("'automations.status.succeeded': '已完成'");
+    expect(i18nSource).toContain("'automations.status.needsAttention': '需处理'");
+  });
+
+  it('keeps recent-run status, unread state, and timestamp in aligned non-wrapping slots', () => {
+    expect(automationUiSource).toContain('grid-cols-[minmax(0,1fr)_max-content]');
+    expect(automationUiSource).toContain('flex shrink-0 items-center justify-end gap-2 whitespace-nowrap');
+    expect(automationUiSource).toContain('flex shrink-0 items-center justify-end gap-3 whitespace-nowrap');
+    expect(automationUiSource).toContain('whitespace-nowrap text-right text-[10px] tabular-nums');
+  });
+
+  it('links failed scheduled runs to auditable retries and presents successful recovery', () => {
+    expect(automationBackendSource).toContain('pub fn retry_automation_run');
+    expect(automationBackendSource).toContain("status='RECOVERED'");
+    expect(automationBackendSource).toContain('retry_of_run_id');
+    expect(automationBackendSource).toContain('recovered_by_run_id');
+    expect(rustEntrySource).toContain('automations::retry_automation_run');
+    expect(automationUiSource).toContain('bridge.retryAutomationRun(runId)');
+    expect(automationUiSource).toContain("case 'RECOVERED':");
+    expect(i18nSource).toContain("'automations.status.recovered': '已恢复'");
+  });
+
+  it('reconciles committed completion receipts without rerunning finished work', () => {
+    expect(automationBackendSource).toContain('AutomationCompletionProbe');
+    expect(automationBackendSource).toContain('probe_completion_receipt');
+    expect(automationBackendSource).toContain('reconcile_failed_completion_probes');
+    expect(automationBackendSource).toContain('completion-receipt:');
+    expect(automationBackendSource).toContain("status='RECOVERED'");
+    expect(i18nSource).toContain('后续完成凭证已确认');
   });
 
   it('ships only the generic scheduling skill in the public app', () => {
@@ -196,6 +254,10 @@ describe('automation runtime regressions', () => {
     expect(bundledScheduleSkillSource).toContain('smallest common project directory');
     expect(bundledScheduleSkillSource).toContain('Delete the smoke task');
     expect(automationBackendSource).toContain('<automation_result_contract>');
+    expect(automationBackendSource).toContain('::automation-needs-attention{');
+    expect(automationBackendSource).toContain('automation_completion_recovery_prompt');
+    expect(automationBackendSource).toContain('automation_needs_completion_recovery');
+    expect(automationBackendSource).toContain('"--resume".to_string()');
     expect(automationBackendSource).toContain('::automation-failed{');
     expect(automationBackendSource).toContain('automation_reported_failure');
   });
@@ -288,6 +350,7 @@ describe('automation runtime regressions', () => {
     expect(automationUiSource).toContain('<MarkdownRenderer');
     expect(automationUiSource).toContain('stripFinalInboxDirective(run.output)');
     expect(automationOutputSource).toContain("const INBOX_DIRECTIVE = '::inbox-item{'");
+    expect(automationOutputSource).toContain("const ATTENTION_DIRECTIVE = '::automation-needs-attention{'");
     expect(automationOutputSource).toContain("!suffix.endsWith('}')");
   });
 
@@ -307,6 +370,29 @@ describe('automation runtime regressions', () => {
     expect(automationUiSource).toContain("t('automations.continueConversation')");
     expect(i18nSource).toContain("'automations.continueConversation': '继续这条任务对话'");
     expect(i18nSource).toContain("'automations.continueConversation': 'Continue this task'");
+  });
+
+  it('keeps a running scheduled conversation visible and prevents a concurrent resume', () => {
+    expect(rustEntrySource).toContain('automations::list_active_automation_sessions');
+    expect(automationBackendSource).toContain('pub fn list_active_automation_sessions()');
+    expect(automationBackendSource).toContain("r.status = 'RUNNING'");
+    expect(appSource).toContain('<AutomationSessionMonitor />');
+    expect(automationSessionMonitorSource).toContain('bridge.listActiveAutomationSessions()');
+    expect(automationSessionMonitorSource).toContain('bridge.loadSession(session.path)');
+    expect(automationSessionMonitorSource).toContain('parseSessionMessages(rawMessages)');
+    expect(chatPanelSource).toContain('data-testid="automation-session-banner"');
+    expect(chatPanelSource).toContain("t('automations.chatRunning')");
+    expect(inputBarSource).toContain('activeBySession.has(tabId)');
+    expect(inputBarSource).toContain('Boolean(activeAutomation)');
+    expect(i18nSource).toContain("'automations.chatSendLocked'");
+  });
+
+  it('fails closed when a cron omits its terminal receipt or skips final Agent synthesis', () => {
+    expect(automationBackendSource).toContain('Scheduled task ended without the required final result directive');
+    expect(automationBackendSource).toContain("the run ended without a final synthesis");
+    expect(automationBackendSource).toContain('last_main_assistant_event');
+    expect(automationBackendSource).toContain('last_agent_completion_event');
+    expect(automationBackendSource).toContain('definition.kind == "cron"');
   });
 
   it('kills timed-out runs and recovers interrupted claims on startup', () => {
@@ -387,14 +473,17 @@ describe('automation runtime regressions', () => {
     expect(automationUiSource).toContain("t('automations.includedIgnoredFiles')");
   });
 
-  it('shows provider-native lead and auxiliary choices while persisting stable slots', () => {
-    expect(automationUiSource).toContain('getModelDisplayOptions(editingProvider)');
+  it('inherits the three user system defaults while retaining optional per-task model overrides', () => {
+    expect(automationUiSource).toContain('getModelDisplayOptions(defaultProvider)');
+    expect(automationUiSource).not.toContain('editingProvider');
     expect(automationUiSource).toContain("t('automations.mainModel')");
     expect(automationUiSource).toContain("t('automations.auxiliaryModel')");
     expect(automationUiSource).toContain('normalizeModelTier(definition.model)');
-    expect(automationUiSource).toMatch(/createAutomationDraft\(\s*selectedModel,/);
+    expect(automationUiSource).toContain("t('automations.useSystemDefault')");
+    expect(automationUiSource).toMatch(/createAutomationDraft\(\s*workingDirectory/);
     expect(automationUiSource).not.toMatch(/Opus 4|Sonnet 4|Haiku 4|1M/);
-    expect(automationBackendSource).toContain('.unwrap_or("sonnet")');
+    expect(automationBackendSource).toContain('providers.default_main_model.clone()');
+    expect(automationBackendSource).toContain('providers.default_auxiliary_model.clone()');
     expect(automationBackendSource).toContain('.model_mappings');
     expect(automationBackendSource).toContain('has no model mapping for the {tier} tier');
     expect(automationBackendSource).toContain('CLAUDE_CODE_SUBAGENT_MODEL');
@@ -452,6 +541,15 @@ describe('automation runtime regressions', () => {
       'automations.launchAtLoginHint',
       'automations.worktreeRetention',
       'automations.worktreeRetentionHint',
+      'automations.status.succeeded',
+      'automations.status.needsAttention',
+      'automations.status.recovered',
+      'automations.retry',
+      'automations.retrying',
+      'automations.retryOf',
+      'automations.recoveredSummary',
+      'automations.recoveredDetail',
+      'automations.markAllRead',
     ]) {
       expect(i18nSource.match(new RegExp(`'${key.replace('.', '\\.')}'`, 'g'))).toHaveLength(2);
     }
@@ -465,10 +563,22 @@ describe('automation runtime regressions', () => {
     }
   });
 
-  it('pins scheduled smoke runs to the isolated provider revision', () => {
-    expect(schedulerSmokeSource).toContain('provider_id: activeProvider.id');
-    expect(schedulerSmokeSource).toContain('provider_revision: Number(activeProvider.revision || 1)');
-    expect(schedulerSmokeSource).not.toContain('provider_id: null');
+  it('launches scheduled work like a normal new conversation without task credentials', () => {
+    expect(schedulerSmokeSource).not.toContain('provider_id: activeProvider.id');
+    expect(schedulerSmokeSource).not.toContain('provider_revision: Number(activeProvider.revision || 1)');
+    expect(automationBackendSource).toContain('providers.default_api');
+    expect(automationUiSource).toContain('configured.providers.find(');
+    expect(automationUiSource).not.toContain('SYSTEM_API_ID');
+    expect(automationUiSource).not.toContain('checkClaudeAuth()');
+    expect(automationBackendSource).toContain('System Claude Login has been retired');
+    expect(automationBackendSource).toContain('migrate_legacy_provider_index_bindings');
+    expect(automationBackendSource).toContain('migrate_legacy_definition_provider_bindings');
+    expect(automationBackendSource).toContain('crate::resolve_claude_sdk_runtime()');
+    const scheduledInvoke = automationBackendSource.split('async fn invoke_claude(')[1]
+      ?.split('fn parse_result_directive(')[0] || '';
+    expect(scheduledInvoke).not.toContain('find_claude_binary()');
+    expect(automationUiSource).not.toContain("t('automations.providerPinned')");
+    expect(i18nSource).not.toContain("'automations.providerPinned'");
   });
 
   it('gives each scheduled smoke a clean Claude profile and removes its transcripts', () => {

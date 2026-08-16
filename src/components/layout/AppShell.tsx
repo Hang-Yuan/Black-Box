@@ -2,6 +2,11 @@ import { useCallback, useRef, useEffect, useState } from 'react';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useFileStore } from '../../stores/fileStore';
 import { FilePreview } from '../files/FilePreview';
+import { useSessionStore } from '../../stores/sessionStore';
+import {
+  loadConversationPanelState,
+  saveConversationPanelState,
+} from '../../lib/conversation-view-state';
 
 interface AppShellProps {
   sidebar: React.ReactNode;
@@ -28,7 +33,9 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
   const toggleSidebar = useSettingsStore((s) => s.toggleSidebar);
   const secondaryPanelOpen = useSettingsStore((s) => s.secondaryPanelOpen);
   const secondaryPanelWidth = useSettingsStore((s) => s.secondaryPanelWidth);
+  const secondaryPanelTab = useSettingsStore((s) => s.secondaryPanelTab);
   const toggleSecondaryPanel = useSettingsStore((s) => s.toggleSecondaryPanel);
+  const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
 
   /* File preview state — when a file is selected, we enter "preview mode" */
   const selectedFile = useFileStore((s) => s.selectedFile);
@@ -44,32 +51,53 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
     Math.round(window.innerWidth * 0.5)
   );
 
-  /* Remember panel states before entering preview mode so we can restore them on exit */
-  const panelStateBeforePreview = useRef<{ sidebar: boolean; secondary: boolean } | null>(null);
-
-  /* Re-calculate default when entering preview mode */
-  const prevPreviewMode = useRef(false);
+  /*
+   * Full file preview temporarily collapses the navigation shells. Ownership
+   * is session-scoped: switching conversations while a file is open must not
+   * restore the previous conversation's panel state into the new one.
+   */
+  const previewOwner = useRef<{ sessionId: string; sidebar: boolean } | null>(null);
   useEffect(() => {
-    if (isFilePreviewMode && !prevPreviewMode.current) {
-      // Entering preview mode — save current panel state and collapse them
+    if (isFilePreviewMode && selectedSessionId && previewOwner.current?.sessionId !== selectedSessionId) {
       setPreviewWidth(Math.round(window.innerWidth * 0.5));
-      panelStateBeforePreview.current = {
-        sidebar: sidebarOpen,
-        secondary: secondaryPanelOpen,
-      };
+      saveConversationPanelState(selectedSessionId, {
+        open: secondaryPanelOpen,
+        tab: secondaryPanelTab,
+        width: secondaryPanelWidth,
+      });
+      previewOwner.current = { sessionId: selectedSessionId, sidebar: sidebarOpen };
       if (sidebarOpen) toggleSidebar();
       if (secondaryPanelOpen) toggleSecondaryPanel();
-    } else if (!isFilePreviewMode && prevPreviewMode.current) {
-      // Exiting preview mode — restore panels to their previous state
-      const saved = panelStateBeforePreview.current;
-      if (saved) {
-        if (saved.sidebar && !sidebarOpen) toggleSidebar();
-        if (saved.secondary && !secondaryPanelOpen) toggleSecondaryPanel();
-        panelStateBeforePreview.current = null;
+      return;
+    }
+
+    if (!isFilePreviewMode && previewOwner.current) {
+      const owner = previewOwner.current;
+      previewOwner.current = null;
+      // Restore only when the same conversation closed its own preview. A tab
+      // switch has already restored the destination conversation atomically.
+      if (selectedSessionId === owner.sessionId) {
+        const panel = loadConversationPanelState(owner.sessionId);
+        if (owner.sidebar && !sidebarOpen) toggleSidebar();
+        if (panel) {
+          useSettingsStore.getState().setSecondaryPanelState({
+            open: panel.open,
+            tab: panel.tab,
+            width: panel.width,
+          });
+        }
       }
     }
-    prevPreviewMode.current = isFilePreviewMode;
-  }, [isFilePreviewMode, sidebarOpen, toggleSidebar, secondaryPanelOpen, toggleSecondaryPanel]);
+  }, [
+    isFilePreviewMode,
+    secondaryPanelOpen,
+    secondaryPanelTab,
+    secondaryPanelWidth,
+    selectedSessionId,
+    sidebarOpen,
+    toggleSecondaryPanel,
+    toggleSidebar,
+  ]);
 
   // Refs to avoid re-registering global listeners when these values change
   const isFilePreviewModeRef = useRef(isFilePreviewMode);

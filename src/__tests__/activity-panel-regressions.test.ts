@@ -31,10 +31,12 @@ describe('long-task activity panel', () => {
     expect(settingsStore).toContain("export type SecondaryPanelTab = 'activity' | 'files'");
     expect(secondaryPanel).toContain("id: 'activity'");
     expect(secondaryPanel).toContain("activeTab === 'activity' && <ActivityPanel />");
-    expect(chatPanel).toContain('data-testid="activity-panel-toggle"');
     expect(chatPanel).toContain('data-testid="agent-panel-toggle"');
-    expect(chatPanel).toContain("openSecondaryTab('activity')");
+    expect(chatPanel).toContain("setSecondaryTab('activity')");
     expect(chatPanel).toContain("openSecondaryTab('files')");
+    expect(chatPanel).not.toContain('data-testid="activity-panel-toggle"');
+    expect(chatPanel).toContain("import { AgentPanel }");
+    expect(chatPanel).toContain('data-testid="agent-roster-popover"');
   });
 
   it('keeps header labels independent from the secondary-panel open state', () => {
@@ -46,6 +48,7 @@ describe('long-task activity panel', () => {
     expect(chatPanel).toContain("active={taskComposerMode === 'workflow'}");
     expect(chatPanel).toContain("active={taskComposerMode === 'loop'}");
     expect(chatPanel).toContain("active={taskComposerMode === 'goal'}");
+    expect(chatPanel).toContain('running={goalRequestRunning}');
     expect(chatPanel).not.toContain('compact={secondaryPanelOpen}');
     expect(chatPanel).not.toContain('iconOnly={secondaryPanelOpen}');
   });
@@ -77,7 +80,7 @@ describe('long-task activity panel', () => {
 
   it('does not count the main agent as a subagent', () => {
     expect(activityPanel).toContain('.filter((agent) => !agent.isMain)');
-    expect(activityPanel).toContain("visibleAgents.filter((agent) => !['idle', 'completed', 'error'].includes(agent.phase))");
+    expect(activityPanel).toContain('visibleAgents.filter(isAgentActive)');
   });
 
   it('clears the live Agent/Task authority when a new conversation starts', () => {
@@ -97,6 +100,19 @@ describe('long-task activity panel', () => {
     expect(activityPanel).toContain("agent.name || t('agents.claudeSubAgent')");
     expect(activityPanel).toContain('agent.model || auxiliaryModel');
     expect(activityPanel).toContain('taskDescription');
+  });
+
+  it('keeps forwarded subagent output optional inside the real process panel', () => {
+    expect(activityPanel).toContain('agent.activity ?? []');
+    expect(activityPanel).toContain('sanitizeAssistantTextForDisplay(entry.content)');
+    expect(activityPanel).toContain('data-testid={`activity-panel-agent-process-${agent.id}`}');
+    expect(activityPanel).toContain('<details');
+    expect(activityPanel).toContain('<MarkdownRenderer content={entry.content} />');
+    expect(chatPanel).toContain('<AgentPanel onOpenProcess={openAgentProcess} />');
+    expect(chatPanel).toContain("new CustomEvent('blackbox:focus-agent-process'");
+    expect(chatPanel).not.toContain('data-testid="background-agent-banner"');
+    expect(activityPanel).toContain('data-testid="activity-agent-teams-control"');
+    expect(activityPanel).toContain('data-testid="agent-teams-toggle"');
   });
 
   it('keeps native loop wakeups visibly active between foreground turns', () => {

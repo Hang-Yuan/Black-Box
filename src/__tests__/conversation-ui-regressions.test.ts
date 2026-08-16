@@ -14,10 +14,14 @@ describe('conversation archive regressions', () => {
     expect(list).toContain('handleToggleArchive');
     expect(list).toContain('handleBatchArchive');
     expect(list).toContain('groupsForConversationView');
+    expect(list).toContain("teardownTabBackendProcesses(session.id, 'archive')");
+    expect(list).toContain("teardownTabBackendProcesses(sessionId, 'delete')");
   });
 
-  it('preserves task groups in read-only history and starts them collapsed', () => {
-    expect(list).toContain('setArchiveExpandedGroups(new Set())');
+  it('preserves task groups in read-only history and restores explicit visibility', () => {
+    expect(list).toContain('loadConversationSidebarVisibility');
+    expect(list).toContain('saveConversationSidebarVisibility');
+    expect(list).not.toContain('setArchiveExpandedGroups(new Set())');
     expect(list).toContain("readOnly={conversationView === 'archived'}");
     expect(group).toContain('readOnly={readOnly}');
     expect(taskGroup).toContain('useSortable({ id: group.id, disabled: readOnly })');
@@ -44,6 +48,66 @@ describe('compact switch geometry', () => {
       expect(ui).toContain('? 16 : 0}px)');
       expect(ui).not.toContain('translate-x-[18px]');
     }
+  });
+});
+
+describe('markdown code block wrapping', () => {
+  const markdown = source('components/shared/MarkdownRenderer.tsx');
+
+  it('soft-wraps long fenced-code lines instead of requiring horizontal scrolling', () => {
+    expect(markdown).toContain('min-w-0 max-w-full overflow-x-hidden');
+    expect(markdown).toContain('whitespace-pre-wrap break-words [overflow-wrap:anywhere]');
+    expect(markdown).not.toContain('border border-border-subtle overflow-x-auto">\n            {children}');
+  });
+});
+
+describe('lead progress and runtime feedback', () => {
+  const chat = source('components/chat/ChatPanel.tsx');
+  const input = source('components/chat/InputBar.tsx');
+  const presentation = source('lib/conversation-presentation.ts');
+
+  it('keeps the previewed expandable process-update design for lead progress', () => {
+    expect(presentation).toContain('Repeated lead-agent progress is summarized in one expandable row');
+    expect(presentation).toContain("kind: 'process_group'");
+    expect(chat).toContain("id: 'live_lead_progress'");
+    expect(chat).toContain("import { ProcessUpdateGroup }");
+    expect(chat).toContain('<ProcessUpdateGroup');
+    expect(chat).toContain('isFirstVisibleAssistantTextInTurn');
+    expect(presentation).toContain('hidden progress text cannot consume the one avatar');
+  });
+
+  it('keeps the Agent roster in a clean popover and runtime detail in the side panel', () => {
+    const activity = source('components/activity/ActivityPanel.tsx');
+    const agentPanel = source('components/agents/AgentPanel.tsx');
+    expect(chat).toContain('data-testid="agent-roster-popover"');
+    expect(chat).toContain('<AgentPanel onOpenProcess={openAgentProcess} />');
+    expect(agentPanel).toContain('data-testid="agent-background-summary"');
+    expect(agentPanel).toContain('onClick={() => onOpenProcess?.(agent.id)}');
+    expect(chat).not.toContain('data-testid="background-agent-banner"');
+    expect(input).not.toContain('data-testid="ongoing-background-work-notice"');
+    expect(activity).toContain('const RUNTIME_STALL_WARNING_MS = 120_000;');
+    expect(activity).toContain("t('input.lastActivity').replace('{time}', lastActivity)");
+    expect(activity).toContain("t('input.backgroundWorkStalled')");
+  });
+
+  it('preserves the visible conversation anchor while the process panel changes width', () => {
+    expect(chat).toContain('captureConversationViewport(container)');
+    expect(chat).toContain('restoreConversationViewport(container, snapshot)');
+    expect(chat).toContain('runWithPreservedViewport');
+  });
+});
+
+describe('chat avatar proportion', () => {
+  const chat = source('components/chat/ChatPanel.tsx');
+  const bubble = source('components/chat/MessageBubble.tsx');
+  const processUpdates = source('components/chat/ProcessUpdateGroup.tsx');
+
+  it('keeps both participants at 60px and aligns avatar-free rows to the same gutter', () => {
+    expect(bubble).toContain('<UserAvatar size="w-[60px] h-[60px] text-lg"');
+    expect(bubble).toContain('<AiAvatar size="w-[60px] h-[60px]"');
+    expect(bubble).toContain('<div className="w-[60px] flex-shrink-0" />');
+    expect(chat).toContain('<UserAvatar size="w-[60px] h-[60px] text-lg"');
+    expect(processUpdates).toContain('ml-[72px] mr-[72px]');
   });
 });
 

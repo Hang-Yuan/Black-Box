@@ -1,4 +1,5 @@
 const INBOX_DIRECTIVE = '::inbox-item{';
+const ATTENTION_DIRECTIVE = '::automation-needs-attention{';
 const FAILURE_DIRECTIVE = '::automation-failed{';
 
 /**
@@ -7,7 +8,7 @@ const FAILURE_DIRECTIVE = '::automation-failed{';
  * literal example in the middle of an answer remains visible.
  */
 export function stripFinalInboxDirective(output: string): string {
-  const markers = [INBOX_DIRECTIVE, FAILURE_DIRECTIVE];
+  const markers = [INBOX_DIRECTIVE, ATTENTION_DIRECTIVE, FAILURE_DIRECTIVE];
   const candidates = markers.map((marker) => {
     const lineMarker = output.lastIndexOf(`\n${marker}`);
     return lineMarker >= 0 ? lineMarker + 1 : output.startsWith(marker) ? 0 : -1;
@@ -16,6 +17,8 @@ export function stripFinalInboxDirective(output: string): string {
   if (start < 0) return output;
 
   const suffix = output.slice(start).trim();
-  if (!markers.some((marker) => suffix.startsWith(marker)) || !suffix.endsWith('}')) return output;
+  if (!markers.some((marker) => suffix.startsWith(marker))
+    || !suffix.endsWith('}')
+    || suffix.split(/\r?\n/).length !== 1) return output;
   return output.slice(0, start).trimEnd();
 }

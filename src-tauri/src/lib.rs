@@ -44,6 +44,11 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -51,6 +56,77 @@ use tokio::sync::Mutex as TokioMutex;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+
+/// A dedicated monochrome alpha mask for the macOS menu bar. The application
+/// icon has an opaque square background, so using it as a template image makes
+/// macOS faithfully render that entire background as a white square.
+#[cfg(target_os = "macos")]
+fn menu_bar_template_icon() -> tauri::image::Image<'static> {
+    const SIZE: u32 = 36;
+    const SAMPLES: u32 = 4;
+    const HALF_STROKE: f32 = 1.55;
+    let segments = [
+        ((8.0_f32, 6.5_f32), (28.0_f32, 6.5_f32)),
+        ((28.0_f32, 7.0_f32), (8.0_f32, 29.0_f32)),
+        ((8.0_f32, 29.5_f32), (28.0_f32, 29.5_f32)),
+        ((8.0_f32, 7.0_f32), (28.0_f32, 29.0_f32)),
+    ];
+    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
+
+    let distance_to_segment = |px: f32, py: f32, start: (f32, f32), end: (f32, f32)| {
+        let dx = end.0 - start.0;
+        let dy = end.1 - start.1;
+        let length_sq = dx * dx + dy * dy;
+        let t = if length_sq > 0.0 {
+            (((px - start.0) * dx + (py - start.1) * dy) / length_sq).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let nearest_x = start.0 + t * dx;
+        let nearest_y = start.1 + t * dy;
+        ((px - nearest_x).powi(2) + (py - nearest_y).powi(2)).sqrt()
+    };
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let mut covered = 0_u32;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
+                    if segments.iter().any(|(start, end)| {
+                        distance_to_segment(px, py, *start, *end) <= HALF_STROKE
+                    }) {
+                        covered += 1;
+                    }
+                }
+            }
+            let index = ((y * SIZE + x) * 4) as usize;
+            rgba[index + 3] = ((covered * 255) / (SAMPLES * SAMPLES)) as u8;
+        }
+    }
+
+    tauri::image::Image::new_owned(rgba, SIZE, SIZE)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod menu_bar_icon_tests {
+    use super::menu_bar_template_icon;
+
+    #[test]
+    fn template_icon_keeps_the_background_transparent() {
+        let icon = menu_bar_template_icon();
+        let alpha = icon
+            .rgba()
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .collect::<Vec<_>>();
+        assert_eq!((icon.width(), icon.height()), (36, 36));
+        assert_eq!(alpha[0], 0);
+        assert!(alpha.iter().any(|value| *value == 255));
+        assert!(alpha.iter().filter(|value| **value == 0).count() > alpha.len() / 2);
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn claude_needs_cmd_wrapper(bin: &str) -> bool {
@@ -122,6 +198,52 @@ struct CliMaintenanceState {
 
 static CLI_UPDATE_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static CLI_UPDATE_DOWNLOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLI_UPDATE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLI_UPDATE_PERCENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLI_UPDATE_PHASE: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+
+fn set_cli_update_progress(downloaded: u64, total: u64, percent: u64, phase: &str) {
+    CLI_UPDATE_DOWNLOADED.store(downloaded, std::sync::atomic::Ordering::SeqCst);
+    CLI_UPDATE_TOTAL.store(total, std::sync::atomic::Ordering::SeqCst);
+    CLI_UPDATE_PERCENT.store(percent.min(100), std::sync::atomic::Ordering::SeqCst);
+    let phase_state = CLI_UPDATE_PHASE.get_or_init(|| std::sync::Mutex::new("idle".to_string()));
+    *phase_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = phase.to_string();
+}
+
+fn cli_update_progress_snapshot() -> (u64, u64, u64, String) {
+    let downloaded = CLI_UPDATE_DOWNLOADED.load(std::sync::atomic::Ordering::SeqCst);
+    let total = CLI_UPDATE_TOTAL.load(std::sync::atomic::Ordering::SeqCst);
+    let percent = CLI_UPDATE_PERCENT.load(std::sync::atomic::Ordering::SeqCst);
+    let phase = CLI_UPDATE_PHASE
+        .get_or_init(|| std::sync::Mutex::new("idle".to_string()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (downloaded, total, percent, phase)
+}
+
+fn emit_cli_update_progress(
+    app: &AppHandle,
+    downloaded: u64,
+    total: u64,
+    percent: u64,
+    phase: &str,
+) {
+    set_cli_update_progress(downloaded, total, percent, phase);
+    let _ = emit_to_frontend(
+        app,
+        "setup:download:progress",
+        serde_json::json!({
+            "downloaded": downloaded,
+            "total": total,
+            "percent": percent.min(100),
+            "phase": phase,
+        }),
+    );
+}
 
 pub(crate) fn cli_update_in_progress() -> bool {
     CLI_UPDATE_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst)
@@ -132,6 +254,7 @@ struct CliUpdateFlag;
 impl Drop for CliUpdateFlag {
     fn drop(&mut self) {
         CLI_UPDATE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        set_cli_update_progress(0, 0, 0, "idle");
     }
 }
 
@@ -1104,6 +1227,12 @@ struct ApiProvider {
 #[serde(rename_all = "camelCase")]
 struct ProvidersFile {
     version: u32,
+    #[serde(default)]
+    default_api: Option<String>,
+    #[serde(default)]
+    default_main_model: Option<String>,
+    #[serde(default)]
+    default_auxiliary_model: Option<String>,
     active_provider_id: Option<String>,
     providers: Vec<ApiProvider>,
 }
@@ -1138,6 +1267,9 @@ impl Default for ProvidersFile {
     fn default() -> Self {
         Self {
             version: 1,
+            default_api: None,
+            default_main_model: None,
+            default_auxiliary_model: None,
             active_provider_id: None,
             providers: vec![],
         }
@@ -1155,7 +1287,19 @@ pub(crate) fn read_providers_file() -> Result<ProvidersFile, String> {
     }
     let data =
         std::fs::read_to_string(&path).map_err(|e| format!("Cannot read providers: {}", e))?;
-    serde_json::from_str(&data).map_err(|e| format!("Cannot parse providers: {}", e))
+    let providers: ProvidersFile =
+        serde_json::from_str(&data).map_err(|e| format!("Cannot parse providers: {}", e))?;
+    Ok(normalize_provider_defaults(providers))
+}
+
+fn normalize_provider_defaults(mut providers: ProvidersFile) -> ProvidersFile {
+    if providers.default_api.as_deref() == Some("system") {
+        providers.default_api = None;
+    }
+    // v1-v3 did not have an explicit per-user default system configuration.
+    // Missing defaults intentionally remain unconfigured instead of guessing
+    // from the provider attached to whichever conversation happened to be open.
+    providers
 }
 
 fn credential_state_for(provider: &ApiProvider) -> &'static str {
@@ -1353,6 +1497,26 @@ fn save_providers(mut data: ProvidersFile) -> Result<ProvidersFile, String> {
         .map(|provider| (provider.id.clone(), provider))
         .collect();
 
+    if let Some(default_api) = data.default_api.as_deref() {
+        if !data
+            .providers
+            .iter()
+            .any(|provider| provider.id == default_api)
+        {
+            return Err(format!("Default API '{default_api}' does not exist"));
+        }
+    }
+    for (label, model) in [
+        ("main", data.default_main_model.as_deref()),
+        ("auxiliary", data.default_auxiliary_model.as_deref()),
+    ] {
+        if let Some(model) = model {
+            if !matches!(model, "fable" | "opus" | "sonnet" | "haiku") {
+                return Err(format!("Default {label} model tier '{model}' is invalid"));
+            }
+        }
+    }
+
     for provider in &mut data.providers {
         provider.auth_scheme = Some(resolve_provider_auth_scheme(provider)?);
         let previous = existing_by_id.get(&provider.id);
@@ -1391,7 +1555,20 @@ fn save_providers(mut data: ProvidersFile) -> Result<ProvidersFile, String> {
         provider.credential_state = credential_state_for(provider).to_string();
     }
 
-    data.version = 3;
+    if let Some(default_api) = data.default_api.as_deref() {
+        let default_provider = data
+            .providers
+            .iter()
+            .find(|provider| provider.id == default_api)
+            .ok_or_else(|| format!("Default API '{default_api}' does not exist"))?;
+        if legacy_provider_secret(default_provider).is_none() {
+            return Err(format!(
+                "Default API '{default_api}' does not have a saved credential"
+            ));
+        }
+    }
+
+    data.version = 4;
 
     write_providers_file(&path, &data)?;
     Ok(sanitized_providers(data))
@@ -1414,7 +1591,10 @@ fn clear_provider_credential(provider_id: String) -> Result<ProvidersFile, Strin
     provider.credential_state = "missing".to_string();
     provider.revision = provider.revision.max(1).saturating_add(1);
     provider.updated_at = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
-    data.version = 3;
+    if data.default_api.as_deref() == Some(provider_id.as_str()) {
+        data.default_api = None;
+    }
+    data.version = 4;
     write_providers_file(&path, &data)?;
     Ok(sanitized_providers(data))
 }
@@ -1431,7 +1611,10 @@ fn delete_provider(provider_id: String) -> Result<ProvidersFile, String> {
     if data.active_provider_id.as_deref() == Some(provider_id.as_str()) {
         data.active_provider_id = None;
     }
-    data.version = 3;
+    if data.default_api.as_deref() == Some(provider_id.as_str()) {
+        data.default_api = None;
+    }
+    data.version = 4;
     write_providers_file(&path, &data)?;
     Ok(sanitized_providers(data))
 }
@@ -2503,7 +2686,9 @@ mod provider_capability_tests {
 
 #[cfg(test)]
 mod local_provider_credential_tests {
-    use super::{sanitized_providers, write_providers_file, ProvidersFile};
+    use super::{
+        normalize_provider_defaults, sanitized_providers, write_providers_file, ProvidersFile,
+    };
 
     fn legacy_fixture() -> ProvidersFile {
         serde_json::from_value(serde_json::json!({
@@ -2521,6 +2706,23 @@ mod local_provider_credential_tests {
             }]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_provider_files_do_not_guess_system_defaults_from_the_active_conversation() {
+        let fixture = legacy_fixture();
+        assert_eq!(fixture.active_provider_id.as_deref(), Some("relay"));
+        assert!(fixture.default_api.is_none());
+        assert!(fixture.default_main_model.is_none());
+        assert!(fixture.default_auxiliary_model.is_none());
+    }
+
+    #[test]
+    fn retired_system_login_defaults_load_as_unconfigured() {
+        let mut fixture = legacy_fixture();
+        fixture.default_api = Some("system".to_string());
+        let normalized = normalize_provider_defaults(fixture);
+        assert!(normalized.default_api.is_none());
     }
 
     #[test]
@@ -4642,14 +4844,30 @@ async fn list_active_processes(state: State<'_, ProcessManager>) -> Result<Vec<S
 struct CliUpdateBlockers {
     active_session_ids: Vec<String>,
     running_automation: bool,
+    maintenance_in_progress: bool,
+    maintenance_downloaded: u64,
+    maintenance_total: u64,
+    maintenance_percent: u64,
+    maintenance_phase: String,
 }
 
 async fn cli_update_blockers_inner(
     processes: &ProcessManager,
 ) -> Result<CliUpdateBlockers, String> {
+    let (
+        maintenance_downloaded,
+        maintenance_total,
+        maintenance_percent,
+        maintenance_phase,
+    ) = cli_update_progress_snapshot();
     Ok(CliUpdateBlockers {
         active_session_ids: processes.active_ids().await,
         running_automation: automations::has_running_automation()?,
+        maintenance_in_progress: cli_update_in_progress(),
+        maintenance_downloaded,
+        maintenance_total,
+        maintenance_percent,
+        maintenance_phase,
     })
 }
 
@@ -8926,10 +9144,10 @@ fn cli_lifecycle_for(path: Option<String>, version: Option<String>) -> CliLifecy
     let (release_channel, auto_updates, can_update_in_app, update_command, note) = match method {
         CliInstallMethod::Native => (
             Some(native_release_channel()),
-            true,
+            false,
             true,
             Some("claude update".to_string()),
-            "Official native installation; Claude manages updates for the selected channel."
+            "Official native installation; Black Box disables background checks and owns visible manual updates for the selected channel."
                 .to_string(),
         ),
         CliInstallMethod::AppLocalNative => (
@@ -10111,6 +10329,199 @@ async fn update_app_local_cli(app: AppHandle) -> Result<String, String> {
     Err(last_err)
 }
 
+fn cli_owner_update_result(output: std::process::Output) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    let message = format!("{}\n{}", stdout.trim(), stderr.trim())
+        .trim()
+        .chars()
+        .take(1000)
+        .collect::<String>();
+    Err(if message.is_empty() {
+        format!("Update command exited with {:?}", output.status.code())
+    } else {
+        message
+    })
+}
+
+fn native_owner_update_percent(downloaded: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let fraction = (downloaded.min(total) as f64) / (total as f64);
+    (10.0 + fraction * 80.0).round().clamp(10.0, 90.0) as u64
+}
+
+fn native_owner_staging_bytes(version: &str, pid: u32) -> Option<u64> {
+    let staging_root = dirs::home_dir()?
+        .join(".cache")
+        .join("claude")
+        .join("staging");
+    let prefix = format!("{}.{pid}.", version.trim_start_matches('v'));
+    let entries = std::fs::read_dir(staging_root).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .filter_map(|entry| {
+            let plain = entry.path().join("claude");
+            let windows = entry.path().join("claude.exe");
+            std::fs::metadata(&plain)
+                .or_else(|_| std::fs::metadata(&windows))
+                .ok()
+                .map(|metadata| metadata.len())
+        })
+        .max()
+}
+
+async fn native_owner_release_size(version: &str) -> Option<u64> {
+    let version = version.trim_start_matches('v');
+    if version.is_empty() {
+        return None;
+    }
+    let url = format!(
+        "{}/{}/{}/{}",
+        CLI_GCS_BASE,
+        version,
+        native_platform_key(),
+        if cfg!(target_os = "windows") {
+            "claude.exe"
+        } else {
+            "claude"
+        },
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .ok()?;
+    let response_length = |response: &reqwest::Response| {
+        let headers = response.headers();
+        headers
+            .get("x-goog-stored-content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                headers
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.rsplit('/').next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .or_else(|| response.content_length())
+            .filter(|length| *length > 1)
+    };
+
+    if let Ok(response) = client.head(&url).send().await {
+        if response.status().is_success() {
+            if let Some(length) = response_length(&response) {
+                return Some(length);
+            }
+        }
+    }
+
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .ok()?;
+    response.status().is_success().then(|| response_length(&response)).flatten()
+}
+
+#[cfg(test)]
+mod native_owner_update_progress_tests {
+    use super::native_owner_update_percent;
+
+    #[test]
+    fn maps_real_download_fraction_into_the_update_phase() {
+        assert_eq!(native_owner_update_percent(0, 294_720_528), 10);
+        assert_eq!(native_owner_update_percent(147_360_264, 294_720_528), 50);
+        assert_eq!(native_owner_update_percent(294_720_528, 294_720_528), 90);
+        assert_eq!(native_owner_update_percent(10, 0), 0);
+    }
+}
+
+async fn run_native_cli_owner_update(
+    app: &AppHandle,
+    program: &str,
+    expected_version: Option<&str>,
+) -> Result<(), String> {
+    let target_version = expected_version
+        .and_then(extract_semver)
+        .unwrap_or_default();
+    emit_cli_update_progress(app, 0, 0, 0, "native_manifest");
+    let total_bytes = native_owner_release_size(&target_version)
+        .await
+        .unwrap_or(0);
+
+    let enriched_path = build_enriched_path();
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new(program);
+    #[cfg(not(target_os = "windows"))]
+    let mut command = Command::new(program);
+    command
+        .arg("update")
+        .env("PATH", enriched_path)
+        .env(client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1")
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x08000000);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Cannot start update command: {error}"))?;
+    let pid = child.id().unwrap_or(0);
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(15 * 60));
+    tokio::pin!(deadline);
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut last_bytes = 0_u64;
+    let mut last_change = std::time::Instant::now();
+    let mut last_emitted: Option<(u64, &'static str)> = None;
+
+    loop {
+        tokio::select! {
+            result = &mut wait => {
+                let output = result.map_err(|error| format!("Cannot wait for update command: {error}"))?;
+                return cli_owner_update_result(output);
+            }
+            _ = &mut deadline => {
+                return Err("CLI update timed out after 15 minutes without completing; the existing CLI was kept".to_string());
+            }
+            _ = interval.tick() => {
+                let Some(downloaded) = native_owner_staging_bytes(&target_version, pid) else {
+                    if last_bytes > 0 && last_emitted != Some((95, "native_verify")) {
+                        emit_cli_update_progress(app, last_bytes, total_bytes, 95, "native_verify");
+                        last_emitted = Some((95, "native_verify"));
+                    }
+                    continue;
+                };
+                if downloaded > last_bytes {
+                    last_bytes = downloaded;
+                    last_change = std::time::Instant::now();
+                }
+                let percent = native_owner_update_percent(downloaded, total_bytes);
+                let phase = if last_change.elapsed() >= std::time::Duration::from_secs(30) {
+                    "native_stalled"
+                } else {
+                    "native_download"
+                };
+                if last_emitted != Some((percent, phase)) {
+                    emit_cli_update_progress(app, downloaded, total_bytes, percent, phase);
+                    last_emitted = Some((percent, phase));
+                }
+            }
+        }
+    }
+}
+
 async fn run_cli_owner_update(program: &str, arguments: &[&str]) -> Result<(), String> {
     let enriched_path = build_enriched_path();
     #[cfg(target_os = "windows")]
@@ -10146,21 +10557,7 @@ async fn run_cli_owner_update(program: &str, arguments: &[&str]) -> Result<(), S
     .await
     .map_err(|_| "CLI update timed out after 15 minutes".to_string())?
     .map_err(|error| format!("Cannot wait for update command: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
-    let message = format!("{}\n{}", stdout.trim(), stderr.trim())
-        .trim()
-        .chars()
-        .take(1000)
-        .collect::<String>();
-    Err(if message.is_empty() {
-        format!("Update command exited with {:?}", output.status.code())
-    } else {
-        message
-    })
+    cli_owner_update_result(output)
 }
 
 #[tauri::command]
@@ -10175,6 +10572,7 @@ async fn update_claude_cli(
         .try_write()
         .map_err(|_| "CLI_MAINTENANCE_BUSY".to_string())?;
     CLI_UPDATE_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+    set_cli_update_progress(0, 0, 0, "configuring");
     let _maintenance_lease = CliUpdateLease {
         _gate: maintenance_gate,
         _flag: CliUpdateFlag,
@@ -10199,16 +10597,14 @@ async fn update_claude_cli(
     let path = status
         .path
         .ok_or_else(|| "Claude CLI is not installed".to_string())?;
-    let _ = emit_to_frontend(
-        &app,
-        "setup:download:progress",
-        serde_json::json!({
-            "downloaded": 0, "total": 0, "percent": 20, "phase": "configuring"
-        }),
-    );
+    if lifecycle.install_method != CliInstallMethod::Native {
+        emit_cli_update_progress(&app, 0, 0, 20, "configuring");
+    }
 
     match lifecycle.install_method {
-        CliInstallMethod::Native => run_cli_owner_update(&path, &["update"]).await?,
+        CliInstallMethod::Native => {
+            run_native_cli_owner_update(&app, &path, expected_version.as_deref()).await?
+        }
         CliInstallMethod::HomebrewStable => {
             run_cli_owner_update("brew", &["upgrade", "--cask", "claude-code"]).await?
         }
@@ -10260,13 +10656,7 @@ async fn update_claude_cli(
         expected_version.as_deref(),
     )
     .await?;
-    let _ = emit_to_frontend(
-        &app,
-        "setup:download:progress",
-        serde_json::json!({
-            "downloaded": 0, "total": 0, "percent": 100, "phase": "complete"
-        }),
-    );
+    emit_cli_update_progress(&app, 0, 0, 100, "complete");
     Ok(version)
 }
 
@@ -11863,8 +12253,9 @@ async fn generate_session_title(
     let _provider_gateway_guard =
         route_provider_through_gateway(provider_id.as_deref(), &mut provider_env).await?;
 
-    // Resolve claude binary
-    let claude_bin = find_claude_binary().ok_or_else(|| "Claude CLI not found".to_string())?;
+    // Title generation is still an SDK turn. Keep it on the same selected,
+    // health-probed runtime as ordinary and scheduled conversations.
+    let claude_bin = resolve_claude_sdk_runtime()?.path;
 
     let enriched_path = build_enriched_path();
 
@@ -12155,40 +12546,12 @@ pub fn run() {
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                if CLOSE_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    return;
+                // The macOS red traffic-light hides only the window. Scheduled
+                // work, live conversations and background Agents stay resident.
+                // Cmd-Q / Quit follows the graceful process-settlement path.
+                if let Err(error) = window.hide() {
+                    eprintln!("[BLACKBOX] failed to hide main window: {error}");
                 }
-
-                // Native close is authoritative even if the WebView is stuck,
-                // but it must not SIGKILL live Claude children before their
-                // durable session tail is flushed.
-                let app = window.app_handle().clone();
-                let process_manager = window.state::<ProcessManager>().inner().clone();
-                let stdin_manager = window.state::<StdinManager>().inner().clone();
-                let bypass_modes = window.state::<BypassModeMap>().inner().clone();
-                let power_assertions =
-                    PowerAssertionState::clone(window.state::<PowerAssertionState>().inner());
-                tauri::async_runtime::spawn(async move {
-                    let failures = graceful_stop_all_sessions_inner(
-                        &process_manager,
-                        &stdin_manager,
-                        &bypass_modes,
-                    )
-                    .await;
-                    if !failures.is_empty() {
-                        eprintln!(
-                            "[BLACKBOX] native close kept application open because CLI exit was not confirmed: {:?}",
-                            failures
-                        );
-                        CLOSE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                        return;
-                    }
-                    if let Err(error) = power_assertions.release_all() {
-                        eprintln!("[BLACKBOX] failed to release power assertions: {error}");
-                    }
-                    eprintln!("[BLACKBOX] native close settled CLI sessions; exiting application");
-                    app.exit(0);
-                });
             }
         })
         .setup(|app| {
@@ -12202,6 +12565,57 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
                 }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let show = MenuItem::with_id(
+                    app,
+                    "blackbox-show",
+                    "Show Black Box",
+                    true,
+                    None::<&str>,
+                )?;
+                let quit = MenuItem::with_id(
+                    app,
+                    "blackbox-quit",
+                    "Quit Black Box",
+                    true,
+                    None::<&str>,
+                )?;
+                let menu = Menu::with_items(app, &[&show, &quit])?;
+                let mut tray = TrayIconBuilder::with_id("blackbox-menu-bar")
+                    .tooltip("Black Box")
+                    .icon_as_template(true)
+                    .show_menu_on_left_click(false)
+                    .menu(&menu)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "blackbox-show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "blackbox-quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if matches!(
+                            event,
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            }
+                        ) {
+                            if let Some(window) = tray.app_handle().get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    });
+                tray = tray.icon(menu_bar_template_icon());
+                tray.build(app)?;
             }
 
             // Acquire the default assertion before the WebView finishes
@@ -12474,6 +12888,7 @@ pub fn run() {
             commands::feedback::feedback_is_configured,
             automations::list_automations,
             automations::list_automation_activity_summaries,
+            automations::list_active_automation_sessions,
             automations::get_automation_preferences,
             automations::set_automation_worktree_retention_limit,
             automations::get_automation,
@@ -12481,6 +12896,7 @@ pub fn run() {
             automations::delete_automation,
             automations::set_automation_status,
             automations::run_automation_now,
+            automations::retry_automation_run,
             automations::cancel_automation_run,
             automations::list_automation_runs,
             automations::get_automation_worktree_review,
@@ -12504,9 +12920,9 @@ pub fn run() {
             }
             RunEvent::ExitRequested { api, code, .. } => {
                 // Cmd-Q / menu Quit does not necessarily emit a window close.
-                // Route it through the same confirmed EOF-first settlement as
-                // the red traffic-light button. A second ExitRequested caused
-                // by app.exit is allowed through while CLOSE_IN_PROGRESS=true.
+                // Explicit Quit is the only desktop path that settles live CLI
+                // sessions and stops local scheduling. A second ExitRequested
+                // caused by app.exit is allowed through while CLOSE_IN_PROGRESS=true.
                 if CLOSE_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
@@ -12518,6 +12934,13 @@ pub fn run() {
                 let power_assertions =
                     PowerAssertionState::clone(app.state::<PowerAssertionState>().inner());
                 tauri::async_runtime::spawn(async move {
+                    // Keep ownership of an in-flight installer until its bounded
+                    // update command reaches a terminal result. Exiting the Tokio
+                    // runtime first can orphan `claude update`, leaving a download
+                    // that the relaunched application cannot observe or cancel.
+                    while cli_update_in_progress() {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                     let failures = graceful_stop_all_sessions_inner(
                         &process_manager,
                         &stdin_manager,

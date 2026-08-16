@@ -6,7 +6,9 @@ import { useSessionStore, setOrphanDrainCallback } from '../stores/sessionStore'
 import {
   useAgentStore,
   resolveAgentId,
+  resolveAgentEventId,
   getAgentDepth,
+  appendCachedAgentActivity,
   upsertCachedAgent,
   updateCachedAgentPhase,
   settleCachedAgent,
@@ -15,7 +17,7 @@ import {
   resolveCachedTeamTask,
   updateCachedTeamTask,
 } from '../stores/agentStore';
-import type { TeamTask } from '../stores/agentStore';
+import type { AgentNode, TeamTask } from '../stores/agentStore';
 import { runtimeInventoryFromMessage, useCommandStore } from '../stores/commandStore';
 import { useFileStore } from '../stores/fileStore';
 import { useMcpStore } from '../stores/mcpStore';
@@ -31,6 +33,7 @@ import {
   shouldRetryContextDrop,
 } from '../lib/context-recovery';
 import {
+  isCliPlaceholder,
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from '../lib/presentation-sanitizer';
@@ -53,6 +56,14 @@ import {
 } from '../lib/sessionLifecycle';
 import { matchingSessionPermissionGrants } from '../lib/session-permission-grants';
 import { recordLoopToolReceipt } from '../stores/loopStore';
+import {
+  isForwardedSubagentEvent,
+  isFailedAgentTaskStatus,
+  messageTextContent,
+  parseAgentTaskNotification,
+  parseAsyncAgentLaunch,
+  type AsyncAgentLaunch,
+} from '../lib/agent-lifecycle';
 
 function syncNativeTaskPlan(tabId: string, tasks: Iterable<TeamTask>): void {
   const items = Array.from(tasks)
@@ -203,26 +214,6 @@ export function formatErrorForUser(raw: string): string {
   const match = ERROR_CATEGORIES.find((c) => c.pattern.test(raw));
   const friendly = match ? t(match.i18nKey) : t('error.genericFallback');
   return `${friendly}\n\n<details>\n<summary>${t('error.showDetails')}</summary>\n\n\`\`\`\n${raw}\n\`\`\`\n\n</details>`;
-}
-
-/** S18 (v3 §4.3): allowlist of CLI-internal placeholder result strings that
- *  must not leak into the user-visible conversation. The CLI emits these as
- *  default values for certain non-success result frames (e.g. when the model
- *  is told to reply with `No response requested.` after a tool-only turn).
- *  They are meaningful to the CLI's internal state machine but pure noise
- *  for the end user. */
-const CLI_INTERNAL_PLACEHOLDERS: readonly string[] = [
-  'No response requested.',
-  'No response requested',
-  '(no content)',
-  'No content',
-];
-
-function isCliPlaceholder(text: string | undefined | null): boolean {
-  if (!text) return false;
-  const trimmed = text.trim();
-  if (!trimmed) return true;
-  return CLI_INTERNAL_PLACEHOLDERS.some((p) => trimmed === p);
 }
 
 function shouldHoldPotentialContextDropGreeting(tabId: string, text: string): boolean {
@@ -624,6 +615,14 @@ function buildCommittedThinkingId(msgUuid: string | undefined) {
   return msgUuid ? `${msgUuid}__thinking_committed` : undefined;
 }
 
+function logicalAssistantMessageId(msg: any): string | undefined {
+  const sdkMessageId = typeof msg?.message?.id === 'string'
+    ? msg.message.id.trim()
+    : '';
+  if (sdkMessageId) return sdkMessageId;
+  return typeof msg?.uuid === 'string' && msg.uuid.trim() ? msg.uuid : undefined;
+}
+
 function resolveThinkingPersistence(
   msgUuid: string | undefined,
   content: any[],
@@ -702,6 +701,34 @@ function agentToolIdentity(block: any): {
     name: teammateName || subagentType || undefined,
     model: model || undefined,
     description,
+  };
+}
+
+function backgroundAgentNode(
+  launch: AsyncAgentLaunch,
+  agents: Map<string, AgentNode>,
+): AgentNode {
+  const id = resolveAgentEventId(launch.toolUseId, launch.taskId, agents)
+    ?? launch.toolUseId
+    ?? launch.taskId;
+  const existing = agents.get(id);
+  const toolUseIds = Array.from(new Set([
+    ...(existing?.toolUseIds ?? []),
+    ...(launch.toolUseId ? [launch.toolUseId] : []),
+  ]));
+  return {
+    id,
+    parentId: existing?.parentId ?? 'main',
+    description: launch.description ?? existing?.description ?? 'Background Agent',
+    phase: 'thinking',
+    startTime: existing?.startTime ?? Date.now(),
+    isMain: false,
+    kind: existing?.kind ?? 'subagent',
+    name: existing?.name,
+    model: launch.model ?? existing?.model,
+    taskId: launch.taskId,
+    toolUseIds,
+    background: true,
   };
 }
 
@@ -904,15 +931,18 @@ function commitThinkingBeforeAssistantText(params: {
     stdinId,
   } = params;
   if (!thinkingPersistence) return false;
-
-  const store = useChatStore.getState();
-  const tab = store.getTab(tabId);
-  if (!tab) return false;
   if (!shouldRenderThinkingForTab(tabId)) {
     clearLivePartialThinking(tabId, stdinId);
     return false;
   }
 
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  if (!tab) return false;
+
+  // Thinking and final text are two views of one logical SDK message. Keep
+  // thinking as its own compact, collapsed row, but give it a stable logical
+  // id so split/replayed wrappers update that row instead of duplicating it.
   const committedId = buildCommittedThinkingId(msgUuid) ?? thinkingPersistence.id;
   const legacyId = msgUuid ? `${msgUuid}_thinking` : undefined;
   const existingThinking = tab.messages.find((message) =>
@@ -973,6 +1003,7 @@ function resolveToolResultTargetMessageId(
 export const __streamThinkingTesting = {
   buildThinkingSnapshot,
   buildCommittedThinkingId,
+  logicalAssistantMessageId,
   resolveThinkingPersistence,
   mergeThinkingContent,
   shouldMaterializeThinkingSnapshot,
@@ -993,6 +1024,9 @@ export const __streamRetryTesting = {
 
 export const __streamAgentTeamsTesting = {
   agentToolIdentity,
+  backgroundAgentNode,
+  parseAsyncAgentLaunch,
+  parseAgentTaskNotification,
   sanitizeToolResultContent: sanitizeToolResultForDisplay,
 };
 
@@ -1277,21 +1311,44 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (!evt) break;
         const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
         const bgAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
+        const bgForwardedSubagentEvent = isForwardedSubagentEvent(msg);
         if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           const text = evt.delta.text || '';
           if (text) {
-            store.updatePartialMessage(tabId, text);
+            if (bgForwardedSubagentEvent) {
+              appendCachedAgentActivity(tabId, bgAgentId, {
+                kind: 'text',
+                content: text,
+                append: true,
+              });
+            } else {
+              store.updatePartialMessage(tabId, text);
+            }
             updateCachedAgentPhase(tabId, bgAgentId, 'writing');
           }
         } else if (evt.type === 'content_block_delta' && evt.delta?.type === 'thinking_delta') {
           // F1 (#57): background tabs must handle thinking_delta too,
           // otherwise thinking content is silently lost on tab switch.
           const thinking = evt.delta.thinking || '';
-          if (shouldRenderThinkingForTab(tabId)) {
+          if (bgForwardedSubagentEvent) {
+            updateCachedAgentPhase(tabId, bgAgentId, 'thinking');
+          } else if (shouldRenderThinkingForTab(tabId)) {
             appendLiveThinkingDelta(tabId, thinking, msg.__stdinId as string | undefined);
           } else if (msg.__stdinId) {
             streamController.clearThinking(msg.__stdinId as string);
           }
+        }
+        if (
+          bgForwardedSubagentEvent
+          && evt.type === 'content_block_start'
+          && evt.content_block?.type === 'tool_use'
+        ) {
+          appendCachedAgentActivity(tabId, bgAgentId, {
+            kind: 'tool',
+            content: evt.content_block.name || 'Tool',
+            toolName: evt.content_block.name,
+          });
+          updateCachedAgentPhase(tabId, bgAgentId, 'tool', evt.content_block.name);
         }
         if (evt.type === 'content_block_start'
             && evt.content_block?.type === 'tool_use'
@@ -1314,6 +1371,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (evt.type === 'content_block_start'
             && evt.content_block?.type === 'tool_use'
             && evt.content_block?.name === 'ExitPlanMode'
+            && !bgForwardedSubagentEvent
             && getEffectiveMode(store.getTab(tabId)?.sessionMeta) === 'plan') {
           const bgTab = store.getTab(tabId);
           const bgExisting = bgTab?.messages.find((m) => m.id === 'plan_review_current');
@@ -1361,6 +1419,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         completePendingCommand(tabId);
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
+        const bgAssistantMessageId = logicalAssistantMessageId(msg);
         // Selectively clear partial in tab — only wipe partialText if a text
         // block is present (which supersedes streaming text). Otherwise, preserve
         // it to avoid intermediate thinking-only messages destroying streaming text.
@@ -1377,12 +1436,53 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         const bgAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
         const bgAgentDepth = getAgentDepth(bgAgentId, bgAgents);
         const bgStdinId = msg.__stdinId as string | undefined;
+        if (isForwardedSubagentEvent(msg)) {
+          for (const block of content) {
+            if (block.type === 'text' && typeof block.text === 'string') {
+              const safeText = sanitizeAssistantTextForDisplay(block.text).trim();
+              if (safeText) {
+                appendCachedAgentActivity(tabId, bgAgentId, {
+                  kind: 'text',
+                  content: safeText,
+                });
+                updateCachedAgentPhase(tabId, bgAgentId, 'writing');
+              }
+            } else if (block.type === 'tool_use') {
+              appendCachedAgentActivity(tabId, bgAgentId, {
+                kind: 'tool',
+                content: block.name || 'Tool',
+                toolName: block.name,
+              });
+              if (block.name === 'Agent' || block.name === 'Task') {
+                const identity = agentToolIdentity(block);
+                upsertCachedAgent(tabId, {
+                  id: block.id || generateMessageId(),
+                  parentId: bgAgentId,
+                  description: identity.description,
+                  phase: 'spawning',
+                  startTime: Date.now(),
+                  isMain: false,
+                  kind: identity.kind,
+                  name: identity.name,
+                  model: identity.model,
+                });
+              } else {
+                updateCachedAgentPhase(tabId, bgAgentId, 'tool', block.name);
+              }
+            } else if (block.type === 'thinking') {
+              updateCachedAgentPhase(tabId, bgAgentId, 'thinking');
+            }
+          }
+          // Forwarded subagent frames are projected only into Agent activity.
+          // The lead conversation waits for the main agent's synthesis.
+          break;
+        }
         const bgBufferedThinking = bgStdinId
           ? streamController.peekBufferedThinking(bgStdinId)
           : undefined;
         const bgThinkingPersistence = bgShouldRenderThinking
           ? resolveThinkingPersistence(
-            msg.uuid,
+            bgAssistantMessageId,
             content,
             bgTab?.partialThinking,
             bgBufferedThinking,
@@ -1398,7 +1498,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         let bgThinkingMessageEmitted = bgHasTextBlock
           ? commitThinkingBeforeAssistantText({
             tabId,
-            msgUuid: msg.uuid,
+            msgUuid: bgAssistantMessageId,
             thinkingPersistence: bgThinkingPersistence,
             timestamp: Date.now(),
             stdinId: bgStdinId,
@@ -1417,16 +1517,20 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         for (let blockIdx = 0; blockIdx < content.length; blockIdx++) {
           const block = content[blockIdx];
           if (block.type === 'text') {
+            const displayText = sanitizeAssistantTextForDisplay(block.text);
             if (
               bgHasAskUserQuestion
               || isCliPlaceholder(block.text)
               || shouldHoldPotentialContextDropGreeting(tabId, block.text)
+              || !displayText.trim()
             ) continue;
-            const textId = msg.uuid ? `${msg.uuid}_text_${blockIdx}` : generateMessageId();
+            const textId = bgAssistantMessageId
+              ? `${bgAssistantMessageId}_text_${blockIdx}`
+              : generateMessageId();
             store.addMessage(tabId, {
               id: textId,
               role: 'assistant', type: 'text',
-              content: block.text, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
+              content: displayText, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
             });
             updateCachedAgentPhase(tabId, bgAgentId, 'writing');
           } else if (block.type === 'tool_use') {
@@ -1559,7 +1663,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             if (bgShouldMaterializeThinking && bgThinkingPersistence) {
               bgThinkingMessageEmitted = commitThinkingBeforeAssistantText({
                 tabId,
-                msgUuid: msg.uuid,
+                msgUuid: bgAssistantMessageId,
                 thinkingPersistence: bgThinkingPersistence,
                 timestamp: Date.now(),
                 stdinId: bgStdinId,
@@ -1570,7 +1674,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (bgShouldMaterializeThinking && bgThinkingPersistence && !bgThinkingMessageEmitted) {
           commitThinkingBeforeAssistantText({
             tabId,
-            msgUuid: msg.uuid,
+            msgUuid: bgAssistantMessageId,
             thinkingPersistence: bgThinkingPersistence,
             timestamp: Date.now(),
             stdinId: bgStdinId,
@@ -1580,6 +1684,36 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       }
       case 'user':
       case 'human': {
+        const bgLaunch = parseAsyncAgentLaunch(msg);
+        if (bgLaunch) {
+          const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          upsertCachedAgent(tabId, backgroundAgentNode(bgLaunch, bgAgents));
+        }
+        const bgNotification = parseAgentTaskNotification(messageTextContent(msg));
+        if (bgNotification) {
+          const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          const bgEventAgentId = resolveAgentEventId(
+            bgNotification.toolUseId,
+            bgNotification.taskId,
+            bgAgents,
+          );
+          if (bgEventAgentId) {
+            const safeResult = bgNotification.resultText
+              ? sanitizeAssistantTextForDisplay(bgNotification.resultText).trim()
+              : '';
+            if (safeResult) {
+              appendCachedAgentActivity(tabId, bgEventAgentId, {
+                kind: 'text',
+                content: safeResult,
+              });
+            }
+            settleCachedAgent(
+              tabId,
+              bgEventAgentId,
+              isFailedAgentTaskStatus(bgNotification.status),
+            );
+          }
+        }
         const userContent = msg.message?.content;
         if (Array.isArray(userContent)) {
           for (const block of userContent) {
@@ -1652,9 +1786,19 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       case 'result': {
         if (msg.parent_tool_use_id) {
           const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          const bgResultAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
+          const safeResult = typeof msg.result === 'string'
+            ? sanitizeAssistantTextForDisplay(msg.result).trim()
+            : '';
+          if (safeResult && !isCliPlaceholder(safeResult)) {
+            appendCachedAgentActivity(tabId, bgResultAgentId, {
+              kind: 'text',
+              content: safeResult,
+            });
+          }
           settleCachedAgent(
             tabId,
-            resolveAgentId(msg.parent_tool_use_id, bgAgents),
+            bgResultAgentId,
             msg.subtype !== 'success',
           );
           break;
@@ -1694,7 +1838,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
         commitThinkingAtTurnBoundary({
           tabId,
-          msgUuid: msg.uuid,
+          msgUuid: logicalAssistantMessageId(msg),
           timestamp: Date.now(),
           stdinId: bgResultStdinId,
         });
@@ -1771,6 +1915,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           tabId,
           msg.subtype !== 'success',
           msg.subtype === 'success' && useSettingsStore.getState().agentTeamsEnabled,
+          msg.subtype === 'success',
         );
         {
           const bgTab = store.getTab(tabId);
@@ -2004,26 +2149,36 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           recordApiRetry(tabId, msg);
         } else if (msg.subtype === 'task_started') {
           const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
-          const cachedAgent = toolUseId
-            ? useAgentStore.getState().agentCache.get(tabId)?.get(toolUseId)
-            : undefined;
-          if (toolUseId && cachedAgent) {
+          const taskId = typeof msg.task_id === 'string' ? msg.task_id : undefined;
+          const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          const bgEventAgentId = resolveAgentEventId(toolUseId, taskId, bgAgents);
+          if (bgEventAgentId) {
+            const existingToolUseIds = bgAgents.get(bgEventAgentId)?.toolUseIds ?? [];
             upsertCachedAgent(tabId, {
-              id: toolUseId,
-              taskId: typeof msg.task_id === 'string' ? msg.task_id : undefined,
+              id: bgEventAgentId,
+              taskId,
+              toolUseIds: Array.from(new Set([
+                ...existingToolUseIds,
+                ...(toolUseId ? [toolUseId] : []),
+              ])),
+              background: true,
               phase: 'thinking',
             });
           }
         } else if (msg.subtype === 'task_progress') {
-          if (typeof msg.tool_use_id === 'string') {
-            updateCachedAgentPhase(tabId, msg.tool_use_id, 'thinking');
+          const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          const bgEventAgentId = resolveAgentEventId(msg.tool_use_id, msg.task_id, bgAgents);
+          if (bgEventAgentId) {
+            upsertCachedAgent(tabId, { id: bgEventAgentId, phase: 'thinking', background: true });
           }
         } else if (msg.subtype === 'task_notification') {
-          if (typeof msg.tool_use_id === 'string') {
+          const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+          const bgEventAgentId = resolveAgentEventId(msg.tool_use_id, msg.task_id, bgAgents);
+          if (bgEventAgentId) {
             settleCachedAgent(
               tabId,
-              msg.tool_use_id,
-              String(msg.status || '').toLowerCase() === 'failed',
+              bgEventAgentId,
+              isFailedAgentTaskStatus(msg.status),
             );
           }
         }
@@ -2033,11 +2188,25 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           if (msg.delta?.type === 'text_delta') {
             const text = msg.delta?.text || '';
             if (text) {
-              store.updatePartialMessage(tabId, text);
+              const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+              const bgAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
+              if (isForwardedSubagentEvent(msg)) {
+                appendCachedAgentActivity(tabId, bgAgentId, {
+                  kind: 'text',
+                  content: text,
+                  append: true,
+                });
+              } else {
+                store.updatePartialMessage(tabId, text);
+              }
             }
           } else if (msg.delta?.type === 'thinking_delta') {
             const thinking = msg.delta?.thinking || '';
-            if (thinking && shouldRenderThinkingForTab(tabId)) {
+            if (thinking && isForwardedSubagentEvent(msg)) {
+              const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+              const bgAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
+              updateCachedAgentPhase(tabId, bgAgentId, 'thinking');
+            } else if (thinking && shouldRenderThinkingForTab(tabId)) {
               appendLiveThinkingDelta(tabId, thinking, msg.__stdinId as string | undefined);
             } else if (thinking && msg.__stdinId) {
               streamController.clearThinking(msg.__stdinId as string);
@@ -2308,6 +2477,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       case 'stream_event': {
         const evt = msg.event;
         if (!evt) break;
+        const forwardedSubagentEvent = isForwardedSubagentEvent(msg);
 
         // Diagnostic: log tool_use starts for debugging plan mode flow
         if (evt.type === 'content_block_start' && evt.content_block?.type === 'tool_use') {
@@ -2323,7 +2493,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           // Skip ExitPlanMode (handled by plan_review path) and Task/Agent/
           // TaskCreate/SendMessage (handled by agent registration below).
           const toolName = evt.content_block.name;
-          if (shouldCreateStreamingToolPlaceholder(toolName)) {
+          if (!forwardedSubagentEvent && shouldCreateStreamingToolPlaceholder(toolName)) {
             setActivityStatus({ phase: 'tool', toolName });
             agentActions.updatePhase(agentId, 'tool', toolName);
             addMessage({
@@ -2342,13 +2512,23 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           const text = evt.delta.text || '';
           if (text && msgStdinId) {
-            streamController.appendText(msgStdinId, text);
+            if (forwardedSubagentEvent) {
+              agentActions.appendActivity(agentId, {
+                kind: 'text',
+                content: text,
+                append: true,
+              });
+            } else {
+              streamController.appendText(msgStdinId, text);
+            }
             agentActions.updatePhase(agentId, 'writing');
           }
         } else if (evt.type === 'content_block_delta' && evt.delta?.type === 'thinking_delta') {
           const thinkingText = evt.delta.thinking || '';
           if (thinkingText && msgStdinId) {
-            if (shouldRenderThinkingForTab(tabId)) {
+            if (forwardedSubagentEvent) {
+              agentActions.updatePhase(agentId, 'thinking');
+            } else if (shouldRenderThinkingForTab(tabId)) {
               streamController.appendThinking(msgStdinId, thinkingText);
               agentActions.updatePhase(agentId, 'thinking');
             } else {
@@ -2360,6 +2540,19 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             setActivityStatus({ phase: shouldRenderThinkingForTab(tabId) ? 'thinking' : 'writing' });
             agentActions.updatePhase(agentId, shouldRenderThinkingForTab(tabId) ? 'thinking' : 'writing');
           }
+        }
+
+        if (
+          forwardedSubagentEvent
+          && evt.type === 'content_block_start'
+          && evt.content_block?.type === 'tool_use'
+        ) {
+          agentActions.appendActivity(agentId, {
+            kind: 'tool',
+            content: evt.content_block.name || 'Tool',
+            toolName: evt.content_block.name,
+          });
+          agentActions.updatePhase(agentId, 'tool', evt.content_block.name);
         }
 
         // Early agent creation: register sub-agent as soon as Agent/Task tool_use
@@ -2386,6 +2579,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (evt.type === 'content_block_start'
             && evt.content_block?.type === 'tool_use'
             && evt.content_block?.name === 'ExitPlanMode'
+            && !forwardedSubagentEvent
             && getEffectiveMode(useChatStore.getState().getTab(tabId)?.sessionMeta) === 'plan') {
           const currentMessages = (useChatStore.getState().getTab(tabId)?.messages ?? []);
 
@@ -2467,23 +2661,45 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           recordApiRetry(tabId, msg);
         } else if (msg.subtype === 'task_started') {
           const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
-          if (toolUseId && useAgentStore.getState().agents.has(toolUseId)) {
+          const taskId = typeof msg.task_id === 'string' ? msg.task_id : undefined;
+          const eventAgentId = resolveAgentEventId(
+            toolUseId,
+            taskId,
+            useAgentStore.getState().agents,
+          );
+          if (eventAgentId) {
+            const currentAgent = useAgentStore.getState().agents.get(eventAgentId);
             agentActions.upsertAgent({
-              id: toolUseId,
-              taskId: typeof msg.task_id === 'string' ? msg.task_id : undefined,
+              id: eventAgentId,
+              taskId,
+              toolUseIds: Array.from(new Set([
+                ...(currentAgent?.toolUseIds ?? []),
+                ...(toolUseId ? [toolUseId] : []),
+              ])),
+              background: true,
               phase: 'thinking',
             });
           }
         } else if (msg.subtype === 'task_progress') {
-          const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
-          if (toolUseId) agentActions.updatePhase(toolUseId, 'thinking');
+          const eventAgentId = resolveAgentEventId(
+            msg.tool_use_id,
+            msg.task_id,
+            useAgentStore.getState().agents,
+          );
+          if (eventAgentId) {
+            agentActions.upsertAgent({ id: eventAgentId, phase: 'thinking', background: true });
+          }
         } else if (msg.subtype === 'task_notification') {
-          const toolUseId = typeof msg.tool_use_id === 'string' ? msg.tool_use_id : undefined;
-          if (toolUseId) {
-            if (String(msg.status || '').toLowerCase() === 'failed') {
-              agentActions.completeAgent(toolUseId, 'error');
+          const eventAgentId = resolveAgentEventId(
+            msg.tool_use_id,
+            msg.task_id,
+            useAgentStore.getState().agents,
+          );
+          if (eventAgentId) {
+            if (isFailedAgentTaskStatus(msg.status)) {
+              agentActions.completeAgent(eventAgentId, 'error');
             } else {
-              agentActions.setAgentIdle(toolUseId);
+              agentActions.setAgentIdle(eventAgentId);
             }
           }
         } else if (
@@ -2502,6 +2718,46 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       case 'assistant': {
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
+        const assistantMessageId = logicalAssistantMessageId(msg);
+        if (isForwardedSubagentEvent(msg)) {
+          for (const block of content) {
+            if (block.type === 'text' && typeof block.text === 'string') {
+              const safeText = sanitizeAssistantTextForDisplay(block.text).trim();
+              if (safeText) {
+                agentActions.appendActivity(agentId, {
+                  kind: 'text',
+                  content: safeText,
+                });
+                agentActions.updatePhase(agentId, 'writing');
+              }
+            } else if (block.type === 'tool_use') {
+              agentActions.appendActivity(agentId, {
+                kind: 'tool',
+                content: block.name || 'Tool',
+                toolName: block.name,
+              });
+              if (block.name === 'Task' || block.name === 'Agent') {
+                const identity = agentToolIdentity(block);
+                agentActions.upsertAgent({
+                  id: block.id || generateMessageId(),
+                  parentId: agentId,
+                  description: identity.description,
+                  phase: 'spawning',
+                  startTime: Date.now(),
+                  isMain: false,
+                  kind: identity.kind,
+                  name: identity.name,
+                  model: identity.model,
+                });
+              } else {
+                agentActions.updatePhase(agentId, 'tool', block.name);
+              }
+            } else if (block.type === 'thinking') {
+              agentActions.updatePhase(agentId, 'thinking');
+            }
+          }
+          break;
+        }
 
         // With --include-partial-messages, intermediate assistant messages arrive
         // frequently. We must NOT aggressively wipe streaming text state when the
@@ -2520,7 +2776,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           : undefined;
         const thinkingPersistence = shouldRenderThinking
           ? resolveThinkingPersistence(
-            msg.uuid,
+            assistantMessageId,
             content,
             currentTab?.partialThinking,
             bufferedThinking,
@@ -2536,7 +2792,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         const committedThinkingBeforeText = hasTextBlock
           ? commitThinkingBeforeAssistantText({
             tabId,
-            msgUuid: msg.uuid,
+            msgUuid: assistantMessageId,
             thinkingPersistence,
             timestamp: Date.now(),
             subAgentDepth: agentDepth,
@@ -2574,21 +2830,25 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         for (let blockIdx = 0; blockIdx < content.length; blockIdx++) {
           const block = content[blockIdx];
           if (block.type === 'text') {
+            const displayText = sanitizeAssistantTextForDisplay(block.text);
             if (
               hasAskUserQuestion
               || isCliPlaceholder(block.text)
               || shouldHoldPotentialContextDropGreeting(tabId, block.text)
+              || !displayText.trim()
             ) continue;
             setActivityStatus({ phase: 'writing' });
             agentActions.updatePhase(agentId, 'writing');
             // Use msg.uuid + block index as stable ID so re-delivered
             // messages de-duplicate correctly in the store.
-            const textId = msg.uuid ? `${msg.uuid}_text_${blockIdx}` : generateMessageId();
+            const textId = assistantMessageId
+              ? `${assistantMessageId}_text_${blockIdx}`
+              : generateMessageId();
             addMessage({
               id: textId,
               role: 'assistant',
               type: 'text',
-              content: block.text,
+              content: displayText,
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
             });
@@ -2767,7 +3027,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             if (shouldMaterializeThinking && thinkingPersistence) {
               thinkingMessageEmitted = commitThinkingBeforeAssistantText({
                 tabId,
-                msgUuid: msg.uuid,
+                msgUuid: assistantMessageId,
                 thinkingPersistence,
                 timestamp: Date.now(),
                 subAgentDepth: agentDepth,
@@ -2779,7 +3039,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (shouldMaterializeThinking && thinkingPersistence && !thinkingMessageEmitted) {
           commitThinkingBeforeAssistantText({
             tabId,
-            msgUuid: msg.uuid,
+            msgUuid: assistantMessageId,
             thinkingPersistence,
             timestamp: Date.now(),
             subAgentDepth: agentDepth,
@@ -2816,6 +3076,36 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           }
         }
 
+        const launch = parseAsyncAgentLaunch(msg);
+        if (launch) {
+          const currentAgents = useAgentStore.getState().agents;
+          agentActions.upsertAgent(backgroundAgentNode(launch, currentAgents));
+        }
+        const notification = parseAgentTaskNotification(messageTextContent(msg));
+        if (notification) {
+          const currentAgents = useAgentStore.getState().agents;
+          const eventAgentId = resolveAgentEventId(
+            notification.toolUseId,
+            notification.taskId,
+            currentAgents,
+          );
+          if (eventAgentId) {
+            const safeResult = notification.resultText
+              ? sanitizeAssistantTextForDisplay(notification.resultText).trim()
+              : '';
+            if (safeResult) {
+              agentActions.appendActivity(eventAgentId, {
+                kind: 'text',
+                content: safeResult,
+              });
+            }
+            if (isFailedAgentTaskStatus(notification.status)) {
+              agentActions.completeAgent(eventAgentId, 'error');
+            } else {
+              agentActions.setAgentIdle(eventAgentId);
+            }
+          }
+        }
         const userContent = msg.message?.content;
         if (Array.isArray(userContent)) {
           for (const block of userContent) {
@@ -2845,8 +3135,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             }
           }
         }
-        if (msg.tool_use_result) {
-          const tur = msg.tool_use_result;
+        if (msg.tool_use_result || msg.toolUseResult) {
+          const tur = msg.tool_use_result ?? msg.toolUseResult;
           const resultText = typeof tur === 'string' ? tur
             : typeof tur.stdout === 'string' ? tur.stdout
             : typeof tur.content === 'string' ? tur.content
@@ -2884,6 +3174,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           : typeof msg.content === 'string'
             ? msg.content
             : msg.output || '';
+
+        if (isForwardedSubagentEvent(msg)) {
+          agentActions.updatePhase(agentId, 'thinking');
+          break;
+        }
 
         const toolUseId = msg.tool_use_id;
         // Auto-refresh file tree when file-mutating tools complete
@@ -2972,6 +3267,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // call setSessionStatus('completed') and freeze the UI mid-run.
         if (msg.parent_tool_use_id) {
           const completedAgentId = resolveAgentId(msg.parent_tool_use_id, agentActions.agents);
+          const safeResult = typeof msg.result === 'string'
+            ? sanitizeAssistantTextForDisplay(msg.result).trim()
+            : '';
+          if (safeResult && !isCliPlaceholder(safeResult)) {
+            agentActions.appendActivity(completedAgentId, {
+              kind: 'text',
+              content: safeResult,
+            });
+          }
           if (msg.subtype === 'success') agentActions.setAgentIdle(completedAgentId);
           else agentActions.completeAgent(completedAgentId, 'error');
           break;
@@ -2999,7 +3303,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
         commitThinkingAtTurnBoundary({
           tabId,
-          msgUuid: msg.uuid,
+          msgUuid: logicalAssistantMessageId(msg),
           timestamp: Date.now(),
           subAgentDepth: agentDepth,
           stdinId: msgStdinId,
@@ -3289,6 +3593,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         agentActions.completeAll(
           msg.subtype === 'success' ? 'completed' : 'error',
           msg.subtype === 'success' && useSettingsStore.getState().agentTeamsEnabled,
+          msg.subtype === 'success',
         );
         useSessionStore.getState().fetchSessions();
         setTimeout(() => useSessionStore.getState().fetchSessions(), 1000);
@@ -3536,11 +3841,22 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           if (msg.delta?.type === 'text_delta') {
             const text = msg.delta?.text || '';
             if (text && msgStdinId) {
-              streamController.appendText(msgStdinId, text);
+              if (isForwardedSubagentEvent(msg)) {
+                agentActions.appendActivity(agentId, {
+                  kind: 'text',
+                  content: text,
+                  append: true,
+                });
+                agentActions.updatePhase(agentId, 'writing');
+              } else {
+                streamController.appendText(msgStdinId, text);
+              }
             }
           } else if (msg.delta?.type === 'thinking_delta') {
             const thinking = msg.delta?.thinking || '';
-            if (thinking && msgStdinId && shouldRenderThinkingForTab(tabId)) {
+            if (thinking && msgStdinId && isForwardedSubagentEvent(msg)) {
+              agentActions.updatePhase(agentId, 'thinking');
+            } else if (thinking && msgStdinId && shouldRenderThinkingForTab(tabId)) {
               streamController.appendThinking(msgStdinId, thinking);
             } else if (thinking && msgStdinId) {
               streamController.clearThinking(msgStdinId);

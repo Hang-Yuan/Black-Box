@@ -13,6 +13,10 @@ const protocol = readFileSync(
 );
 const bridge = readFileSync(resolve(__dirname, '../lib/tauri-bridge.ts'), 'utf8');
 const stream = readFileSync(resolve(__dirname, '../hooks/useStreamProcessor.ts'), 'utf8');
+const questionCard = readFileSync(
+  resolve(__dirname, '../components/chat/QuestionCard.tsx'),
+  'utf8',
+);
 
 describe('selected Claude CLI as the SDK runtime', () => {
   it('health-checks version and the stream-json control contract before selection', () => {
@@ -37,6 +41,14 @@ describe('selected Claude CLI as the SDK runtime', () => {
     expect(sessionStart).toContain('sdk_capabilities: sdk_runtime.capabilities');
   });
 
+  it('uses the selected SDK runtime for auxiliary conversation turns too', () => {
+    const titleStart = rust.indexOf('async fn generate_session_title(');
+    const titleEnd = rust.indexOf('\n#[tauri::command]\nasync fn open_terminal_login', titleStart);
+    const titleGeneration = rust.slice(titleStart, titleEnd);
+    expect(titleGeneration).toContain('let claude_bin = resolve_claude_sdk_runtime()?.path;');
+    expect(titleGeneration).not.toContain('find_claude_binary()');
+  });
+
   it('negotiates newer hook and subagent stream flags from the selected CLI', () => {
     expect(rust).toContain('sdk_runtime.capabilities.include_hook_events');
     expect(rust).toContain('args.push("--include-hook-events".to_string())');
@@ -52,6 +64,14 @@ describe('selected Claude CLI as the SDK runtime', () => {
     expect(rust).toContain('"type": "blackbox_control_request_cancelled"');
     expect(stream).toContain("case 'blackbox_control_request_cancelled'");
     expect(stream).toContain("interactionState: 'expired'");
+  });
+
+  it('releases a question card when the CLI control request never arrives', () => {
+    expect(questionCard).toContain('data-testid="ask-question-release-stuck"');
+    expect(questionCard).toContain('recoverStuckInteraction');
+    expect(questionCard).toContain('bridge.interruptSession(owner.stdinId)');
+    expect(questionCard).toContain("teardownSession(owner.stdinId, owner.tabId, 'stop')");
+    expect(questionCard).toContain('}, 15_000)');
   });
 
   it('uses canonical identity and a real health probe before deleting an environment', () => {

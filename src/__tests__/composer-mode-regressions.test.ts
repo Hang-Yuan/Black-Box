@@ -63,6 +63,15 @@ describe('single task composer modes', () => {
     expect(input).toContain("new CustomEvent('blackbox:loop-submit'");
   });
 
+  it('keeps the Goal header visibly live for the foreground Goal turn', () => {
+    expect(input).toContain('submittedViaGoal = true;');
+    expect(input).toContain('goalRequestActive: submittedViaGoal,');
+    expect(chat).toContain('sessionMeta.goalRequestActive === true && isSessionBusy(sessionStatus)');
+    expect(chat).toContain('running={goalRequestRunning}');
+    expect(goal).toContain('data-goal-live={running');
+    expect(goal).toContain("'bg-accent animate-pulse-soft'");
+  });
+
   it('offers the same activate action from every split-button menu', () => {
     expect(workflow).toContain('data-testid="workflow-activate-option"');
     expect(loop).toContain('data-testid="loop-activate-option"');

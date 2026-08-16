@@ -1,21 +1,22 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
-import { useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
+import { isSessionBusy, useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
 import { ToolGroup } from './ToolGroup';
+import { ProcessUpdateGroup } from './ProcessUpdateGroup';
 import { InputBar } from './InputBar';
 import { ExportMenu } from '../conversations/ExportMenu';
 import { useSettingsStore, mapSessionModeToPermissionMode } from '../../stores/settingsStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useFileStore } from '../../stores/fileStore';
-import { useAgentStore } from '../../stores/agentStore';
+import { isAgentActive, useAgentStore } from '../../stores/agentStore';
 import { AgentPanel } from '../agents/AgentPanel';
 // bridge import removed — spawn goes through sessionLifecycle module
 import { open } from '@tauri-apps/plugin-dialog';
 import { useT } from '../../lib/i18n';
 import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
 import { flushAndCaptureSpawnConfiguration, getResolvedModelDisplayName, is1MModel as isOneMillionModel, resolveModelOrError } from '../../lib/api-provider';
-import { useProviderStore } from '../../stores/providerStore';
+import { hasUsableProviderCredential, useProviderStore } from '../../stores/providerStore';
 import { spawnSession } from '../../lib/sessionLifecycle';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { SetupWizard } from '../setup/SetupWizard';
@@ -43,6 +44,15 @@ import { parseSessionMessages } from '../../lib/session-loader';
 import { useComposerModeStore } from '../../stores/composerModeStore';
 import type { TaskComposerMode } from '../../lib/composer-mode';
 import { useCommandStore } from '../../stores/commandStore';
+import { useAutomationSessionStore } from '../../stores/automationSessionStore';
+import {
+  buildConversationTurnKeys,
+  resolveComparisonAlignment,
+} from '../../lib/conversation-compare';
+import {
+  buildConversationDisplayItems,
+  isFirstVisibleAssistantTextInTurn,
+} from '../../lib/conversation-presentation';
 
 /** Shared plan panel toggle — used by ChatPanel (panel) and InputBar (button) */
 export const usePlanPanelStore = create<{
@@ -54,6 +64,72 @@ export const usePlanPanelStore = create<{
   toggle: () => set((s) => ({ open: !s.open })),
   close: () => set({ open: false }),
 }));
+
+function AutomationRunBanner() {
+  const t = useT();
+  const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
+  const active = useAutomationSessionStore((state) => (
+    selectedSessionId ? state.activeBySession.get(selectedSessionId) : undefined
+  ));
+  const transcriptSync = useAutomationSessionStore((state) => (
+    selectedSessionId ? state.transcriptSyncBySession.get(selectedSessionId) : undefined
+  ));
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const interval = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, [active?.runId]);
+
+  if (!active) return null;
+  const elapsed = formatElapsedCompact(now - active.startedAt);
+  const latestEvent = transcriptSync?.latestEventAt
+    ? new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).format(transcriptSync.latestEventAt)
+    : null;
+
+  return (
+    <div
+      data-testid="automation-session-banner"
+      data-automation-run-id={active.runId}
+      className="flex items-start gap-3 border-b border-warning/30 bg-warning/[0.08]
+        px-5 py-2.5 text-warning"
+      aria-live="polite"
+    >
+      <span className="relative mt-1 flex h-2.5 w-2.5 flex-shrink-0">
+        <span className="absolute inset-0 animate-ping rounded-full bg-warning/35" />
+        <span className="relative h-2.5 w-2.5 rounded-full bg-warning" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-semibold text-text-primary">
+          {t('automations.chatRunning')}
+        </div>
+        <div className="mt-0.5 text-[11px] text-text-muted">
+          {t('automations.chatRunningDetail')
+            .replace('{title}', active.title)
+            .replace('{elapsed}', elapsed)}
+        </div>
+        <div className="mt-0.5 text-[10px] leading-4 text-text-tertiary">
+          {latestEvent
+            ? t('automations.chatLatestEvent').replace('{time}', latestEvent)
+            : t('automations.chatWaitingEvent')}
+          {' · '}{t('automations.chatSendLocked')}
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => useSettingsStore.getState().setMainView('automations')}
+        className="flex-shrink-0 rounded-md px-2 py-1 text-[10px] font-medium
+          text-warning hover:bg-warning/10"
+      >
+        {t('automations.openCenter')}
+      </button>
+    </div>
+  );
+}
 
 function ForkBanner() {
   const t = useT();
@@ -123,7 +199,100 @@ function ForkBanner() {
   );
 }
 
-function ConversationComparePane() {
+function getVisibleConversationTurnKey(container: HTMLElement): string | undefined {
+  const containerRect = container.getBoundingClientRect();
+  const targetY = containerRect.top + Math.min(containerRect.height * 0.35, 240);
+  const anchors = Array.from(
+    container.querySelectorAll<HTMLElement>('[data-conversation-turn-key]'),
+  );
+  let firstVisible: string | undefined;
+  let closestBeforeTarget: string | undefined;
+
+  for (const anchor of anchors) {
+    const key = anchor.dataset.conversationTurnKey;
+    if (!key) continue;
+    const rect = anchor.getBoundingClientRect();
+    if (rect.bottom < containerRect.top || rect.top > containerRect.bottom) continue;
+    firstVisible ??= key;
+    if (rect.top <= targetY) closestBeforeTarget = key;
+    if (rect.top <= targetY && rect.bottom >= targetY) return key;
+  }
+
+  return closestBeforeTarget ?? firstVisible;
+}
+
+interface ConversationViewportSnapshot {
+  atBottom: boolean;
+  scrollTop: number;
+  anchorId?: string;
+  anchorOffset?: number;
+}
+
+function captureConversationViewport(container: HTMLElement): ConversationViewportSnapshot {
+  const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+  const containerRect = container.getBoundingClientRect();
+  const targetY = containerRect.top + Math.min(containerRect.height * 0.35, 240);
+  const anchors = Array.from(
+    container.querySelectorAll<HTMLElement>('[data-conversation-anchor-id]'),
+  );
+  const anchor = anchors.find((element) => {
+    const rect = element.getBoundingClientRect();
+    return rect.top <= targetY && rect.bottom >= targetY;
+  }) ?? anchors.find((element) => element.getBoundingClientRect().bottom >= containerRect.top);
+  return {
+    atBottom,
+    scrollTop: container.scrollTop,
+    anchorId: anchor?.dataset.conversationAnchorId,
+    anchorOffset: anchor
+      ? anchor.getBoundingClientRect().top - containerRect.top
+      : undefined,
+  };
+}
+
+function restoreConversationViewport(
+  container: HTMLElement,
+  snapshot: ConversationViewportSnapshot,
+): void {
+  if (snapshot.atBottom) {
+    container.scrollTop = container.scrollHeight;
+    return;
+  }
+  const anchor = snapshot.anchorId
+    ? Array.from(container.querySelectorAll<HTMLElement>('[data-conversation-anchor-id]'))
+      .find((element) => element.dataset.conversationAnchorId === snapshot.anchorId)
+    : undefined;
+  if (anchor && snapshot.anchorOffset !== undefined) {
+    const nextOffset = anchor.getBoundingClientRect().top - container.getBoundingClientRect().top;
+    container.scrollTop += nextOffset - snapshot.anchorOffset;
+    return;
+  }
+  container.scrollTop = snapshot.scrollTop;
+}
+
+function scrollComparisonToTurn(
+  container: HTMLElement,
+  turnKey: string,
+  placement: 'context' | 'bottom',
+) {
+  const candidates = Array.from(
+    container.querySelectorAll<HTMLElement>('[data-conversation-turn-key]'),
+  ).filter((node) => node.dataset.conversationTurnKey === turnKey);
+  const target = placement === 'bottom' ? candidates[candidates.length - 1] : candidates[0];
+  if (!target) {
+    container.scrollTop = container.scrollHeight;
+    return;
+  }
+
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const relativeTop = container.scrollTop + targetRect.top - containerRect.top;
+  const desiredTop = placement === 'bottom'
+    ? relativeTop + targetRect.height - container.clientHeight + 24
+    : relativeTop - Math.min(container.clientHeight * 0.2, 120);
+  container.scrollTop = Math.max(0, desiredTop);
+}
+
+function ConversationComparePane({ primaryMessages }: { primaryMessages: ChatMessage[] }) {
   const t = useT();
   const comparisonThreadId = useForkStore((state) => state.comparisonThreadId);
   const closeComparison = useForkStore((state) => state.closeComparison);
@@ -138,8 +307,18 @@ function ConversationComparePane() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [width, setWidth] = useState(460);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const alignedComparisonRef = useRef('');
   const widthRef = useRef(width);
   widthRef.current = width;
+  const primaryTurnKeys = useMemo(
+    () => buildConversationTurnKeys(primaryMessages),
+    [primaryMessages],
+  );
+  const comparisonTurnKeys = useMemo(
+    () => buildConversationTurnKeys(messages),
+    [messages],
+  );
 
   useEffect(() => {
     if (comparisonThreadId && comparisonThreadId === selectedSessionId) {
@@ -166,6 +345,51 @@ function ConversationComparePane() {
       });
     return () => { cancelled = true; };
   }, [comparisonThreadId, session?.path]);
+
+  useEffect(() => {
+    alignedComparisonRef.current = '';
+  }, [selectedSessionId, comparisonThreadId]);
+
+  useEffect(() => {
+    const comparisonScroll = scrollRef.current;
+    if (!selectedSessionId || !comparisonThreadId || loading || !comparisonScroll || messages.length === 0) {
+      return;
+    }
+    const alignmentId = `${selectedSessionId}:${comparisonThreadId}`;
+    if (alignedComparisonRef.current === alignmentId) return;
+
+    const frame = requestAnimationFrame(() => {
+      const primaryScroll = document.querySelector<HTMLElement>('[data-testid="chat-messages"]');
+      const visibleTurnKey = primaryScroll
+        ? getVisibleConversationTurnKey(primaryScroll)
+        : undefined;
+      const alignment = resolveComparisonAlignment(
+        visibleTurnKey,
+        primaryTurnKeys,
+        comparisonTurnKeys,
+      );
+
+      if (alignment.mode === 'bottom') {
+        comparisonScroll.scrollTop = comparisonScroll.scrollHeight;
+      } else {
+        scrollComparisonToTurn(
+          comparisonScroll,
+          alignment.turnKey,
+          alignment.mode === 'exact' ? 'context' : 'bottom',
+        );
+      }
+      alignedComparisonRef.current = alignmentId;
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [
+    comparisonThreadId,
+    comparisonTurnKeys,
+    loading,
+    messages.length,
+    primaryTurnKeys,
+    selectedSessionId,
+  ]);
 
   const startResize = useCallback((event: React.MouseEvent) => {
     event.preventDefault();
@@ -238,7 +462,7 @@ function ConversationComparePane() {
           </svg>
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
         {loading ? (
           <div className="py-8 text-center text-xs text-text-tertiary">{t('common.loading')}</div>
         ) : error ? (
@@ -249,8 +473,13 @@ function ConversationComparePane() {
           <div className="py-8 text-center text-xs text-text-tertiary">{t('conv.empty')}</div>
         ) : (
           <div className="mx-auto max-w-3xl space-y-4">
-            {messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
+            {messages.map((message, index) => (
+              <div
+                key={message.id}
+                data-conversation-turn-key={comparisonTurnKeys[index]}
+              >
+                <MessageBubble message={message} />
+              </div>
             ))}
           </div>
         )}
@@ -654,7 +883,6 @@ export function ChatPanel() {
   const secondaryPanelTab = useSettingsStore((s) => s.secondaryPanelTab);
   const setSecondaryTab = useSettingsStore((s) => s.setSecondaryTab);
   const agentPanelOpen = useSettingsStore((s) => s.agentPanelOpen);
-  const agentTeamsEnabled = useSettingsStore((s) => s.agentTeamsEnabled);
   const toggleAgentPanel = useSettingsStore((s) => s.toggleAgentPanel);
   const _selModel = useSettingsStore((s) => s.selectedModel);
   const _customModel = useSettingsStore((s) => s.customModelId);
@@ -679,27 +907,64 @@ export function ChatPanel() {
   const taskComposerMode = useComposerModeStore((state) => (
     selectedSessionId ? state.tabs[selectedSessionId]?.taskMode || null : null
   ));
+  const goalRequestRunning = sessionMeta.goalRequestActive === true && isSessionBusy(sessionStatus);
   const selectTaskComposerMode = useComposerModeStore((state) => state.selectTaskMode);
   const sessions = useSessionStore((s) => s.sessions);
   const isFilePreviewMode = !!useFileStore((s) => s.selectedFile);
 
-  // Agent activity for floating button badge
+  // The compact top control owns the roster popover. Detailed process output
+  // remains in the right-side Process panel.
   const agents = useAgentStore((s) => s.agents);
+  const agentList = useMemo(() => Array.from(agents.values()), [agents]);
   const activeAgentCount = useMemo(
-    () => Array.from(agents.values()).filter(
-      (a) => !['idle', 'completed', 'error'].includes(a.phase)
-    ).length,
-    [agents],
+    () => agentList.filter(isAgentActive).length,
+    [agentList],
   );
-  const totalAgentCount = agents.size;
+  const totalAgentCount = agentList.length;
+  const agentRuntimeActive = isSessionBusy(sessionStatus) || activeAgentCount > 0;
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const viewportSnapshotRef = useRef<ConversationViewportSnapshot | null>(null);
+
+  const captureViewportBeforeLayoutChange = useCallback(() => {
+    const container = scrollRef.current;
+    if (container) viewportSnapshotRef.current = captureConversationViewport(container);
+  }, []);
+
+  const restoreViewportAfterLayoutChange = useCallback(() => {
+    const snapshot = viewportSnapshotRef.current;
+    const container = scrollRef.current;
+    viewportSnapshotRef.current = null;
+    if (container && snapshot) restoreConversationViewport(container, snapshot);
+  }, []);
+
+  const runWithPreservedViewport = useCallback((change: () => void) => {
+    captureViewportBeforeLayoutChange();
+    change();
+    requestAnimationFrame(() => requestAnimationFrame(restoreViewportAfterLayoutChange));
+  }, [captureViewportBeforeLayoutChange, restoreViewportAfterLayoutChange]);
 
   const openSecondaryTab = useCallback((tab: 'activity' | 'files') => {
-    if (secondaryPanelOpen && secondaryPanelTab === tab) {
-      toggleSecondaryPanel();
-      return;
+    runWithPreservedViewport(() => {
+      if (secondaryPanelOpen && secondaryPanelTab === tab) {
+        toggleSecondaryPanel();
+        return;
+      }
+      setSecondaryTab(tab);
+    });
+  }, [runWithPreservedViewport, secondaryPanelOpen, secondaryPanelTab, setSecondaryTab, toggleSecondaryPanel]);
+
+  const openAgentProcess = useCallback((agentId: string) => {
+    if (agentPanelOpen) toggleAgentPanel();
+    if (!(secondaryPanelOpen && secondaryPanelTab === 'activity')) {
+      runWithPreservedViewport(() => setSecondaryTab('activity'));
     }
-    setSecondaryTab(tab);
-  }, [secondaryPanelOpen, secondaryPanelTab, setSecondaryTab, toggleSecondaryPanel]);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      window.dispatchEvent(new CustomEvent('blackbox:focus-agent-process', {
+        detail: { agentId },
+      }));
+    }));
+  }, [agentPanelOpen, runWithPreservedViewport, secondaryPanelOpen, secondaryPanelTab, setSecondaryTab, toggleAgentPanel]);
 
   const selectTaskMode = useCallback((mode: TaskComposerMode) => {
     if (!selectedSessionId) return;
@@ -722,6 +987,16 @@ export function ChatPanel() {
     }
   }), []);
 
+  useEffect(() => {
+    const capture = () => captureViewportBeforeLayoutChange();
+    const restore = () => restoreViewportAfterLayoutChange();
+    window.addEventListener('blackbox:chat-layout-will-change', capture);
+    window.addEventListener('blackbox:chat-layout-did-change', restore);
+    return () => {
+      window.removeEventListener('blackbox:chat-layout-will-change', capture);
+      window.removeEventListener('blackbox:chat-layout-did-change', restore);
+    };
+  }, [captureViewportBeforeLayoutChange, restoreViewportAfterLayoutChange]);
 
   // Listen for internal file tree drag-drop (mouse-based, not HTML5 drag-and-drop)
   // HTML5 drag events don't work in Tauri because dragDropEnabled: true intercepts them.
@@ -740,31 +1015,38 @@ export function ChatPanel() {
     return () => window.removeEventListener('blackbox:open-file', onOpenFile);
   }, []);
 
-  // --- Tool grouping: group 3+ consecutive tool_use messages ---
-  type DisplayItem =
-    | { kind: 'message'; msg: ChatMessage; idx: number }
-    | { kind: 'tool_group'; msgs: ChatMessage[]; startIdx: number };
-
-  const displayItems = useMemo<DisplayItem[]>(() => {
-    const items: DisplayItem[] = [];
-    let i = 0;
-    while (i < messages.length) {
-      // Detect runs of consecutive tool_use messages
-      if (messages[i].type === 'tool_use') {
-        let j = i;
-        while (j < messages.length && messages[j].type === 'tool_use') j++;
-        const runLength = j - i;
-        if (runLength >= 3) {
-          items.push({ kind: 'tool_group', msgs: messages.slice(i, j), startIdx: i });
-          i = j;
-          continue;
-        }
-      }
-      items.push({ kind: 'message', msg: messages[i], idx: i });
-      i++;
+  const displayItems = useMemo(
+    () => buildConversationDisplayItems(messages, sessionStatus),
+    [messages, sessionStatus],
+  );
+  const hasActiveProcessGroup = useMemo(
+    () => displayItems.some((item) => item.kind === 'process_group' && item.active),
+    [displayItems],
+  );
+  const hasPendingQuestion = useMemo(
+    () => messages.some(
+      (message) => message.type === 'question' && !message.resolved
+        && message.interactionState !== 'resolved' && message.interactionState !== 'sending',
+    ),
+    [messages],
+  );
+  const liveAssistantTextIsFirstInTurn = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === 'user') return true;
+      if (
+        message.role === 'assistant'
+        && message.type === 'text'
+        && (message.subAgentDepth ?? 0) === 0
+        && message.content.trim().length > 0
+      ) return false;
     }
-    return items;
+    return true;
   }, [messages]);
+  const conversationTurnKeys = useMemo(
+    () => buildConversationTurnKeys(messages),
+    [messages],
+  );
 
   // Collect plan review messages from the session (created by ExitPlanMode)
   const planMessages = useMemo(
@@ -777,7 +1059,6 @@ export function ChatPanel() {
     (s) => s.id === selectedSessionId
   )?.path;
 
-  const scrollRef = useRef<HTMLDivElement>(null);
   const find = useFindInPage(scrollRef);
   const thinkingPreRef = useRef<HTMLPreElement>(null);
   const isNearBottomRef = useRef(true);
@@ -910,24 +1191,28 @@ export function ChatPanel() {
 
         {/* Integrated controls: Agent Teams, Provider/API key, permission mode. */}
         <div className="relative ml-5 flex min-w-0 items-center gap-3">
-          {/* Agent status — clickable dot + label → opens AgentPanel */}
-          <button onClick={() => {
-            if (!agentPanelOpen) announceHeaderPopover('agent');
-            toggleAgentPanel();
-          }}
+          {/* Agent status — opens the compact roster. Process detail stays right. */}
+          <button
+            onClick={() => {
+              if (!agentPanelOpen) announceHeaderPopover('agent');
+              toggleAgentPanel();
+            }}
             data-testid="agent-panel-toggle"
+            aria-expanded={agentPanelOpen}
             className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded-md
               transition-smooth text-[9px]
-              ${agentPanelOpen ? 'bg-accent/10' : 'hover:bg-bg-secondary/50'}`}
+              ${agentPanelOpen
+                ? 'bg-accent/10'
+                : 'hover:bg-bg-secondary/50'}`}
             title={t('agents.toggle')}>
             <span className={`w-[6px] h-[6px] rounded-full flex-shrink-0 transition-smooth
-              ${activeAgentCount > 0
+              ${agentRuntimeActive
                 ? 'bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.5)] animate-pulse-soft'
                 : totalAgentCount > 0
                   ? 'bg-success'
                   : 'bg-text-tertiary/30'}`} />
-            <span className={`${activeAgentCount > 0 ? 'text-amber-400' : totalAgentCount > 0 ? 'text-success' : 'text-text-tertiary'}`}>
-              {agentTeamsEnabled ? 'Team' : 'Agent'}{totalAgentCount > 1 ? ` (${totalAgentCount})` : ''}
+            <span className={`${agentRuntimeActive ? 'text-amber-400' : totalAgentCount > 0 ? 'text-success' : 'text-text-tertiary'}`}>
+              Agent{totalAgentCount > 0 ? ` (${totalAgentCount})` : ''}
             </span>
           </button>
 
@@ -936,17 +1221,19 @@ export function ChatPanel() {
           {/* Current session mode — visible and switchable in place. */}
           <ModeSelector placement="down" compact />
 
-          {/* Floating agent panel popover — anchored to agent button */}
           {agentPanelOpen && (
             <>
               <div className="fixed inset-0 z-40" onClick={toggleAgentPanel} />
-              <div className="absolute left-0 top-full mt-2 z-50
-                w-72 max-h-80 rounded-lg border border-border-subtle
-                bg-bg-primary shadow-lg overflow-y-auto">
-                <AgentPanel />
+              <div
+                data-testid="agent-roster-popover"
+                className="absolute left-0 top-full z-50 mt-2 w-72 max-h-[min(72vh,34rem)]
+                  overflow-y-auto rounded-lg border border-border-subtle bg-bg-primary shadow-lg"
+              >
+                <AgentPanel onOpenProcess={openAgentProcess} />
               </div>
             </>
           )}
+
         </div>
 
         {/* Spacer + right-side actions */}
@@ -961,22 +1248,10 @@ export function ChatPanel() {
         />
         <GoalControl
           active={taskComposerMode === 'goal'}
+          running={goalRequestRunning}
           onSelect={() => selectTaskMode('goal')}
         />
         <TaskLocationControl />
-        <button onClick={() => openSecondaryTab('activity')}
-          data-testid="activity-panel-toggle"
-          className={`p-1.5 rounded-md text-text-tertiary transition-smooth
-            ${secondaryPanelOpen && secondaryPanelTab === 'activity' ? 'bg-accent/10 text-accent' : 'hover:bg-bg-tertiary'}`}
-          title={t('activity.toggle')}>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
-            stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
-            <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h11" />
-            <circle cx="6" cy="3.5" r="1.2" fill="currentColor" stroke="none" />
-            <circle cx="10.5" cy="8" r="1.2" fill="currentColor" stroke="none" />
-            <circle cx="5" cy="12.5" r="1.2" fill="currentColor" stroke="none" />
-          </svg>
-        </button>
         <ExportMenu sessionPath={currentSessionPath} />
         <button onClick={() => openSecondaryTab('files')}
           className={`p-1.5 rounded-md text-text-tertiary transition-smooth
@@ -991,6 +1266,7 @@ export function ChatPanel() {
       </div>
 
       <ForkBanner />
+      <AutomationRunBanner />
 
       <div className="flex flex-1 min-h-0 relative">
       {/* Main chat area */}
@@ -1010,11 +1286,11 @@ export function ChatPanel() {
           <div className="max-w-3xl mx-auto">
             {displayItems.map((item, displayIdx) => {
               // Determine spacing based on item type
-              const isCompact = item.kind === 'tool_group'
+              const isCompact = item.kind === 'tool_group' || item.kind === 'process_group'
                 || (item.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review'].includes(item.msg.type));
               const prevItem = displayIdx > 0 ? displayItems[displayIdx - 1] : null;
               const prevIsCompact = prevItem && (
-                prevItem.kind === 'tool_group'
+                prevItem.kind === 'tool_group' || prevItem.kind === 'process_group'
                 || (prevItem.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review'].includes(prevItem.msg.type))
               );
               const spacing = displayIdx === 0
@@ -1027,28 +1303,59 @@ export function ChatPanel() {
 
               if (item.kind === 'tool_group') {
                 return (
-                  <div key={`tg_${item.msgs[0].id}`} className={spacing}>
+                  <div
+                    key={`tg_${item.msgs[0].id}`}
+                    className={spacing}
+                    data-conversation-anchor-id={`tool-${item.msgs[0].id}`}
+                    data-conversation-turn-key={conversationTurnKeys[item.startIdx]}
+                  >
                     <ToolGroup messages={item.msgs} />
+                  </div>
+                );
+              }
+
+              if (item.kind === 'process_group') {
+                const liveMessage: ChatMessage | null = item.active
+                  && partialText
+                  && !hasPendingQuestion
+                  ? {
+                    id: 'live_lead_progress',
+                    role: 'assistant',
+                    type: 'text',
+                    content: partialText,
+                    timestamp: Date.now(),
+                  }
+                  : null;
+                return (
+                  <div
+                    key={`pg_${item.msgs[0].id}`}
+                    className={spacing}
+                    data-conversation-anchor-id={`process-${item.msgs[0].id}`}
+                    data-conversation-turn-key={conversationTurnKeys[item.startIdx]}
+                  >
+                    <ProcessUpdateGroup
+                      messages={liveMessage ? [...item.msgs, liveMessage] : item.msgs}
+                      active={item.active}
+                    />
                   </div>
                 );
               }
 
               const msg = item.msg;
               const idx = item.idx;
-              // Show avatar only for the FIRST assistant text in a turn.
-              let isFirstInGroup = true;
-              if (msg.role === 'assistant' && msg.type === 'text') {
-                for (let j = idx - 1; j >= 0; j--) {
-                  const prev = messages[j];
-                  if (prev.role === 'user') break;
-                  if (prev.role === 'assistant' && prev.type === 'text') {
-                    isFirstInGroup = false;
-                    break;
-                  }
-                }
-              }
+              // Process updates have no avatar, so grouping must follow the
+              // visible projection rather than hidden raw progress messages.
+              const isFirstInGroup = isFirstVisibleAssistantTextInTurn(
+                displayItems,
+                displayIdx,
+              );
               return (
-                <div key={msg.id} className={spacing}>
+                <div
+                  key={msg.id}
+                  className={spacing}
+                  data-conversation-anchor-id={`message-${msg.id}`}
+                  data-conversation-turn-key={conversationTurnKeys[idx]}
+                >
                   <MessageBubble message={msg} isFirstInGroup={isFirstInGroup} />
                 </div>
               );
@@ -1057,7 +1364,11 @@ export function ChatPanel() {
             {isStreaming && partialThinking && (() => {
               const hasVisiblePartialText = partialText.trim().length > 0;
               return (
-              <div className="ml-11 mr-11 mt-1">
+              <div
+                className="ml-[72px] mr-[72px] mt-1"
+                data-conversation-anchor-id="live-thinking"
+                data-conversation-turn-key={conversationTurnKeys[conversationTurnKeys.length - 1]}
+              >
                 <details
                   key={hasVisiblePartialText ? 'collapsed' : 'open'}
                   {...(!hasVisiblePartialText ? { open: true } : {})}
@@ -1089,35 +1400,25 @@ export function ChatPanel() {
               // content, but the user needs to answer the question first.
               // Check both resolved flag AND interactionState to handle edge
               // cases where setInteractionState hasn't propagated yet.
-              const hasPendingQuestion = messages.some(
-                (m) => m.type === 'question' && !m.resolved
-                  && m.interactionState !== 'resolved' && m.interactionState !== 'sending',
-              );
-              if (hasPendingQuestion) return null;
+              if (hasPendingQuestion || hasActiveProcessGroup) return null;
 
-              // Check if there's already an assistant text in this turn
-              let showStreamAvatar = true;
-              for (let j = messages.length - 1; j >= 0; j--) {
-                if (messages[j].role === 'user') break;
-                if (messages[j].role === 'assistant' && messages[j].type === 'text') {
-                  showStreamAvatar = false;
-                  break;
-                }
-              }
+              const partialMessage: ChatMessage = {
+                id: 'live_lead_progress',
+                role: 'assistant',
+                type: 'text',
+                content: partialText,
+                timestamp: Date.now(),
+              };
               return (
-              <div className="flex gap-3 mt-2">
-                {showStreamAvatar ? (
-                  <div className="w-8 h-8 rounded-[10px] bg-accent
-                    flex items-center justify-center flex-shrink-0 text-text-inverse
-                    text-xs font-bold shadow-md mt-0.5">C</div>
-                ) : (
-                  <div className="w-8 flex-shrink-0" />
-                )}
-                <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
-                  <MarkdownRenderer content={partialText} />
-                </div>
-                {/* Right gutter mirrors the avatar so streaming text aligns with the user bubble's right edge */}
-                <div className="w-8 flex-shrink-0" />
+              <div
+                className="mt-2"
+                data-conversation-anchor-id="live-text"
+                data-conversation-turn-key={conversationTurnKeys[conversationTurnKeys.length - 1]}
+              >
+                <MessageBubble
+                  message={partialMessage}
+                  isFirstInGroup={liveAssistantTextIsFirstInTurn}
+                />
               </div>
               );
             })()}
@@ -1141,7 +1442,7 @@ export function ChatPanel() {
                     {pending.kind === 'steer' ? t('chat.steerQueued') : t('chat.queued')}
                   </span>
                 </div>
-                <UserAvatar size="w-8 h-8 text-xs" className="mt-0.5 flex-shrink-0" />
+                <UserAvatar size="w-[60px] h-[60px] text-lg" className="mt-0.5 flex-shrink-0" />
               </div>
             ))}
             {/* Inline activity status indicator — like Claude Desktop App */}
@@ -1205,7 +1506,7 @@ export function ChatPanel() {
       {workingDirectory && !directoryMissing && <InputBar />}
       </div>{/* end main chat area */}
 
-      <ConversationComparePane />
+      <ConversationComparePane primaryMessages={messages} />
 
       {/* Right-side plan panel (resizable) */}
       {showPlanPanel && (
@@ -1240,6 +1541,28 @@ async function startDraftSession(folderPath: string) {
     draftId = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     useSessionStore.getState().addDraftSession(draftId, folderPath);
   }
+
+  const providerState = useProviderStore.getState();
+  if (!providerState.loaded) await providerState.load();
+  const defaults = useProviderStore.getState();
+  if (!defaults.defaultApi || !defaults.defaultMainModel || !defaults.defaultAuxiliaryModel) {
+    useSettingsStore.getState().openSettings('provider');
+    return;
+  }
+  const defaultProvider = defaults.providers.find(
+    (provider) => provider.id === defaults.defaultApi,
+  );
+  if (
+    !defaultProvider
+    || !hasUsableProviderCredential(defaultProvider)
+  ) {
+    useSettingsStore.getState().openSettings('provider');
+    return;
+  }
+  defaults.setActive(defaults.defaultApi);
+  useSettingsStore.getState().setSelectedModel(defaults.defaultMainModel);
+  useSettingsStore.getState().setAuxiliaryModel(defaults.defaultAuxiliaryModel);
+  useSettingsStore.getState().setCustomModelId(null);
 
   // Pre-warm: spawn CLI process in background so first message is fast.
   // Send empty prompt — Rust will skip the NDJSON send.

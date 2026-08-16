@@ -6,6 +6,7 @@ const CONFIG_OVERRIDE_ENV: &str = "BLACKBOX_CLAUDE_CONFIG_DIR";
 const ACTIVE_ENVIRONMENT_ENV: &str = "BLACKBOX_ACTIVE_CLAUDE_ENVIRONMENT";
 const MIGRATION_RECEIPT: &str = "claude-isolation-v1.json";
 const RUNTIME_ENVIRONMENT_FILE: &str = "claude-runtime-environment.json";
+pub(crate) const DISABLE_BACKGROUND_AUTOUPDATER_ENV: &str = "DISABLE_AUTOUPDATER";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +131,10 @@ pub(crate) fn claude_config_dir() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn apply_to_tokio_command(command: &mut tokio::process::Command) -> Result<(), String> {
+    // Black Box owns update visibility and process lifetime. Claude's supported
+    // switch disables only background checks; an explicit `claude update`
+    // remains available to the owner-aware maintenance path.
+    command.env(DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1");
     match active_environment()? {
         ClaudeRuntimeEnvironment::Isolated => {
             command.env("CLAUDE_CONFIG_DIR", private_claude_config_dir()?);
@@ -142,6 +147,7 @@ pub(crate) fn apply_to_tokio_command(command: &mut tokio::process::Command) -> R
 }
 
 pub(crate) fn apply_to_std_command(command: &mut std::process::Command) -> Result<(), String> {
+    command.env(DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1");
     match active_environment()? {
         ClaudeRuntimeEnvironment::Isolated => {
             command.env("CLAUDE_CONFIG_DIR", private_claude_config_dir()?);

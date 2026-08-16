@@ -6,25 +6,41 @@ import {
 } from '../automation-form';
 
 describe('scheduled-task form contract', () => {
-  it('prefills a new Cron task from the current project and conversation', () => {
-    const draft = createAutomationDraft('sonnet', '/tmp/project', 'thread-123', 42, 'relay', 7);
+  it('prefills project context while inheriting the user system defaults', () => {
+    const draft = createAutomationDraft('/tmp/project', 'thread-123', 42);
 
-    expect(draft.model).toBe('sonnet');
+    expect(draft.model).toBeNull();
+    expect(draft.auxiliary_model).toBeNull();
     expect(draft.agent_teams_enabled).toBe(false);
     expect(draft.data_write_subdirectories).toEqual([]);
     expect(draft.execution_environment).toBe('worktree');
     expect(draft.target).toEqual({ type: 'project', projectId: '/tmp/project' });
     expect(draft.cwds).toEqual(['/tmp/project']);
     expect(draft.target_thread_id).toBe('thread-123');
-    expect(draft.provider_id).toBe('relay');
-    expect(draft.provider_revision).toBe(7);
+    expect(draft).not.toHaveProperty('provider_id');
+    expect(draft).not.toHaveProperty('provider_revision');
     expect(draft.created_at).toBe(42);
     expect(draft.updated_at).toBe(42);
   });
 
+  it('strips legacy provider bindings when an old task is saved', () => {
+    const draft = {
+      ...createAutomationDraft('/tmp/project', null, 42),
+      name: 'Portable task',
+      prompt: 'Do the work',
+      provider_id: 'deleted-provider',
+      provider_revision: 99,
+    };
+
+    const definition = prepareAutomationDefinitionForSave(draft, 'FREQ=DAILY;BYHOUR=9');
+
+    expect(definition).not.toHaveProperty('provider_id');
+    expect(definition).not.toHaveProperty('provider_revision');
+  });
+
   it('forces Heartbeat onto the selected conversation local cwd', () => {
     const draft = {
-      ...createAutomationDraft('haiku', '/tmp/original', 'thread-456', 42),
+      ...createAutomationDraft('/tmp/original', 'thread-456', 42),
       kind: 'heartbeat' as const,
       name: 'Return to thread',
       prompt: 'Continue the review',
@@ -43,7 +59,7 @@ describe('scheduled-task form contract', () => {
 
   it('trims Cron project paths and clears a dormant Heartbeat target', () => {
     const draft = {
-      ...createAutomationDraft('sonnet', '  /tmp/project  ', 'thread-unused', 42),
+      ...createAutomationDraft('  /tmp/project  ', 'thread-unused', 42),
       name: 'Daily review',
       prompt: 'Review the project',
     };
@@ -56,7 +72,7 @@ describe('scheduled-task form contract', () => {
   });
 
   it('requires human fields plus the appropriate target before enabling save', () => {
-    const cron = createAutomationDraft('sonnet', '/tmp/project', null, 42);
+    const cron = createAutomationDraft('/tmp/project', null, 42);
     expect(isAutomationDraftComplete(cron)).toBe(false);
     expect(isAutomationDraftComplete({ ...cron, name: 'Task', prompt: 'Do it' })).toBe(true);
 

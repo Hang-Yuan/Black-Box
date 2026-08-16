@@ -217,10 +217,11 @@ function workflowStatus(workflow: WorkflowActivitySource): TaskActivityStatus {
 function automationStatus(automation: AutomationActivitySummary): TaskActivityStatus {
   const runStatus = automation.runStatus?.toUpperCase();
   if (automation.running || runStatus === 'RUNNING') return 'running';
-  if (runStatus === 'PENDING_REVIEW') return 'waiting_user';
+  if (runStatus === 'NEEDS_ATTENTION') return 'waiting_user';
   if (runStatus === 'FAILED') return 'failed';
   if (automation.definitionStatus.toUpperCase() === 'PAUSED') return 'paused';
-  if (runStatus === 'CANCELLED' || runStatus === 'ARCHIVED') return 'completed';
+  if (runStatus === 'SUCCEEDED' || runStatus === 'RECOVERED' || runStatus === 'PENDING_REVIEW'
+    || runStatus === 'CANCELLED' || runStatus === 'ARCHIVED') return 'completed';
   if (automation.nextRunAt !== null) return 'queued';
   return automation.lastRunAt !== null ? 'completed' : 'queued';
 }

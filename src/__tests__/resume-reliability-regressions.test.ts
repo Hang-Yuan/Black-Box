@@ -53,7 +53,7 @@ describe('durable resume reliability regressions', () => {
     expect(stream).not.toContain("completePendingCommand(tabId, { output: 'Compact timed out' })");
   });
 
-  it('flushes live CLI sessions before native app exit', () => {
+  it('hides on red close and flushes live CLI sessions only on explicit app exit', () => {
     const rust = read('../src-tauri/src/lib.rs');
     const capabilities = read('../src-tauri/capabilities/default.json');
     const app = read('App.tsx');
@@ -61,19 +61,16 @@ describe('durable resume reliability regressions', () => {
     expect(rust).toContain('futures_util::future::join_all(stops)');
     expect(rust).toContain('.filter_map(Result::err)');
     const windowClose = rust.indexOf('WindowEvent::CloseRequested');
-    const windowSettlement = rust.indexOf(
-      'let failures = graceful_stop_all_sessions_inner(',
-      windowClose,
-    );
-    expect(windowSettlement)
-      .toBeLessThan(rust.indexOf('app.exit(0);', windowClose));
+    const closePath = rust.slice(windowClose, rust.indexOf('.setup(|app|', windowClose));
     const quit = rust.indexOf('RunEvent::ExitRequested { api, code, .. }');
     const quitSettlement = rust.indexOf(
       'let failures = graceful_stop_all_sessions_inner(',
       quit,
     );
     expect(windowClose).toBeGreaterThan(-1);
-    expect(windowSettlement).toBeGreaterThan(windowClose);
+    expect(closePath).toContain('window.hide()');
+    expect(closePath).not.toContain('graceful_stop_all_sessions_inner');
+    expect(closePath).not.toContain('app.exit(0)');
     expect(quit).toBeGreaterThan(-1);
     expect(quitSettlement).toBeGreaterThan(quit);
     expect(quitSettlement).toBeLessThan(rust.indexOf('app.exit(code.unwrap_or(0));', quit));
@@ -175,7 +172,7 @@ describe('durable resume reliability regressions', () => {
 
   it('uses graceful process settlement for internal restart paths', () => {
     const source = read('lib/sessionLifecycle.ts');
-    expect(source).toContain("reason === 'stop' || reason === 'delete'");
+    expect(source).toContain("const stopProcess = reason === 'stop'");
     expect(source).toContain('bridge.gracefulStopSession(stdinId)');
   });
 

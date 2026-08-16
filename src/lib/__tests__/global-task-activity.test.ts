@@ -127,7 +127,7 @@ describe('global task activity', () => {
     expect(snapshot.automations[0]).not.toHaveProperty('cwds');
   });
 
-  it('prioritizes waiting user and failed automation run states over definition scheduling', () => {
+  it('keeps automation outcome status independent from unread result state', () => {
     const input = emptyInput();
     input.threads = [{
       threadId: 'thread-waiting',
@@ -138,9 +138,24 @@ describe('global task activity', () => {
     }];
     input.automations = [
       {
-        id: 'review', title: 'Review', definitionStatus: 'ACTIVE',
-        runStatus: 'PENDING_REVIEW', scheduleKind: 'cron', activeRunId: 'run-1',
+        id: 'attention', title: 'Attention', definitionStatus: 'ACTIVE',
+        runStatus: 'NEEDS_ATTENTION', scheduleKind: 'cron', activeRunId: 'run-1',
         running: false, unreadRuns: 1, nextRunAt: 30, lastRunAt: 20, updatedAt: 25,
+      },
+      {
+        id: 'succeeded', title: 'Succeeded', definitionStatus: 'ACTIVE',
+        runStatus: 'SUCCEEDED', scheduleKind: 'cron', activeRunId: null,
+        running: false, unreadRuns: 1, nextRunAt: 35, lastRunAt: 20, updatedAt: 24,
+      },
+      {
+        id: 'legacy', title: 'Legacy', definitionStatus: 'ACTIVE',
+        runStatus: 'PENDING_REVIEW', scheduleKind: 'cron', activeRunId: null,
+        running: false, unreadRuns: 1, nextRunAt: 36, lastRunAt: 20, updatedAt: 23,
+      },
+      {
+        id: 'recovered', title: 'Recovered', definitionStatus: 'ACTIVE',
+        runStatus: 'RECOVERED', scheduleKind: 'cron', activeRunId: null,
+        running: false, unreadRuns: 1, nextRunAt: 38, lastRunAt: 20, updatedAt: 22,
       },
       {
         id: 'failed', title: 'Failed', definitionStatus: 'ACTIVE',
@@ -159,7 +174,10 @@ describe('global task activity', () => {
     expect(Object.fromEntries(snapshot.automations.map((row) => [row.automationId, row.status]))).toEqual({
       paused: 'paused',
       failed: 'failed',
-      review: 'waiting_user',
+      attention: 'waiting_user',
+      succeeded: 'completed',
+      legacy: 'completed',
+      recovered: 'completed',
     });
   });
 

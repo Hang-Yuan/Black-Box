@@ -47,6 +47,17 @@ pub struct AutomationTarget {
     pub project_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutomationCompletionProbe {
+    /// JSON receipt relative to the automation's project directory. `{date}`
+    /// expands from the scheduled local date plus `scheduled_date_offset_days`.
+    pub relative_path: String,
+    #[serde(default)]
+    pub scheduled_date_offset_days: i64,
+    #[serde(default)]
+    pub json_equals: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutomationDefinition {
@@ -58,8 +69,8 @@ pub struct AutomationDefinition {
     pub status: String,
     pub rrule: String,
     pub model: Option<String>,
-    /// Logical lightweight model slot captured when the task is saved. It is
-    /// resolved through the same pinned provider revision as the lead model.
+    /// Optional per-task lightweight-model override. Missing values inherit
+    /// the user's default system configuration at execution time.
     pub auxiliary_model: Option<String>,
     pub reasoning_effort: Option<String>,
     /// Explicit opt-in for Claude Code Agent Teams. Disabled by default because
@@ -73,12 +84,15 @@ pub struct AutomationDefinition {
     pub target: Option<AutomationTarget>,
     pub cwds: Vec<String>,
     pub target_thread_id: Option<String>,
-    /// Bind a task to an API provider. None means native/system Claude config;
-    /// it never follows a later global provider switch.
-    pub provider_id: Option<String>,
-    /// Immutable provider revision captured when the user saves the task.
-    /// A mismatch fails closed instead of silently changing keys or routing.
-    pub provider_revision: Option<u64>,
+    /// Optional durable receipt used to reconcile transport/tail failures with
+    /// work that was already committed by the scheduled task.
+    pub completion_probe: Option<AutomationCompletionProbe>,
+    /// Pre-0.14.20 input only. Never exposed or serialized by the current API.
+    #[serde(default, rename = "provider_id", skip_serializing)]
+    legacy_provider_id: Option<String>,
+    /// Pre-0.14.20 input only. Never exposed or serialized by the current API.
+    #[serde(default, rename = "provider_revision", skip_serializing)]
+    legacy_provider_revision: Option<u64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -95,7 +109,7 @@ impl Default for AutomationDefinition {
             status: ACTIVE.to_string(),
             rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0".to_string(),
             model: None,
-            auxiliary_model: Some("sonnet".to_string()),
+            auxiliary_model: None,
             reasoning_effort: None,
             agent_teams_enabled: false,
             data_write_subdirectories: vec![],
@@ -103,8 +117,9 @@ impl Default for AutomationDefinition {
             target: None,
             cwds: vec![],
             target_thread_id: None,
-            provider_id: None,
-            provider_revision: None,
+            completion_probe: None,
+            legacy_provider_id: None,
+            legacy_provider_revision: None,
             created_at: now,
             updated_at: now,
         }
@@ -142,6 +157,21 @@ pub struct AutomationActivitySummary {
     pub updated_at: i64,
 }
 
+/// Minimal live-session projection used by the conversation surface.
+///
+/// The chat monitor only needs enough metadata to associate a durable Claude
+/// session with an active scheduled run. Keep prompts, output, trace bodies,
+/// provider data, and credentials out of this contract.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveAutomationSession {
+    pub run_id: String,
+    pub automation_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub started_at: i64,
+}
+
 // Security boundary: this query may select status metadata only. Do not add
 // definition prompts or automation_runs body columns here.
 const AUTOMATION_ACTIVITY_SUMMARY_SQL: &str = r#"
@@ -173,7 +203,7 @@ const AUTOMATION_ACTIVITY_SUMMARY_SQL: &str = r#"
          FROM automation_runs unread
         WHERE unread.automation_id = a.id
           AND unread.read_at IS NULL
-          AND unread.status = 'PENDING_REVIEW') AS unread_runs,
+          AND unread.status IN ('SUCCEEDED', 'NEEDS_ATTENTION', 'FAILED', 'RECOVERED', 'PENDING_REVIEW')) AS unread_runs,
       a.updated_at
     FROM automations a
     ORDER BY a.updated_at DESC, a.name COLLATE NOCASE ASC, a.id ASC
@@ -229,6 +259,10 @@ pub struct AutomationRun {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub archived_reason: Option<String>,
+    pub retry_of_run_id: Option<String>,
+    pub recovered_by_run_id: Option<String>,
+    pub recovered_at: Option<i64>,
+    pub recovery_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +346,10 @@ struct AutomationExecution {
     output: String,
     trace: Vec<AutomationTraceEvent>,
     session_id: Option<String>,
+    /// Position of the most recent root-agent assistant event in stdout.
+    last_main_assistant_event: Option<u64>,
+    /// Position of the most recent completed background Agent notification.
+    last_agent_completion_event: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +388,7 @@ enum ResolvedAutomationWorktreeReview {
 struct AutomationExecutionError {
     message: String,
     trace: Vec<AutomationTraceEvent>,
+    output: String,
 }
 
 #[derive(Debug)]
@@ -368,6 +407,7 @@ impl AutomationExecutionError {
         Self {
             message: message.into(),
             trace: Vec::new(),
+            output: String::new(),
         }
     }
 }
@@ -605,6 +645,20 @@ fn configure_read_only_connection(connection: Connection) -> rusqlite::Result<Co
     Ok(connection)
 }
 
+fn migrate_legacy_run_statuses(connection: &Connection) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE automation_runs SET status='SUCCEEDED' WHERE status='PENDING_REVIEW'",
+        [],
+    )
+}
+
+fn migrate_legacy_provider_index_bindings(connection: &Connection) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE automations SET provider_id=NULL,provider_revision=NULL WHERE provider_id IS NOT NULL OR provider_revision IS NOT NULL",
+        [],
+    )
+}
+
 fn open_database() -> Result<Connection, String> {
     let path = database_path()?;
     if let Some(parent) = path.parent() {
@@ -667,7 +721,11 @@ fn open_database() -> Result<Connection, String> {
               scheduled_at INTEGER,
               started_at INTEGER NOT NULL,
               finished_at INTEGER,
-              archived_reason TEXT
+              archived_reason TEXT,
+              retry_of_run_id TEXT,
+              recovered_by_run_id TEXT,
+              recovered_at INTEGER,
+              recovery_evidence TEXT
             );
             CREATE TABLE IF NOT EXISTS automation_claims (
               automation_id TEXT NOT NULL,
@@ -820,6 +878,41 @@ fn open_database() -> Result<Connection, String> {
                 .map_err(|e| format!("Cannot add automation worktree lifecycle storage: {e}"))?;
         }
     }
+    for (column, sql) in [
+        (
+            "retry_of_run_id",
+            "ALTER TABLE automation_runs ADD COLUMN retry_of_run_id TEXT",
+        ),
+        (
+            "recovered_by_run_id",
+            "ALTER TABLE automation_runs ADD COLUMN recovered_by_run_id TEXT",
+        ),
+        (
+            "recovered_at",
+            "ALTER TABLE automation_runs ADD COLUMN recovered_at INTEGER",
+        ),
+        (
+            "recovery_evidence",
+            "ALTER TABLE automation_runs ADD COLUMN recovery_evidence TEXT",
+        ),
+    ] {
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('automation_runs') WHERE name=?1",
+                params![column],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Cannot inspect automations database: {e}"))?;
+        if present == 0 {
+            connection
+                .execute(sql, [])
+                .map_err(|e| format!("Cannot add automation retry storage: {e}"))?;
+        }
+    }
+    migrate_legacy_run_statuses(&connection)
+        .map_err(|e| format!("Cannot migrate legacy automation run statuses: {e}"))?;
+    migrate_legacy_provider_index_bindings(&connection)
+        .map_err(|e| format!("Cannot migrate legacy automation provider bindings: {e}"))?;
     Ok(connection)
 }
 
@@ -1166,6 +1259,7 @@ fn validate_definition(definition: &AutomationDefinition) -> Result<(), String> 
         return Err("heartbeat automations cannot use a worktree".to_string());
     }
     validate_data_write_subdirectories(definition)?;
+    validate_completion_probe(definition)?;
     parse_rrule(&definition.rrule)?;
     if definition.kind == "cron" {
         let project = definition
@@ -1191,6 +1285,39 @@ fn validate_definition(definition: &AutomationDefinition) -> Result<(), String> 
         return Err("heartbeat automation requires targetThreadId".to_string());
     }
     validate_development_isolation(definition)?;
+    Ok(())
+}
+
+fn validate_completion_probe(definition: &AutomationDefinition) -> Result<(), String> {
+    let Some(probe) = &definition.completion_probe else {
+        return Ok(());
+    };
+    if definition.kind != "cron" {
+        return Err("completionProbe is only supported for cron automations".to_string());
+    }
+    if probe.relative_path.trim() != probe.relative_path
+        || probe.relative_path.is_empty()
+        || !safe_relative_path(Path::new(
+            &probe.relative_path.replace("{date}", "2000-01-01"),
+        ))
+    {
+        return Err(
+            "completionProbe.relativePath must be a safe path relative to the project".to_string(),
+        );
+    }
+    if !(-366..=366).contains(&probe.scheduled_date_offset_days) {
+        return Err(
+            "completionProbe.scheduledDateOffsetDays must be between -366 and 366".to_string(),
+        );
+    }
+    if probe.json_equals.is_empty()
+        || probe
+            .json_equals
+            .iter()
+            .any(|(key, expected)| key.trim() != key || key.is_empty() || expected.is_empty())
+    {
+        return Err("completionProbe.jsonEquals must contain non-empty fields".to_string());
+    }
     Ok(())
 }
 
@@ -1264,8 +1391,18 @@ fn read_definition(path: &Path) -> Result<AutomationDefinition, String> {
     toml::from_str(&text).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
 }
 
+fn clear_legacy_provider_binding(definition: &mut AutomationDefinition) -> bool {
+    let changed =
+        definition.legacy_provider_id.is_some() || definition.legacy_provider_revision.is_some();
+    definition.legacy_provider_id = None;
+    definition.legacy_provider_revision = None;
+    changed
+}
+
 fn load_definition(id: &str) -> Result<AutomationDefinition, String> {
-    read_definition(&definition_path(id)?)
+    let mut definition = read_definition(&definition_path(id)?)?;
+    clear_legacy_provider_binding(&mut definition);
+    Ok(definition)
 }
 
 fn load_all_definitions() -> Result<Vec<AutomationDefinition>, String> {
@@ -1278,11 +1415,34 @@ fn load_all_definitions() -> Result<Vec<AutomationDefinition>, String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().join("automation.toml");
         if path.is_file() {
-            definitions.push(read_definition(&path)?);
+            let mut definition = read_definition(&path)?;
+            clear_legacy_provider_binding(&mut definition);
+            definitions.push(definition);
         }
     }
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(definitions)
+}
+
+fn migrate_legacy_definition_provider_bindings() -> Result<usize, String> {
+    let root = automation_root()?;
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut migrated = 0;
+    for entry in fs::read_dir(root).map_err(|e| format!("Cannot read automations: {e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().join("automation.toml");
+        if !path.is_file() {
+            continue;
+        }
+        let mut definition = read_definition(&path)?;
+        if clear_legacy_provider_binding(&mut definition) {
+            save_definition(&definition)?;
+            migrated += 1;
+        }
+    }
+    Ok(migrated)
 }
 
 fn save_definition(definition: &AutomationDefinition) -> Result<AutomationDefinition, String> {
@@ -1340,15 +1500,14 @@ fn reconcile_definition(
         .execute(
             r#"INSERT INTO automations
             (id,kind,name,prompt,status,next_run_at,last_run_at,cwds,rrule,model,reasoning_effort,
-             execution_environment,target_type,project_id,target_thread_id,provider_id,provider_revision,created_at,updated_at)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+             execution_environment,target_type,project_id,target_thread_id,created_at,updated_at)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
             ON CONFLICT(id) DO UPDATE SET
               kind=excluded.kind,name=excluded.name,prompt=excluded.prompt,status=excluded.status,
               next_run_at=excluded.next_run_at,cwds=excluded.cwds,rrule=excluded.rrule,
               model=excluded.model,reasoning_effort=excluded.reasoning_effort,
               execution_environment=excluded.execution_environment,target_type=excluded.target_type,
               project_id=excluded.project_id,target_thread_id=excluded.target_thread_id,
-              provider_id=excluded.provider_id,provider_revision=excluded.provider_revision,
               updated_at=excluded.updated_at"#,
             params![
                 definition.id,
@@ -1363,11 +1522,15 @@ fn reconcile_definition(
                 definition.model,
                 definition.reasoning_effort,
                 definition.execution_environment,
-                definition.target.as_ref().map(|target| target.target_type.as_str()),
-                definition.target.as_ref().map(|target| target.project_id.as_str()),
+                definition
+                    .target
+                    .as_ref()
+                    .map(|target| target.target_type.as_str()),
+                definition
+                    .target
+                    .as_ref()
+                    .map(|target| target.project_id.as_str()),
                 definition.target_thread_id,
-                definition.provider_id,
-                definition.provider_revision,
                 definition.created_at,
                 definition.updated_at,
             ],
@@ -1377,11 +1540,14 @@ fn reconcile_definition(
 }
 
 fn reconcile_all() -> Result<(), String> {
+    migrate_legacy_definition_provider_bindings()?;
     let connection = open_database()?;
-    for definition in load_all_definitions()? {
+    let definitions = load_all_definitions()?;
+    for definition in &definitions {
         validate_definition(&definition)?;
         reconcile_definition(&connection, &definition)?;
     }
+    reconcile_failed_completion_probes(&connection, &definitions)?;
     Ok(())
 }
 
@@ -1399,7 +1565,7 @@ fn query_summary(
             .map_err(|e| e.to_string())?;
     let unread_runs: u32 = connection
         .query_row(
-            "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1 AND read_at IS NULL AND status='PENDING_REVIEW'",
+            "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1 AND read_at IS NULL AND status IN ('SUCCEEDED','NEEDS_ATTENTION','FAILED','RECOVERED','PENDING_REVIEW')",
             params![definition.id],
             |row| row.get(0),
         )
@@ -1516,6 +1682,43 @@ pub fn list_automation_activity_summaries() -> Result<Vec<AutomationActivitySumm
     query_automation_activity_summaries(&connection)
 }
 
+fn query_active_automation_sessions(
+    connection: &Connection,
+) -> Result<Vec<ActiveAutomationSession>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT r.run_id, r.automation_id, r.session_id, a.name, r.started_at
+              FROM automation_runs r
+              JOIN automations a ON a.id = r.automation_id
+             WHERE r.status = 'RUNNING'
+               AND r.session_id IS NOT NULL
+               AND a.active_run_id = r.run_id
+             ORDER BY r.started_at DESC, r.run_id DESC
+            "#,
+        )
+        .map_err(|error| format!("Cannot prepare active automation sessions: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ActiveAutomationSession {
+                run_id: row.get(0)?,
+                automation_id: row.get(1)?,
+                session_id: row.get(2)?,
+                title: row.get(3)?,
+                started_at: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("Cannot query active automation sessions: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Cannot read active automation sessions: {error}"))
+}
+
+#[tauri::command]
+pub fn list_active_automation_sessions() -> Result<Vec<ActiveAutomationSession>, String> {
+    let connection = open_database_read_only()?;
+    query_active_automation_sessions(&connection)
+}
+
 #[tauri::command]
 pub fn get_automation(id: String) -> Result<AutomationSummary, String> {
     let definition = load_definition(&id)?;
@@ -1542,6 +1745,7 @@ pub fn upsert_automation(
         definition.created_at = now;
     }
     definition.version = 1;
+    clear_legacy_provider_binding(&mut definition);
     definition.updated_at = now;
     validate_definition(&definition)?;
     let definition = save_definition(&definition)?;
@@ -1578,22 +1782,24 @@ fn resolve_provider_and_models(
 ) -> Result<(Option<String>, String, String, String), String> {
     let providers = crate::read_providers_file()?;
     let (provider_id, model) = resolve_provider_and_model_with(definition, &providers)?;
+    let auxiliary_request = definition
+        .auxiliary_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| providers.default_auxiliary_model.clone())
+        .ok_or_else(|| {
+            "Default system configuration is incomplete: choose a default auxiliary model"
+                .to_string()
+        })?;
     let mut auxiliary_definition = definition.clone();
-    auxiliary_definition.model = Some(
-        definition
-            .auxiliary_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("sonnet")
-            .to_string(),
-    );
+    auxiliary_definition.model = Some(auxiliary_request.clone());
     let (_, auxiliary_model) = resolve_provider_and_model_with(&auxiliary_definition, &providers)?;
     if auxiliary_model.trim().is_empty() {
         return Err("Automation auxiliary model resolved to an empty value".to_string());
     }
-    let auxiliary_model_tier =
-        crate::native_agent_model_tier(definition.auxiliary_model.as_deref().unwrap_or("sonnet"))?;
+    let auxiliary_model_tier = crate::native_agent_model_tier(&auxiliary_request)?;
     Ok((provider_id, model, auxiliary_model, auxiliary_model_tier))
 }
 
@@ -1616,36 +1822,41 @@ fn resolve_provider_and_model_with(
     definition: &AutomationDefinition,
     providers: &crate::ProvidersFile,
 ) -> Result<(Option<String>, String), String> {
-    let provider_id = definition.provider_id.clone();
     let requested = definition
         .model
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("sonnet");
-    let pinned_provider = if let Some(ref id) = provider_id {
-        let provider = providers
-            .providers
-            .iter()
-            .find(|provider| provider.id == *id)
-            .ok_or_else(|| format!("Automation provider {id} does not exist"))?;
-        let expected_revision = definition.provider_revision.ok_or_else(|| {
-            format!("Automation provider {id} is not pinned; open and save the task again")
+        .map(str::to_string)
+        .or_else(|| providers.default_main_model.clone())
+        .ok_or_else(|| {
+            "Default system configuration is incomplete: choose a default main model".to_string()
         })?;
-        let actual_revision = provider.revision.max(1);
-        if expected_revision != actual_revision {
-            return Err(format!(
-                "Automation provider {id} changed from revision {expected_revision} to {actual_revision}; open and save the task again"
-            ));
+    let runtime_provider = match providers.default_api.as_deref() {
+        Some("system") => {
+            return Err(
+                "System Claude Login has been retired; choose a credentialed default API"
+                    .to_string(),
+            )
         }
-        Some(provider)
-    } else {
-        None
+        Some(id) => Some(
+            providers
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .ok_or_else(|| format!("The default system API {id} does not exist"))?,
+        ),
+        None => {
+            return Err(
+                "Default system configuration is incomplete: choose a default API".to_string(),
+            )
+        }
     };
-    let Some(tier) = logical_model_tier(requested) else {
-        return Ok((provider_id, requested.to_string()));
+    let provider_id = runtime_provider.map(|provider| provider.id.clone());
+    let Some(tier) = logical_model_tier(&requested) else {
+        return Ok((provider_id, requested));
     };
-    let model = if let Some(provider) = pinned_provider {
+    let model = if let Some(provider) = runtime_provider {
         provider
             .model_mappings
             .iter()
@@ -1654,7 +1865,7 @@ fn resolve_provider_and_model_with(
             .filter(|model| !model.trim().is_empty())
             .ok_or_else(|| {
                 format!(
-                    "Provider {} has no model mapping for the {tier} tier",
+                    "The default new-conversation provider {} has no model mapping for the {tier} tier",
                     provider.name
                 )
             })?
@@ -2894,7 +3105,7 @@ fn automation_prompt(
     } else {
         String::new()
     };
-    let result_contract = "\n<automation_result_contract>If every required step completes, end with ::inbox-item{title=\"short title\" summary=\"short factual summary\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, end with ::automation-failed{summary=\"short factual reason\"} on its own final line and do not emit a success directive.</automation_result_contract>";
+    let result_contract = "\n<automation_result_contract>If every required step completes and no user action is required, end with ::inbox-item{title=\"short title\" summary=\"short factual summary\"} on its own final line. If every required step completes but an explicit user decision or follow-up action is required, end with ::automation-needs-attention{title=\"short title\" summary=\"short factual next action\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, end with ::automation-failed{summary=\"short factual reason\"} on its own final line and do not emit a success or needs-attention directive.</automation_result_contract>";
     Ok(prepend_native_skill_invocation(native_skill_invocation, format!(
         "Automation: {name}\nAutomation ID: {id}\nAutomation memory: {memory}\nScheduled at: {scheduled}\n\n{prompt}\n\n{memory_block}{team_contract}{result_contract}",
         name = definition.name,
@@ -2913,6 +3124,13 @@ fn automation_prompt(
         team_contract = team_contract,
         result_contract = result_contract,
     )))
+}
+
+fn automation_completion_recovery_prompt(definition: &AutomationDefinition) -> String {
+    format!(
+        "<automation_completion_recovery>\nThe scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. End with exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}.\n</automation_completion_recovery>",
+        id = definition.id,
+    )
 }
 
 fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, AutomationExecutionError> {
@@ -2942,8 +3160,15 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
     let mut final_output = None;
     let mut final_error = None;
     let mut session_id = None;
+    let mut last_main_assistant_event = None;
+    let mut last_agent_completion_event = None;
 
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+    for (event_index, line) in stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let event_position = event_index as u64 + 1;
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -2953,6 +3178,9 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
         match event.get("type").and_then(Value::as_str) {
             Some("assistant") => {
                 let parent_tool_use_id = event_string(&event, &["parent_tool_use_id"]);
+                if parent_tool_use_id.is_none() {
+                    last_main_assistant_event = Some(event_position);
+                }
                 let event_agent_id = event_string(&event, &["agent_id", "agentId"]);
                 let agent_depth = parent_tool_use_id
                     .as_ref()
@@ -3146,6 +3374,8 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
                                 agent_kinds.insert(parent.clone(), agent_kind.clone());
                             }
                         }
+                    } else {
+                        last_agent_completion_event = Some(event_position);
                     }
                     let status = event.get("status").and_then(Value::as_str).unwrap_or(
                         if subtype == "task_started" {
@@ -3183,6 +3413,7 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
             Some("result") => {
                 let parent_tool_use_id = event_string(&event, &["parent_tool_use_id"]);
                 if parent_tool_use_id.is_some() {
+                    last_agent_completion_event = Some(event_position);
                     let result_agent_type = parent_tool_use_id
                         .as_ref()
                         .and_then(|id| agent_types.get(id))
@@ -3238,17 +3469,24 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
     }
 
     if let Some(message) = final_error {
-        return Err(AutomationExecutionError { message, trace });
+        return Err(AutomationExecutionError {
+            message,
+            trace,
+            output: String::new(),
+        });
     }
     match final_output {
         Some(output) => Ok(AutomationExecution {
             output,
             trace,
             session_id,
+            last_main_assistant_event,
+            last_agent_completion_event,
         }),
         None => Err(AutomationExecutionError {
             message: "Claude stream ended without a result event".to_string(),
             trace,
+            output: String::new(),
         }),
     }
 }
@@ -3298,37 +3536,36 @@ async fn invoke_claude(
     run_id: &str,
     execution_cwd: &Path,
     session_target: &AutomationSessionTarget,
+    prompt_override: Option<&str>,
 ) -> Result<AutomationExecution, AutomationExecutionError> {
-    let claude_bin =
-        crate::find_claude_binary().ok_or_else(|| "Claude CLI not found".to_string())?;
+    // Scheduled runs use the exact SDK execution kernel selected for ordinary
+    // conversations. A second PATH resolver can silently launch another
+    // Claude build with different protocol capabilities.
+    let claude_bin = crate::resolve_claude_sdk_runtime()
+        .map_err(AutomationExecutionError::new)?
+        .path;
     let (provider_id, model, _auxiliary_model, auxiliary_model_tier) =
         resolve_provider_and_models(definition)?;
-    if provider_id.is_none() {
-        let auth = crate::probe_claude_auth_status().await.map_err(|error| {
-            AutomationExecutionError::new(format!(
-                "Cannot verify the native Claude account for this scheduled task: {error}"
-            ))
-        })?;
-        if !auth.authenticated {
-            let environment = crate::client_runtime::runtime_environment_status()
-                .map(|status| status.active_config_dir)
-                .unwrap_or_else(|_| "the active Claude environment".to_string());
-            return Err(AutomationExecutionError::new(format!(
-                "The native Claude account is not logged in for {environment}. Select an API provider for this scheduled task, or sign in to that Claude environment."
-            )));
-        }
-    }
+    let provider_id = provider_id.ok_or_else(|| {
+        AutomationExecutionError::new(
+            "Scheduled tasks require a credentialed default API in Default system configuration",
+        )
+    })?;
     let (mut provider_env, mut provider_remove, provider_args, _caps) =
-        crate::resolve_provider_env(provider_id.as_deref())?;
-    crate::apply_provider_model_aliases(provider_id.as_deref(), &mut provider_env)?;
+        crate::resolve_provider_env(Some(provider_id.as_str()))?;
+    crate::apply_provider_model_aliases(Some(provider_id.as_str()), &mut provider_env)?;
     let _provider_gateway_guard =
-        crate::route_provider_through_gateway(provider_id.as_deref(), &mut provider_env).await?;
+        crate::route_provider_through_gateway(Some(provider_id.as_str()), &mut provider_env)
+            .await?;
     crate::enforce_provider_loopback_child_env(
-        provider_id.as_deref(),
+        Some(provider_id.as_str()),
         &mut provider_env,
         &mut provider_remove,
     );
-    let prompt = automation_prompt(definition, scheduled_at)?;
+    let prompt = match prompt_override {
+        Some(prompt) => prompt.to_string(),
+        None => automation_prompt(definition, scheduled_at)?,
+    };
     let data_dir = automation_data_dir().map_err(AutomationExecutionError::new)?;
     let additional_write_paths = prepare_automation_write_paths(definition, &data_dir)
         .map_err(AutomationExecutionError::new)?;
@@ -3360,7 +3597,7 @@ async fn invoke_claude(
     }
     args.extend(provider_args);
     // Every ordinary Agent/subagent and every Agent Teams teammate uses the
-    // task's pinned auxiliary model, even when Agent Teams itself is disabled.
+    // task's selected auxiliary tier, even when Agent Teams itself is disabled.
     provider_env.insert(
         "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
         auxiliary_model_tier.clone(),
@@ -3440,11 +3677,7 @@ async fn invoke_claude(
     args.push(security_settings_path.to_string_lossy().to_string());
 
     let env_config = crate::env_manager::ClaudeEnvConfig {
-        auth_mode: if provider_id.is_some() {
-            crate::env_manager::AuthMode::ThirdParty
-        } else {
-            crate::env_manager::AuthMode::Native
-        },
+        auth_mode: crate::env_manager::AuthMode::ThirdParty,
         enriched_path: Some(crate::build_enriched_path()),
         extra: provider_env,
         extra_remove: provider_remove,
@@ -3549,21 +3782,26 @@ async fn invoke_claude(
     let status = match wait_result {
         Ok(status) => status,
         Err(message) => {
-            let trace = match parsed {
-                Ok(execution) => execution.trace,
-                Err(error) => error.trace,
+            let (output, trace) = match parsed {
+                Ok(execution) => (execution.output, execution.trace),
+                Err(error) => (error.output, error.trace),
             };
-            return Err(AutomationExecutionError { message, trace });
+            return Err(AutomationExecutionError {
+                message,
+                trace,
+                output,
+            });
         }
     };
     if !status.success() {
-        let trace = match parsed {
-            Ok(execution) => execution.trace,
-            Err(error) => error.trace,
+        let (output, trace) = match parsed {
+            Ok(execution) => (execution.output, execution.trace),
+            Err(error) => (error.output, error.trace),
         };
         return Err(AutomationExecutionError {
             message: format!("Claude exited with {:?}: {}", status.code(), stderr.trim()),
             trace,
+            output,
         });
     }
     let execution = parsed?;
@@ -3575,25 +3813,33 @@ async fn invoke_claude(
                 execution.session_id.as_deref().unwrap_or("none")
             ),
             trace: execution.trace,
+            output: execution.output,
         });
     }
     Ok(execution)
 }
 
-fn parse_inbox_directive(output: &str, fallback: &str) -> (String, String) {
-    let Some(start) = output.rfind("::inbox-item{") else {
-        return (fallback.to_string(), output.chars().take(240).collect());
-    };
-    let directive = &output[start..];
+fn parse_result_directive(output: &str, marker: &str, fallback: &str) -> Option<(String, String)> {
+    let start = final_automation_directive_start(output, marker)?;
+    let directive = output[start..].trim();
     let field = |name: &str| -> Option<String> {
         let marker = format!("{name}=\"");
         let value = directive.split_once(&marker)?.1;
         Some(value.split('"').next()?.to_string())
     };
-    (
+    Some((
         field("title").unwrap_or_else(|| fallback.to_string()),
         field("summary").unwrap_or_else(|| output.chars().take(240).collect()),
-    )
+    ))
+}
+
+fn parse_inbox_directive(output: &str, fallback: &str) -> (String, String) {
+    parse_result_directive(output, "::inbox-item{", fallback)
+        .unwrap_or_else(|| (fallback.to_string(), output.chars().take(240).collect()))
+}
+
+fn parse_automation_attention_directive(output: &str, fallback: &str) -> Option<(String, String)> {
+    parse_result_directive(output, "::automation-needs-attention{", fallback)
 }
 
 fn parse_automation_failure_directive(output: &str) -> Option<String> {
@@ -3615,15 +3861,42 @@ fn final_automation_directive_start(output: &str, marker: &str) -> Option<usize>
     if start > 0 && output.as_bytes().get(start.wrapping_sub(1)) != Some(&b'\n') {
         return None;
     }
-    output[start..].trim().ends_with('}').then_some(start)
+    let suffix = output[start..].trim();
+    (suffix.starts_with(marker) && suffix.ends_with('}') && suffix.lines().count() == 1)
+        .then_some(start)
 }
 
-fn automation_reported_failure(execution: &AutomationExecution) -> Option<String> {
+fn automation_reported_failure(
+    execution: &AutomationExecution,
+    require_terminal_directive: bool,
+) -> Option<String> {
     if let Some(reason) = parse_automation_failure_directive(&execution.output) {
         return Some(reason);
     }
-    if final_automation_directive_start(&execution.output, "::inbox-item{").is_some() {
+    let has_terminal_directive =
+        final_automation_directive_start(&execution.output, "::inbox-item{").is_some()
+            || final_automation_directive_start(&execution.output, "::automation-needs-attention{")
+                .is_some();
+    if execution
+        .last_agent_completion_event
+        .is_some_and(|completion| {
+            execution
+                .last_main_assistant_event
+                .is_none_or(|main| main < completion)
+        })
+    {
+        return Some(
+            "Background Agents finished after the main Agent's last response; the run ended without a final synthesis"
+                .to_string(),
+        );
+    }
+    if has_terminal_directive {
         return None;
+    }
+    if require_terminal_directive {
+        return Some(
+            "Scheduled task ended without the required final result directive".to_string(),
+        );
     }
     let terminal_tool_failed = execution
         .trace
@@ -3641,10 +3914,244 @@ fn automation_reported_failure(execution: &AutomationExecution) -> Option<String
     })
 }
 
+fn automation_needs_completion_recovery(execution: &AutomationExecution) -> bool {
+    if parse_automation_failure_directive(&execution.output).is_some() {
+        return false;
+    }
+    let background_finished_after_main =
+        execution
+            .last_agent_completion_event
+            .is_some_and(|completion| {
+                execution
+                    .last_main_assistant_event
+                    .is_none_or(|main| main < completion)
+            });
+    let has_terminal_directive =
+        final_automation_directive_start(&execution.output, "::inbox-item{").is_some()
+            || final_automation_directive_start(&execution.output, "::automation-needs-attention{")
+                .is_some();
+    background_finished_after_main || !has_terminal_directive
+}
+
+fn merge_automation_executions(
+    mut first: AutomationExecution,
+    mut continuation: AutomationExecution,
+) -> AutomationExecution {
+    let sequence_offset = first
+        .trace
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(0);
+    for event in &mut continuation.trace {
+        event.sequence = event.sequence.saturating_add(sequence_offset);
+    }
+    let position_offset = first
+        .last_main_assistant_event
+        .into_iter()
+        .chain(first.last_agent_completion_event)
+        .max()
+        .unwrap_or(0);
+    let last_main_assistant_event = continuation
+        .last_main_assistant_event
+        .map(|position| position.saturating_add(position_offset))
+        .or(first.last_main_assistant_event);
+    let last_agent_completion_event = continuation
+        .last_agent_completion_event
+        .map(|position| position.saturating_add(position_offset))
+        .or(first.last_agent_completion_event);
+    first.trace.extend(continuation.trace);
+    AutomationExecution {
+        output: format!(
+            "{}\n\n{}",
+            first.output.trim_end(),
+            continuation.output.trim_start()
+        ),
+        trace: first.trace,
+        session_id: continuation.session_id.or(first.session_id),
+        last_main_assistant_event,
+        last_agent_completion_event,
+    }
+}
+
+fn record_successful_retry(
+    connection: &Connection,
+    original_run_id: &str,
+    recovery_run_id: &str,
+    recovered_at: i64,
+) -> Result<bool, String> {
+    let evidence = format!("automation-run:{recovery_run_id}");
+    let updated = connection
+        .execute(
+            "UPDATE automation_runs SET status='RECOVERED',read_at=NULL,recovered_by_run_id=?2,recovered_at=?3,recovery_evidence=?4 WHERE run_id=?1 AND status='FAILED' AND retry_of_run_id IS NULL",
+            params![original_run_id, recovery_run_id, recovered_at, evidence],
+        )
+        .map_err(|error| format!("Cannot record recovered automation run: {error}"))?;
+    if updated == 1 {
+        connection
+            .execute(
+                "UPDATE automation_runs SET read_at=?2 WHERE run_id=?1",
+                params![recovery_run_id, recovered_at],
+            )
+            .map_err(|error| format!("Cannot mark retry audit run read: {error}"))?;
+        connection
+            .execute(
+                "UPDATE inbox_items SET read_at=?2 WHERE run_id=?1",
+                params![recovery_run_id, recovered_at],
+            )
+            .map_err(|error| format!("Cannot mark retry inbox item read: {error}"))?;
+    }
+    Ok(updated == 1)
+}
+
+fn completion_probe_value_matches(actual: &Value, expected: &str) -> bool {
+    actual
+        .as_str()
+        .map(|value| value == expected)
+        .unwrap_or_else(|| actual.to_string() == expected)
+}
+
+fn probe_completion_receipt(
+    definition: &AutomationDefinition,
+    scheduled_at: i64,
+    started_at: i64,
+) -> Result<Option<String>, String> {
+    let Some(probe) = &definition.completion_probe else {
+        return Ok(None);
+    };
+    let scheduled = local_from_ms(scheduled_at)?;
+    let receipt_date =
+        scheduled.date_naive() + ChronoDuration::days(probe.scheduled_date_offset_days);
+    let date = receipt_date.format("%Y-%m-%d").to_string();
+    let rendered_relative = probe.relative_path.replace("{date}", &date);
+    let relative = Path::new(&rendered_relative);
+    if !safe_relative_path(relative) {
+        return Err("Completion receipt path escaped the project directory".to_string());
+    }
+    let project = fs::canonicalize(project_directory(definition)?)
+        .map_err(|error| format!("Cannot resolve completion receipt project: {error}"))?;
+    let candidate = project.join(relative);
+    if !candidate.is_file() {
+        return Ok(None);
+    }
+    let receipt = fs::canonicalize(&candidate)
+        .map_err(|error| format!("Cannot resolve completion receipt: {error}"))?;
+    if !receipt.starts_with(&project) {
+        return Err("Completion receipt escaped the project directory".to_string());
+    }
+    let metadata = fs::metadata(&receipt)
+        .map_err(|error| format!("Cannot inspect completion receipt: {error}"))?;
+    if metadata.len() > 1024 * 1024 {
+        return Err("Completion receipt exceeds the 1 MiB safety limit".to_string());
+    }
+    let modified_at = metadata
+        .modified()
+        .map_err(|error| format!("Cannot read completion receipt timestamp: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Completion receipt timestamp predates the Unix epoch".to_string())?
+        .as_millis() as i64;
+    // A date-specific receipt must still have been written by this run. This
+    // prevents an old committed receipt from masking a new transport failure.
+    if modified_at.saturating_add(5_000) < started_at {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(&receipt).map_err(|error| format!("Cannot read completion receipt: {error}"))?;
+    let json: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Cannot parse completion receipt JSON: {error}"))?;
+    for (field, expected_template) in &probe.json_equals {
+        let expected = expected_template.replace("{date}", &date);
+        let Some(actual) = json.get(field) else {
+            return Ok(None);
+        };
+        if !completion_probe_value_matches(actual, &expected) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(format!("completion-receipt:{rendered_relative}")))
+}
+
+fn recover_run_from_completion_probe(
+    connection: &Connection,
+    definition: &AutomationDefinition,
+    run_id: &str,
+    scheduled_at: i64,
+    started_at: i64,
+    recovered_at: i64,
+) -> Result<bool, String> {
+    let Some(evidence) = probe_completion_receipt(definition, scheduled_at, started_at)? else {
+        return Ok(false);
+    };
+    let updated = connection
+        .execute(
+            "UPDATE automation_runs SET status='RECOVERED',read_at=NULL,title=?2,recovered_at=?3,recovery_evidence=?4 WHERE run_id=?1 AND status='FAILED' AND retry_of_run_id IS NULL",
+            params![run_id, definition.name, recovered_at, evidence],
+        )
+        .map_err(|error| format!("Cannot reconcile automation completion receipt: {error}"))?;
+    if updated == 1 {
+        connection
+            .execute(
+                "UPDATE inbox_items SET title=?2,description=?3,read_at=NULL WHERE run_id=?1",
+                params![
+                    run_id,
+                    definition.name,
+                    "Durable completion receipt verified; original runtime failure preserved",
+                ],
+            )
+            .map_err(|error| format!("Cannot reconcile automation inbox item: {error}"))?;
+    }
+    Ok(updated == 1)
+}
+
+fn reconcile_failed_completion_probes(
+    connection: &Connection,
+    definitions: &[AutomationDefinition],
+) -> Result<u64, String> {
+    let recovered_at = now_ms();
+    let mut recovered = 0_u64;
+    for definition in definitions
+        .iter()
+        .filter(|definition| definition.completion_probe.is_some())
+    {
+        let failed_runs: Vec<(String, i64, i64)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT run_id,scheduled_at,started_at FROM automation_runs WHERE automation_id=?1 AND status='FAILED' AND scheduled_at IS NOT NULL AND retry_of_run_id IS NULL",
+                )
+                .map_err(|error| format!("Cannot inspect failed automation runs: {error}"))?;
+            let rows = statement
+                .query_map(params![definition.id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|error| format!("Cannot query failed automation runs: {error}"))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        for (run_id, scheduled_at, started_at) in failed_runs {
+            match recover_run_from_completion_probe(
+                connection,
+                definition,
+                &run_id,
+                scheduled_at,
+                started_at,
+                recovered_at,
+            ) {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "[BLACKBOX AUTOMATIONS] completion probe {} failed closed: {error}",
+                    definition.id
+                ),
+            }
+        }
+    }
+    Ok(recovered)
+}
+
 async fn execute_automation(
     definition: AutomationDefinition,
     run_id: String,
     scheduled_at: Option<i64>,
+    retry_of_run_id: Option<String>,
 ) {
     // A run already claimed immediately before maintenance waits instead of
     // spawning a second Claude process while the CLI executable is replaced.
@@ -3664,8 +4171,8 @@ async fn execute_automation(
     };
     if let Ok(connection) = open_database() {
         let _ = connection.execute(
-            "INSERT OR REPLACE INTO automation_runs (run_id,automation_id,session_id,status,title,summary,output,source_cwd,scheduled_at,started_at) VALUES (?1,?2,?3,'RUNNING',?4,'','',?5,?6,?7)",
-            params![run_id, definition.id, durable_session_id, definition.name, source_cwd, scheduled_at, started_at],
+            "INSERT OR REPLACE INTO automation_runs (run_id,automation_id,session_id,status,title,summary,output,source_cwd,scheduled_at,started_at,retry_of_run_id) VALUES (?1,?2,?3,'RUNNING',?4,'','',?5,?6,?7,?8)",
+            params![run_id, definition.id, durable_session_id, definition.name, source_cwd, scheduled_at, started_at, retry_of_run_id],
         );
         let _ = connection.execute(
             "UPDATE automations SET active_run_id=?2 WHERE id=?1",
@@ -3713,14 +4220,69 @@ async fn execute_automation(
                         };
                         match session_indexed {
                             Ok(()) => {
-                                invoke_claude(
+                                let first_execution = invoke_claude(
                                     &definition,
                                     scheduled_at,
                                     &run_id,
                                     &directory.execution_cwd,
                                     &session_target,
+                                    None,
                                 )
-                                .await
+                                .await;
+                                match first_execution {
+                                    Ok(execution)
+                                        if definition.kind == "cron"
+                                            && automation_needs_completion_recovery(&execution) =>
+                                    {
+                                        let recovery_prompt =
+                                            automation_completion_recovery_prompt(&definition);
+                                        let resume_target = AutomationSessionTarget {
+                                            session_id: session_target.session_id.clone(),
+                                            arguments: vec![
+                                                "--resume".to_string(),
+                                                session_target.session_id.clone(),
+                                            ],
+                                            creates_new_session: false,
+                                        };
+                                        match invoke_claude(
+                                            &definition,
+                                            scheduled_at,
+                                            &run_id,
+                                            &directory.execution_cwd,
+                                            &resume_target,
+                                            Some(&recovery_prompt),
+                                        )
+                                        .await
+                                        {
+                                            Ok(continuation) => Ok(merge_automation_executions(
+                                                execution,
+                                                continuation,
+                                            )),
+                                            Err(mut error) => {
+                                                let output = if error.output.trim().is_empty() {
+                                                    execution.output
+                                                } else {
+                                                    format!(
+                                                        "{}\n\n{}",
+                                                        execution.output.trim_end(),
+                                                        error.output.trim_start()
+                                                    )
+                                                };
+                                                let mut trace = execution.trace;
+                                                trace.append(&mut error.trace);
+                                                Err(AutomationExecutionError {
+                                                    message: format!(
+                                                        "Scheduled task completion recovery failed: {}",
+                                                        error.message
+                                                    ),
+                                                    trace,
+                                                    output,
+                                                })
+                                            }
+                                        }
+                                    }
+                                    other => other,
+                                }
                             }
                             Err(error) => {
                                 let rollback = rollback_prepared_execution_directory(
@@ -3764,7 +4326,9 @@ async fn execute_automation(
             Ok(execution) => {
                 let trace_json =
                     serde_json::to_string(&execution.trace).unwrap_or_else(|_| "[]".to_string());
-                if let Some(reason) = automation_reported_failure(&execution) {
+                if let Some(reason) =
+                    automation_reported_failure(&execution, definition.kind == "cron")
+                {
                     let title = format!("{} failed", definition.name);
                     let _ = connection.execute(
                         "UPDATE automation_runs SET status='FAILED',title=?2,summary=?3,output=?4,error=?3,trace_json=?5,finished_at=?6 WHERE run_id=?1",
@@ -3774,36 +4338,77 @@ async fn execute_automation(
                         "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
                         params![run_id, title, reason, finished_at],
                     );
-                } else {
-                    let (title, summary) =
-                        parse_inbox_directive(&execution.output, &definition.name);
+                } else if let Some((title, summary)) =
+                    parse_automation_attention_directive(&execution.output, &definition.name)
+                {
                     let _ = connection.execute(
-                        "UPDATE automation_runs SET status='PENDING_REVIEW',title=?2,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
+                        "UPDATE automation_runs SET status='NEEDS_ATTENTION',title=?2,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
                         params![run_id, title, summary, execution.output, trace_json, finished_at],
                     );
                     let _ = connection.execute(
                         "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
                         params![run_id, title, summary, finished_at],
                     );
+                } else {
+                    let (title, summary) =
+                        parse_inbox_directive(&execution.output, &definition.name);
+                    let _ = connection.execute(
+                        "UPDATE automation_runs SET status='SUCCEEDED',title=?2,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
+                        params![run_id, title, summary, execution.output, trace_json, finished_at],
+                    );
+                    let _ = connection.execute(
+                        "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
+                        params![run_id, title, summary, finished_at],
+                    );
+                    if let Some(original_run_id) = retry_of_run_id.as_deref() {
+                        if let Err(error) = record_successful_retry(
+                            &connection,
+                            original_run_id,
+                            &run_id,
+                            finished_at,
+                        ) {
+                            eprintln!(
+                                "[BLACKBOX AUTOMATIONS] retry recovery linkage failed: {error}"
+                            );
+                        }
+                    }
                 }
             }
             Err(error) => {
                 let trace_json =
                     serde_json::to_string(&error.trace).unwrap_or_else(|_| "[]".to_string());
                 let message = error.message;
+                let output = error.output;
                 let status = if message == "Automation cancelled by user" {
                     "CANCELLED"
                 } else {
                     "FAILED"
                 };
                 let _ = connection.execute(
-                    "UPDATE automation_runs SET status=?2,error=?3,summary=?3,trace_json=?4,finished_at=?5 WHERE run_id=?1",
-                    params![run_id, status, message, trace_json, finished_at],
+                    "UPDATE automation_runs SET status=?2,error=?3,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
+                    params![run_id, status, message, output, trace_json, finished_at],
                 );
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
                     params![run_id, format!("{} {}", definition.name, status.to_ascii_lowercase()), message, finished_at],
                 );
+                if status == "FAILED" {
+                    if let Some(scheduled_at) = scheduled_at {
+                        if let Err(error) = recover_run_from_completion_probe(
+                            &connection,
+                            &definition,
+                            &run_id,
+                            scheduled_at,
+                            started_at,
+                            finished_at,
+                        ) {
+                            eprintln!(
+                                "[BLACKBOX AUTOMATIONS] completion probe {} failed closed: {error}",
+                                definition.id
+                            );
+                        }
+                    }
+                }
             }
         }
         let _ = connection.execute(
@@ -3867,6 +4472,7 @@ async fn scheduler_tick() {
                     definition,
                     run_id,
                     Some(scheduled_at),
+                    None,
                 ));
             }
         }
@@ -4008,7 +4614,53 @@ pub fn run_automation_now(id: String) -> Result<String, String> {
     }
     let (definition, run_id) = claim_manual_run(&id)?;
     let returned = run_id.clone();
-    tauri::async_runtime::spawn(execute_automation(definition, run_id, None));
+    tauri::async_runtime::spawn(execute_automation(definition, run_id, None, None));
+    Ok(returned)
+}
+
+#[tauri::command]
+pub fn retry_automation_run(run_id: String) -> Result<String, String> {
+    if crate::cli_update_in_progress() {
+        return Err("CLI_UPDATE_IN_PROGRESS".to_string());
+    }
+    let connection = open_database()?;
+    let target: Option<(String, String, Option<i64>, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT automation_id,status,scheduled_at,retry_of_run_id,recovered_by_run_id FROM automation_runs WHERE run_id=?1",
+            params![run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let (automation_id, status, scheduled_at, retry_of_run_id, recovered_by_run_id) =
+        target.ok_or_else(|| "Automation run does not exist".to_string())?;
+    if retry_of_run_id.is_some() {
+        return Err("Retry the original failed automation run".to_string());
+    }
+    if recovered_by_run_id.is_some() || status == "RECOVERED" {
+        return Err("Automation run was already recovered".to_string());
+    }
+    if status != "FAILED" {
+        return Err("Only failed automation runs can be retried".to_string());
+    }
+    drop(connection);
+
+    let (definition, recovery_run_id) = claim_manual_run(&automation_id)?;
+    let returned = recovery_run_id.clone();
+    tauri::async_runtime::spawn(execute_automation(
+        definition,
+        recovery_run_id,
+        scheduled_at,
+        Some(run_id),
+    ));
     Ok(returned)
 }
 
@@ -4060,7 +4712,7 @@ fn run_automation_blocking(id: &str) -> Result<AutomationRun, String> {
         .enable_all()
         .build()
         .map_err(|e| format!("Cannot create automation runtime: {e}"))?
-        .block_on(execute_automation(definition, run_id.clone(), None));
+        .block_on(execute_automation(definition, run_id.clone(), None, None));
     list_automation_runs(Some(id.to_string()), Some(500))?
         .into_iter()
         .find(|run| run.run_id == run_id)
@@ -4072,6 +4724,7 @@ pub fn list_automation_runs(
     automation_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<AutomationRun>, String> {
+    reconcile_all()?;
     let connection = open_database()?;
     query_automation_runs(&connection, automation_id, limit)
 }
@@ -4091,9 +4744,9 @@ fn query_automation_runs(
 ) -> Result<Vec<AutomationRun>, String> {
     let limit = limit.unwrap_or(100).min(500);
     let sql = if automation_id.is_some() {
-        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason FROM automation_runs WHERE automation_id=?1 ORDER BY started_at DESC LIMIT ?2"
+        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason,retry_of_run_id,recovered_by_run_id,recovered_at,recovery_evidence FROM automation_runs WHERE automation_id=?1 ORDER BY started_at DESC LIMIT ?2"
     } else {
-        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason FROM automation_runs ORDER BY started_at DESC LIMIT ?1"
+        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason,retry_of_run_id,recovered_by_run_id,recovered_at,recovery_evidence FROM automation_runs ORDER BY started_at DESC LIMIT ?1"
     };
     let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
     let mapper = |row: &rusqlite::Row<'_>| {
@@ -4129,6 +4782,10 @@ fn query_automation_runs(
             started_at: row.get(24)?,
             finished_at: row.get(25)?,
             archived_reason: row.get(26)?,
+            retry_of_run_id: row.get(27)?,
+            recovered_by_run_id: row.get(28)?,
+            recovered_at: row.get(29)?,
+            recovery_evidence: row.get(30)?,
         })
     };
     let rows = if let Some(id) = automation_id {
@@ -4856,13 +5513,13 @@ pub fn mark_all_automation_runs_read() -> Result<u64, String> {
     let now = now_ms();
     let updated = transaction
         .execute(
-            "UPDATE automation_runs SET read_at=?1 WHERE read_at IS NULL AND status='PENDING_REVIEW'",
+            "UPDATE automation_runs SET read_at=?1 WHERE read_at IS NULL AND status IN ('SUCCEEDED','NEEDS_ATTENTION','FAILED','RECOVERED','PENDING_REVIEW')",
             params![now],
         )
         .map_err(|e| e.to_string())?;
     transaction
         .execute(
-            "UPDATE inbox_items SET read_at=?1 WHERE read_at IS NULL AND run_id IN (SELECT run_id FROM automation_runs WHERE status='PENDING_REVIEW')",
+            "UPDATE inbox_items SET read_at=?1 WHERE read_at IS NULL AND run_id IN (SELECT run_id FROM automation_runs WHERE status IN ('SUCCEEDED','NEEDS_ATTENTION','FAILED','RECOVERED','PENDING_REVIEW'))",
             params![now],
         )
         .map_err(|e| e.to_string())?;
@@ -5348,6 +6005,7 @@ mod tests {
                 CREATE TABLE automation_runs (
                   run_id TEXT PRIMARY KEY,
                   automation_id TEXT NOT NULL,
+                  session_id TEXT,
                   status TEXT NOT NULL,
                   read_at INTEGER,
                   started_at INTEGER NOT NULL,
@@ -5363,8 +6021,15 @@ mod tests {
                 INSERT INTO automation_runs
                   (run_id,automation_id,status,read_at,started_at,summary,output,trace_json,error)
                 VALUES
-                  ('run-review','auto-1','PENDING_REVIEW',NULL,100,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
+                  ('run-success','auto-1','SUCCEEDED',NULL,100,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
+                  ('run-attention','auto-1','NEEDS_ATTENTION',NULL,110,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
+                  ('run-failed','auto-1','FAILED',NULL,120,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
+                  ('run-recovered','auto-1','RECOVERED',NULL,125,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
+                  ('run-legacy','auto-1','PENDING_REVIEW',NULL,130,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
                   ('run-active','auto-1','RUNNING',NULL,200,'ACTIVE_SUMMARY_SECRET','ACTIVE_OUTPUT_SECRET','ACTIVE_TRACE_SECRET','ACTIVE_ERROR_SECRET');
+                UPDATE automation_runs
+                   SET session_id='session-active'
+                 WHERE run_id='run-active';
                 "#,
             )
             .unwrap();
@@ -5378,9 +6043,18 @@ mod tests {
         assert_eq!(summaries[0].schedule_kind, "cron");
         assert_eq!(summaries[0].active_run_id.as_deref(), Some("run-active"));
         assert!(summaries[0].running);
-        assert_eq!(summaries[0].unread_runs, 1);
+        assert_eq!(summaries[0].unread_runs, 5);
+
+        let active_sessions = query_active_automation_sessions(&connection).unwrap();
+        assert_eq!(active_sessions.len(), 1);
+        assert_eq!(active_sessions[0].run_id, "run-active");
+        assert_eq!(active_sessions[0].automation_id, "auto-1");
+        assert_eq!(active_sessions[0].session_id, "session-active");
+        assert_eq!(active_sessions[0].title, "Nightly review");
+        assert_eq!(active_sessions[0].started_at, 200);
 
         let serialized_text = serde_json::to_string(&summaries).unwrap();
+        let active_serialized = serde_json::to_string(&active_sessions).unwrap();
         for sentinel in [
             "PROMPT_SECRET",
             "SUMMARY_SECRET",
@@ -5389,6 +6063,7 @@ mod tests {
             "ERROR_SECRET",
         ] {
             assert!(!serialized_text.contains(sentinel));
+            assert!(!active_serialized.contains(sentinel));
         }
 
         let query = AUTOMATION_ACTIVITY_SUMMARY_SQL.to_ascii_lowercase();
@@ -5406,6 +6081,272 @@ mod tests {
                 "activity query selected forbidden column {forbidden_column}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_pending_review_runs_migrate_to_succeeded() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE automation_runs (
+                  run_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL
+                );
+                INSERT INTO automation_runs (run_id,status) VALUES
+                  ('legacy','PENDING_REVIEW'),
+                  ('attention','NEEDS_ATTENTION');
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(migrate_legacy_run_statuses(&connection).unwrap(), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM automation_runs WHERE run_id='legacy'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "SUCCEEDED"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM automation_runs WHERE run_id='attention'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "NEEDS_ATTENTION"
+        );
+    }
+
+    #[test]
+    fn successful_retry_recovers_original_without_erasing_failure_evidence() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE automation_runs (
+                  run_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL,
+                  read_at INTEGER,
+                  error TEXT,
+                  trace_json TEXT,
+                  retry_of_run_id TEXT,
+                  recovered_by_run_id TEXT,
+                  recovered_at INTEGER,
+                  recovery_evidence TEXT
+                );
+                CREATE TABLE inbox_items (
+                  run_id TEXT PRIMARY KEY,
+                  read_at INTEGER
+                );
+                INSERT INTO automation_runs
+                  (run_id,status,error,trace_json,retry_of_run_id)
+                VALUES
+                  ('original','FAILED','ORIGINAL_FAILURE','ORIGINAL_TRACE',NULL),
+                  ('retry','SUCCEEDED',NULL,'RETRY_TRACE','original');
+                INSERT INTO inbox_items (run_id,read_at) VALUES ('retry',NULL);
+                "#,
+            )
+            .unwrap();
+
+        assert!(record_successful_retry(&connection, "original", "retry", 1234).unwrap());
+        let original: (String, Option<String>, Option<i64>, Option<String>, String, String) =
+            connection
+                .query_row(
+                    "SELECT status,recovered_by_run_id,recovered_at,recovery_evidence,error,trace_json FROM automation_runs WHERE run_id='original'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(original.0, "RECOVERED");
+        assert_eq!(original.1.as_deref(), Some("retry"));
+        assert_eq!(original.2, Some(1234));
+        assert_eq!(original.3.as_deref(), Some("automation-run:retry"));
+        assert_eq!(original.4, "ORIGINAL_FAILURE");
+        assert_eq!(original.5, "ORIGINAL_TRACE");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT read_at FROM automation_runs WHERE run_id='retry'",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            Some(1234)
+        );
+    }
+
+    fn receipt_probe_definition(project: &Path) -> AutomationDefinition {
+        AutomationDefinition {
+            id: "daily-review-dream".to_string(),
+            name: "daily-dream".to_string(),
+            target: Some(AutomationTarget {
+                target_type: "project".to_string(),
+                project_id: project.to_string_lossy().to_string(),
+            }),
+            cwds: vec![project.to_string_lossy().to_string()],
+            completion_probe: Some(AutomationCompletionProbe {
+                relative_path: "receipts/{date}.json".to_string(),
+                scheduled_date_offset_days: -1,
+                json_equals: BTreeMap::from([
+                    ("logical_date".to_string(), "{date}".to_string()),
+                    ("status".to_string(), "COMMITTED".to_string()),
+                ]),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn completion_probe_expands_scheduled_date_and_verifies_json_receipt() {
+        let project = tempfile::tempdir().unwrap();
+        let receipts = project.path().join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(
+            receipts.join("2026-08-15.json"),
+            br#"{"logical_date":"2026-08-15","status":"COMMITTED"}"#,
+        )
+        .unwrap();
+        let scheduled_at = Local
+            .with_ymd_and_hms(2026, 8, 16, 6, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let evidence =
+            probe_completion_receipt(&receipt_probe_definition(project.path()), scheduled_at, 0)
+                .unwrap();
+        assert_eq!(
+            evidence.as_deref(),
+            Some("completion-receipt:receipts/2026-08-15.json")
+        );
+        let stale = probe_completion_receipt(
+            &receipt_probe_definition(project.path()),
+            scheduled_at,
+            now_ms().saturating_add(60_000),
+        )
+        .unwrap();
+        assert!(stale.is_none());
+    }
+
+    #[test]
+    fn failed_scheduled_run_is_recovered_from_a_fresh_completion_receipt() {
+        let project = tempfile::tempdir().unwrap();
+        let receipts = project.path().join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(
+            receipts.join("2026-08-15.json"),
+            br#"{"logical_date":"2026-08-15","status":"COMMITTED"}"#,
+        )
+        .unwrap();
+        let scheduled_at = Local
+            .with_ymd_and_hms(2026, 8, 16, 6, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE automation_runs (
+                  run_id TEXT PRIMARY KEY,
+                  automation_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  read_at INTEGER,
+                  title TEXT,
+                  scheduled_at INTEGER,
+                  started_at INTEGER NOT NULL,
+                  retry_of_run_id TEXT,
+                  recovered_at INTEGER,
+                  recovery_evidence TEXT
+                );
+                CREATE TABLE inbox_items (
+                  run_id TEXT PRIMARY KEY,
+                  title TEXT,
+                  description TEXT,
+                  read_at INTEGER
+                );
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO automation_runs (run_id,automation_id,status,title,scheduled_at,started_at) VALUES ('run-1','daily-review-dream','FAILED','daily-dream failed',?1,0)",
+                params![scheduled_at],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO inbox_items (run_id,title,description) VALUES ('run-1','failed','transport failed')",
+                [],
+            )
+            .unwrap();
+
+        let recovered = reconcile_failed_completion_probes(
+            &connection,
+            &[receipt_probe_definition(project.path())],
+        )
+        .unwrap();
+        assert_eq!(recovered, 1);
+        let result: (String, String, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT status,title,recovered_at,recovery_evidence FROM automation_runs WHERE run_id='run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(result.0, "RECOVERED");
+        assert_eq!(result.1, "daily-dream");
+        assert!(result.2.is_some());
+        assert_eq!(
+            result.3.as_deref(),
+            Some("completion-receipt:receipts/2026-08-15.json")
+        );
+    }
+
+    #[test]
+    fn legacy_provider_index_bindings_migrate_to_conversation_runtime() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE automations (
+                  id TEXT PRIMARY KEY,
+                  provider_id TEXT,
+                  provider_revision INTEGER
+                );
+                INSERT INTO automations (id,provider_id,provider_revision) VALUES
+                  ('legacy','deleted-provider',7),
+                  ('portable',NULL,NULL);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            migrate_legacy_provider_index_bindings(&connection).unwrap(),
+            1
+        );
+        let binding: (Option<String>, Option<u64>) = connection
+            .query_row(
+                "SELECT provider_id,provider_revision FROM automations WHERE id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(binding, (None, None));
     }
 
     #[test]
@@ -5512,10 +6453,10 @@ mod tests {
                 20,
             ),
             record(
-                "pending",
-                "PENDING_REVIEW",
+                "completed",
+                "SUCCEEDED",
                 "/repo",
-                "/wt/pending",
+                "/wt/completed",
                 None,
                 None,
                 1,
@@ -5568,7 +6509,10 @@ mod tests {
 
     fn provider_fixture() -> crate::ProvidersFile {
         serde_json::from_value(serde_json::json!({
-            "version": 2,
+            "version": 4,
+            "defaultApi": "relay",
+            "defaultMainModel": "sonnet",
+            "defaultAuxiliaryModel": "haiku",
             "activeProviderId": "relay",
             "providers": [{
                 "id": "relay",
@@ -5591,25 +6535,17 @@ mod tests {
     }
 
     #[test]
-    fn automation_models_default_to_native_sonnet_and_use_only_pinned_providers() {
+    fn automation_models_follow_the_default_system_configuration() {
         let providers = provider_fixture();
-        let definition = AutomationDefinition::default();
-        let (provider, model) = resolve_provider_and_model_with(&definition, &providers).unwrap();
-        assert_eq!(provider, None);
-        assert_eq!(model, "sonnet");
-
         let haiku = AutomationDefinition {
             model: Some("haiku".to_string()),
-            provider_id: Some("relay".to_string()),
-            provider_revision: Some(7),
+            legacy_provider_id: Some("deleted-provider".to_string()),
+            legacy_provider_revision: Some(99),
             ..Default::default()
         };
-        assert_eq!(
-            resolve_provider_and_model_with(&haiku, &providers)
-                .unwrap()
-                .1,
-            "relay-haiku"
-        );
+        let (provider, model) = resolve_provider_and_model_with(&haiku, &providers).unwrap();
+        assert_eq!(provider.as_deref(), Some("relay"));
+        assert_eq!(model, "relay-haiku");
     }
 
     #[test]
@@ -5617,8 +6553,8 @@ mod tests {
         let providers = provider_fixture();
         let definition = AutomationDefinition {
             model: Some("claude-opus-4-8".to_string()),
-            provider_id: Some("relay".to_string()),
-            provider_revision: Some(7),
+            legacy_provider_id: Some("relay".to_string()),
+            legacy_provider_revision: Some(7),
             ..Default::default()
         };
         assert_eq!(
@@ -5637,8 +6573,8 @@ mod tests {
             .retain(|mapping| mapping.tier != "fable");
         let definition = AutomationDefinition {
             model: Some("fable".to_string()),
-            provider_id: Some("relay".to_string()),
-            provider_revision: Some(7),
+            legacy_provider_id: Some("relay".to_string()),
+            legacy_provider_revision: Some(7),
             ..Default::default()
         };
         let error = resolve_provider_and_model_with(&definition, &providers).unwrap_err();
@@ -5646,23 +6582,38 @@ mod tests {
     }
 
     #[test]
-    fn automation_provider_revision_drift_fails_closed() {
-        let providers = provider_fixture();
-        let unpinned = AutomationDefinition {
-            provider_id: Some("relay".to_string()),
+    fn legacy_task_provider_bindings_never_control_execution() {
+        let mut providers = provider_fixture();
+        let legacy = AutomationDefinition {
+            model: Some("opus".to_string()),
+            legacy_provider_id: Some("deleted-provider".to_string()),
+            legacy_provider_revision: Some(1),
             ..Default::default()
         };
-        assert!(resolve_provider_and_model_with(&unpinned, &providers)
-            .unwrap_err()
-            .contains("is not pinned"));
+        providers.providers[0].revision = 500;
+        assert_eq!(
+            resolve_provider_and_model_with(&legacy, &providers).unwrap(),
+            (Some("relay".to_string()), "relay-opus".to_string())
+        );
 
-        let stale = AutomationDefinition {
-            provider_id: Some("relay".to_string()),
-            provider_revision: Some(6),
-            ..Default::default()
-        };
-        let error = resolve_provider_and_model_with(&stale, &providers).unwrap_err();
-        assert!(error.contains("changed from revision 6 to 7"));
+        providers.default_api = Some("missing-default".to_string());
+        assert!(resolve_provider_and_model_with(&legacy, &providers)
+            .unwrap_err()
+            .contains("default system API missing-default does not exist"));
+    }
+
+    #[test]
+    fn automation_models_require_explicit_system_defaults() {
+        let mut providers = provider_fixture();
+        providers.default_api = None;
+        let error = resolve_provider_and_model_with(&AutomationDefinition::default(), &providers)
+            .unwrap_err();
+        assert!(error.contains("choose a default API"));
+
+        providers.default_api = Some("system".to_string());
+        let error = resolve_provider_and_model_with(&AutomationDefinition::default(), &providers)
+            .unwrap_err();
+        assert!(error.contains("System Claude Login has been retired"));
     }
 
     #[test]
@@ -5727,6 +6678,7 @@ mod tests {
         assert!(prompt.starts_with("Automation:"));
         assert!(prompt.contains("Inspect the latest build."));
         assert!(prompt.contains("<automation_result_contract>"));
+        assert!(prompt.contains("::automation-needs-attention{title="));
         assert!(prompt.contains("::automation-failed{summary="));
     }
 
@@ -5752,11 +6704,34 @@ mod tests {
                 .to_string(),
             trace: vec![],
             session_id: None,
+            last_main_assistant_event: Some(1),
+            last_agent_completion_event: None,
         };
         assert_eq!(
-            automation_reported_failure(&execution).as_deref(),
+            automation_reported_failure(&execution, true).as_deref(),
             Some("Lock denied")
         );
+    }
+
+    #[test]
+    fn scheduled_attention_directive_becomes_an_actionable_result() {
+        let output = "The report is ready.\n::automation-needs-attention{title=\"Choose release\" summary=\"Approve one release candidate\"}";
+        assert_eq!(
+            parse_automation_attention_directive(output, "Fallback"),
+            Some((
+                "Choose release".to_string(),
+                "Approve one release candidate".to_string(),
+            ))
+        );
+
+        let execution = AutomationExecution {
+            output: output.to_string(),
+            trace: vec![tool_result(1, "Failed")],
+            session_id: None,
+            last_main_assistant_event: Some(1),
+            last_agent_completion_event: None,
+        };
+        assert!(automation_reported_failure(&execution, true).is_none());
     }
 
     #[test]
@@ -5765,30 +6740,119 @@ mod tests {
             output: "Stopped after the required lock command failed.".to_string(),
             trace: vec![tool_result(1, "Failed")],
             session_id: None,
+            last_main_assistant_event: Some(1),
+            last_agent_completion_event: None,
         };
-        assert!(automation_reported_failure(&failed).is_some());
+        assert!(automation_reported_failure(&failed, true).is_some());
 
         let recovered = AutomationExecution {
             output: "Recovered.\n::inbox-item{title=\"Done\" summary=\"Recovered\"}".to_string(),
             trace: vec![tool_result(1, "Failed")],
             session_id: None,
+            last_main_assistant_event: Some(2),
+            last_agent_completion_event: None,
         };
-        assert!(automation_reported_failure(&recovered).is_none());
+        assert!(automation_reported_failure(&recovered, true).is_none());
 
         let later_success = AutomationExecution {
             output: "Recovered without a control record.".to_string(),
             trace: vec![tool_result(1, "Failed"), tool_result(2, "Completed")],
             session_id: None,
+            last_main_assistant_event: Some(2),
+            last_agent_completion_event: None,
         };
-        assert!(automation_reported_failure(&later_success).is_none());
+        assert!(automation_reported_failure(&later_success, true).is_some());
+        assert!(automation_reported_failure(&later_success, false).is_none());
 
         let literal_success_example = AutomationExecution {
             output: "Example: ::inbox-item{title=\"Done\"}\nThe required step still failed."
                 .to_string(),
             trace: vec![tool_result(1, "Failed")],
             session_id: None,
+            last_main_assistant_event: Some(1),
+            last_agent_completion_event: None,
         };
-        assert!(automation_reported_failure(&literal_success_example).is_some());
+        assert!(automation_reported_failure(&literal_success_example, true).is_some());
+
+        let literal_attention_example = AutomationExecution {
+            output: "Example: ::automation-needs-attention{title=\"Review\"}\nThe required step still failed."
+                .to_string(),
+            trace: vec![tool_result(1, "Failed")],
+            session_id: None,
+            last_main_assistant_event: Some(1),
+            last_agent_completion_event: None,
+        };
+        assert!(automation_reported_failure(&literal_attention_example, true).is_some());
+    }
+
+    #[test]
+    fn completed_background_agents_require_a_later_main_agent_synthesis() {
+        let stale_main_result = AutomationExecution {
+            output: "Phase A is done.\n::inbox-item{title=\"Done\" summary=\"Phase A\"}"
+                .to_string(),
+            trace: vec![],
+            session_id: None,
+            last_main_assistant_event: Some(10),
+            last_agent_completion_event: Some(12),
+        };
+        let reason = automation_reported_failure(&stale_main_result, true).unwrap();
+        assert!(reason.contains("without a final synthesis"));
+
+        let synthesized = AutomationExecution {
+            last_main_assistant_event: Some(13),
+            ..stale_main_result
+        };
+        assert!(automation_reported_failure(&synthesized, true).is_none());
+    }
+
+    #[test]
+    fn scheduled_runs_resume_once_when_terminal_synthesis_is_missing() {
+        let incomplete = AutomationExecution {
+            output: "Background extraction finished; waiting for results.".to_string(),
+            trace: vec![tool_result(1, "Completed")],
+            session_id: Some("session-1".to_string()),
+            last_main_assistant_event: Some(4),
+            last_agent_completion_event: Some(5),
+        };
+        assert!(automation_needs_completion_recovery(&incomplete));
+
+        let explicit_failure = AutomationExecution {
+            output: "Blocked.\n::automation-failed{summary=\"Lock conflict\"}".to_string(),
+            ..incomplete
+        };
+        assert!(!automation_needs_completion_recovery(&explicit_failure));
+
+        let prompt = automation_completion_recovery_prompt(&AutomationDefinition {
+            id: "daily-review-dream".to_string(),
+            ..Default::default()
+        });
+        assert!(prompt.contains("Resume the SAME durable session"));
+        assert!(prompt.contains("do not end with progress narration"));
+        assert!(prompt.contains("::automation-failed"));
+    }
+
+    #[test]
+    fn completion_recovery_merges_trace_and_keeps_the_final_directive_last() {
+        let first = AutomationExecution {
+            output: "Initial work finished.".to_string(),
+            trace: vec![tool_result(1, "Completed")],
+            session_id: Some("session-1".to_string()),
+            last_main_assistant_event: Some(2),
+            last_agent_completion_event: Some(3),
+        };
+        let continuation = AutomationExecution {
+            output: "Synthesized.\n::inbox-item{title=\"Done\" summary=\"Closed\"}".to_string(),
+            trace: vec![tool_result(1, "Completed")],
+            session_id: Some("session-1".to_string()),
+            last_main_assistant_event: Some(2),
+            last_agent_completion_event: None,
+        };
+        let merged = merge_automation_executions(first, continuation);
+        assert_eq!(merged.trace.len(), 2);
+        assert_eq!(merged.trace[1].sequence, 2);
+        assert_eq!(merged.last_main_assistant_event, Some(5));
+        assert_eq!(merged.last_agent_completion_event, Some(3));
+        assert!(automation_reported_failure(&merged, true).is_none());
     }
 
     #[test]
@@ -5939,6 +7003,32 @@ mod tests {
                 && event.summary == "Completed"
                 && event.agent_type.as_deref() == Some("plugin:worker")
         }));
+        assert!(
+            execution.last_agent_completion_event.unwrap()
+                > execution.last_main_assistant_event.unwrap()
+        );
+    }
+
+    #[test]
+    fn stream_execution_recognizes_a_main_synthesis_after_background_completion() {
+        let stdout = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"agent-1","name":"Agent","input":{"prompt":"work"}}]}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"task_started","task_id":"task-1","tool_use_id":"agent-1"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"agent-1","status":"completed"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Final synthesis"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Final synthesis\n::inbox-item{title=\"Done\" summary=\"Complete\"}"}"#,
+            "\n",
+        );
+        let execution = parse_stream_execution(stdout).unwrap();
+        assert!(
+            execution.last_main_assistant_event.unwrap()
+                > execution.last_agent_completion_event.unwrap()
+        );
+        assert!(automation_reported_failure(&execution, true).is_none());
     }
 
     #[test]

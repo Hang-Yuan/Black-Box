@@ -6,6 +6,7 @@ import { ConversationList } from '../conversations/ConversationList';
 import { useT } from '../../lib/i18n';
 import { useAgentStore } from '../../stores/agentStore';
 import {
+  resetConversationFileState,
   saveConversationFileState,
   useFileStore,
 } from '../../stores/fileStore';
@@ -74,6 +75,7 @@ export function Sidebar() {
         }
         useAgentStore.getState().clearAgents();
         useSessionStore.getState().setSelectedSession(null);
+        resetConversationFileState();
         useSettingsStore.getState().setWorkingDirectory('');
         setMainView('chat');
       }}

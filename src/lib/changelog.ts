@@ -19,6 +19,278 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.41',
+    date: '2026-08-16',
+    highlights: {
+      zh: [
+        '收紧已安排任务最近运行的状态与时间间距；日期继续整列右对齐，未读标记只在实际出现时占位',
+      ],
+      en: [
+        'Tightens status-to-time spacing in Scheduled Recent Runs while keeping timestamps right-aligned and reserving unread space only when present',
+      ],
+    },
+  },
+  {
+    version: '0.14.40',
+    date: '2026-08-16',
+    highlights: {
+      zh: [
+        '已安排任务的最近运行列表固定对齐状态、未读标记与时间，长摘要不会再把状态徽章挤成竖排',
+      ],
+      en: [
+        'Aligns status, unread, and timestamp slots in Recent Runs so long summaries can no longer squeeze badges into vertical text',
+      ],
+    },
+  },
+  {
+    version: '0.14.39',
+    date: '2026-08-16',
+    highlights: {
+      zh: [
+        '已安排任务支持持久化完成凭证：任务已经提交、尾部恢复进程异常时会自动校正为“已恢复”，并保留原报错、正文与工具轨迹；启动和打开任务中心时也会补核验',
+      ],
+      en: [
+        'Adds durable completion receipts for scheduled work: committed tasks whose recovery tail fails are automatically reconciled as recovered while preserving the original error, output, and tool trace, including startup and Task Center backfill checks',
+      ],
+    },
+  },
+  {
+    version: '0.14.38',
+    date: '2026-08-15',
+    highlights: {
+      zh: [
+        '长终端命令的展开详情改为有高度上限的滚动框，避免 heredoc 和脚本正文无限撑高主对话',
+      ],
+      en: [
+        'Constrains expanded long terminal commands to a bounded scrollable frame so heredocs and script bodies no longer stretch the conversation',
+      ],
+    },
+  },
+  {
+    version: '0.14.37',
+    date: '2026-08-15',
+    highlights: {
+      zh: [
+        '恢复主智能体 thinking：生成时实时显示，完成、中断和重载后保留为默认折叠的小字行；同一 SDK 消息会稳定去重，子智能体细节仍留在右侧进程栏',
+      ],
+      en: [
+        'Restores lead-agent thinking as live output that persists after completion, interruption, and reload in compact default-collapsed rows, with stable SDK-message deduplication and subagent detail kept in the Process panel',
+      ],
+    },
+  },
+  {
+    version: '0.14.36',
+    date: '2026-08-15',
+    highlights: {
+      zh: [
+        '失败的已安排任务可以按原计划时间补跑；补跑成功后原记录显示“补跑完成”，同时保留原报错、工具轨迹与独立补跑审计记录',
+      ],
+      en: [
+        'Adds auditable retries for failed scheduled runs: a successful retry marks the original as recovered while preserving its error, tool trace, and separate retry record',
+      ],
+    },
+  },
+  {
+    version: '0.14.35',
+    date: '2026-08-14',
+    highlights: {
+      zh: [
+        '对话双方头像试调至 60px，并同步扩大正文、过程更新和交互卡片的对齐留白',
+      ],
+      en: [
+        'Raises both chat avatars to 60px and expands the aligned gutter for prose, process updates, and interaction cards',
+      ],
+    },
+  },
+  {
+    version: '0.14.34',
+    date: '2026-08-14',
+    highlights: {
+      zh: [
+        '对话双方头像进一步放大至 50px，并同步校准消息正文、过程更新和交互卡片的水平留白',
+      ],
+      en: [
+        'Further enlarges both chat avatars to 50px and recalibrates the horizontal gutter for messages, process updates, and interaction cards',
+      ],
+    },
+  },
+  {
+    version: '0.14.33',
+    date: '2026-08-14',
+    highlights: {
+      zh: [
+        '对话中的用户与助手头像统一放大至 40px，同步调整正文、过程更新和交互卡片的对齐留白',
+      ],
+      en: [
+        'Enlarges both chat avatars to 40px and keeps prose, process updates, and interaction cards aligned to the same gutter',
+      ],
+    },
+  },
+  {
+    version: '0.14.32',
+    date: '2026-08-14',
+    highlights: {
+      zh: [
+        '空闲 Claude 连接采用分层回收：已使用会话保温 4 小时、未发消息的预热会话保温 30 分钟，并最多保留 4 个；归档或删除会话会立即优雅关闭连接',
+        '修复进程续接后折叠的过程更新抢占头像位置，最终答复会继续显示助手头像',
+      ],
+      en: [
+        'Adds tiered warm-process cleanup: four hours for used conversations, 30 minutes for unused pre-warms, a four-connection LRU cap, and immediate graceful shutdown on archive or delete',
+        'Keeps the assistant avatar on the final answer after reconnecting when folded process updates precede it',
+      ],
+    },
+  },
+  {
+    version: '0.14.31',
+    date: '2026-08-14',
+    highlights: {
+      zh: [
+        '顶部 Agent 恢复为状态与名单下拉菜单，后台数量收进菜单，页面上下不再显示重复横幅',
+        '下拉菜单的“查看过程”会打开右侧进程栏、定位并展开对应子智能体；右栏开合保留主对话的当前阅读位置',
+      ],
+      en: [
+        'Restores the top Agent roster popover, moves the running-background count into it, and keeps duplicate page banners removed',
+        'View process now opens and focuses the matching subagent in the Process panel while preserving the conversation reading position during panel layout changes',
+      ],
+    },
+  },
+  {
+    version: '0.14.30',
+    date: '2026-08-14',
+    highlights: {
+      zh: [
+        '保留带最新内容预览的“过程更新”折叠组；主 Agent 进度可随时展开，子智能体过程只进入右侧进程栏',
+        '顶部 Agent 状态改为唯一进程入口，直接开关右侧进程栏，并移除页面上下重复的后台运行横幅与独立进程图标',
+      ],
+      en: [
+        'Keeps the expandable Process Updates group with a live latest-content preview while forwarded subagent activity stays in the Process panel',
+        'Makes the top Agent status the single direct Process-panel toggle and removes duplicate background banners and the separate Process icon',
+      ],
+    },
+  },
+  {
+    version: '0.14.29',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        'Black Box 启动的 Claude 进程会关闭官方后台自动检查，由可见的手动维护流程统一持有更新生命周期，避免应用退出后再次出现无人监控的 `claude update`',
+      ],
+      en: [
+        'Disables Claude background update checks for processes launched by Black Box so the visible manual maintenance flow owns the update lifecycle and no unmonitored `claude update` reappears after app exit',
+      ],
+    },
+  },
+  {
+    version: '0.14.28',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        'Claude CLI 更新始终显示真实已下载字节；远端总大小探测增加 Range 回退，慢速下载不再看起来像静止的进度条',
+      ],
+      en: [
+        'Always shows real downloaded bytes for Claude CLI updates and adds a Range fallback for remote size discovery so slow transfers no longer look like a frozen progress bar',
+      ],
+    },
+  },
+  {
+    version: '0.14.27',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        '历史恢复会过滤 Claude CLI 写入的中断占位记录，停止操作不再留下 `[Request interrupted by user]` 用户气泡',
+      ],
+      en: [
+        'Filters Claude CLI interruption placeholders during history restoration so stopping a turn no longer leaves a `[Request interrupted by user]` bubble in the conversation',
+      ],
+    },
+  },
+  {
+    version: '0.14.26',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        '显式退出会等待正在进行的 CLI 维护到达受限终态，避免官方更新器脱离 Black Box 成为无法监控的后台孤儿进程',
+      ],
+      en: [
+        'Defers explicit app exit until in-flight CLI maintenance reaches its bounded terminal state so the official updater cannot outlive Black Box as an unobservable orphan process',
+      ],
+    },
+  },
+  {
+    version: '0.14.25',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        'Claude CLI 官方更新现在显示真实下载字节与百分比，停滞会明确提示；重新打开设置会接回同一更新，重复点击不再误报为对话占用',
+        'macOS 菜单栏改用透明单色 Black Box 模板图标，不再把应用图标的不透明背景渲染成白色方块',
+      ],
+      en: [
+        'Reports real downloaded bytes and percentage for the official Claude CLI updater, identifies stalled transfers, reconnects remounted Settings to the same update, and no longer mislabels a duplicate request as a busy conversation',
+        'Uses a transparent monochrome Black Box template in the macOS menu bar instead of rendering the opaque application-icon background as a white square',
+      ],
+    },
+  },
+  {
+    version: '0.14.24',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        '中断后续写使用的内部控制提示保持为运行时私有载荷；应用重启、历史恢复和导出只显示用户原话，同时统一过滤 Claude CLI 的无正文占位语',
+      ],
+      en: [
+        'Keeps interrupted-turn recovery instructions private to the runtime so restart, history, and export project only the user-authored message, with one shared filter for Claude CLI no-content placeholders',
+      ],
+    },
+  },
+  {
+    version: '0.14.23',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        '应用重启或从磁盘重新载入会话时，缺少终态通知的历史后台 Agent 会明确标记为已中断，不再制造“仍在运行”的假状态；过程记录仍保留在右侧进程栏',
+      ],
+      en: [
+        'Marks unresolved historical background agents as interrupted after app restart or disk hydration instead of reporting false live work, while retaining their process history in the Process panel',
+      ],
+    },
+  },
+  {
+    version: '0.14.22',
+    date: '2026-08-13',
+    highlights: {
+      zh: [
+        '主对话只保留主 Agent 的综合答复；阶段性说明折叠为过程更新，子智能体的显式进度、工具轨迹和结果进入右侧进程栏并可按需展开',
+        '主回复结束后若后台 Agent 仍在运行，会持续显示真实状态和数量，并可直接进入进程栏查看；完整任务通知协议不再泄漏到聊天正文',
+        '右侧进程/文件页签、面板宽度、打开文件、编辑缓冲与文件树状态均按会话独立保存，切换会话不再相互串联',
+        '侧栏会话支持通过六点拖柄在分组内排序、跨分组移动以及拖回未归类，同时保留点击、改名、右键和多选交互',
+      ],
+      en: [
+        'Keeps the primary transcript focused on the lead agent synthesis, folds lead progress into Process Updates, and routes explicit subagent progress, tool traces, and results to an optional Process panel',
+        'Continues to show accurate background-agent state and counts after the lead reply finishes, opens the Process panel directly, and removes raw task-notification protocol blocks from chat',
+        'Persists the Process/Files tab, panel width, open document, edit buffer, and file-tree state independently for every conversation so task switches cannot leak view state',
+        'Adds a dedicated six-dot drag handle for reordering conversations within groups, moving them across groups, and returning them to Uncategorized while preserving click, rename, context-menu, and multiselect behavior',
+      ],
+    },
+  },
+  {
+    version: '0.14.21',
+    date: '2026-08-10',
+    highlights: {
+      zh: [
+        '排程在后台 Agent 结束后会回到同一会话完成一次终态收束，并持续显示仍在运行的排程、工具与子智能体；缺失控制请求的权限卡可自动解除，不再锁死对话',
+        '同一逻辑回复按 Claude message ID 归并，内部思考只保留实时状态且不再作为历史正文重复显示；分支与普通会话统一恢复工具、子代与失败重试状态',
+        '逐会话恢复文件预览、编辑缓冲、文件树与滚动位置；并排对照首次打开定位到共同对话轮，代码长行自动换行，项目组展开与收起状态跨重启保留',
+        '默认 API、主模型和子模型可独立选择；Goal 活跃态保持可见；macOS 关闭窗口后继续在后台运行，并可从菜单栏重新打开，只有显式退出才停止运行',
+      ],
+      en: [
+        'Returns to the same scheduled conversation for one bounded terminal synthesis after background agents finish, keeps scheduled work, tools, and subagents visibly active, and automatically releases permission cards that never receive a control request',
+        'Correlates one logical response by its Claude message ID so internal thinking remains transient instead of replaying as duplicate history, with consistent tool, subagent, and retry recovery across branched and ordinary conversations',
+        'Restores file previews, edit buffers, explorer state, and scroll position per conversation; aligns comparison views to the shared turn on open, wraps long code lines, and preserves expanded and collapsed project groups across restarts',
+        'Lets users choose the default API, primary model, and subagent model independently, keeps active Goal state visible, and makes the macOS close button hide the window while menu-bar access and background work remain available until explicit Quit',
+      ],
+    },
+  },
+  {
     version: '0.14.20',
     date: '2026-08-01',
     highlights: {

@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { useSortable } from '@dnd-kit/sortable';
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { SessionListItem } from '../../lib/tauri-bridge';
-import { SessionItem } from './SessionItem';
+import { SortableSessionItem } from './SortableSessionItem';
 import type { SessionGroup } from '../../stores/groupStore';
 
 interface TaskGroupProps {
@@ -36,6 +36,8 @@ interface TaskGroupProps {
   onNewSessionInGroup: (groupId: string) => void;
   /** Archive history can be expanded but cannot reorder or edit groups. */
   readOnly?: boolean;
+  /** Active view with no search/multi-select projection may move conversations. */
+  sessionDragEnabled: boolean;
 }
 
 export function TaskGroup({
@@ -61,6 +63,7 @@ export function TaskGroup({
   onRenameCancel,
   onNewSessionInGroup,
   readOnly = false,
+  sessionDragEnabled,
 }: TaskGroupProps) {
   const [draft, setDraft] = useState(group.label);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -208,26 +211,33 @@ export function TaskGroup({
       {/* Members */}
       {isExpanded && sessions.length > 0 && (
         <div className="px-1 pb-1 pt-1 border-t border-border-subtle/70">
-          {sessions.map((session) => (
-            <SessionItem
-              key={session.id}
-              session={session}
-              isSelected={selectedId === session.id}
-              isRunning={runningSessions.has(session.id)}
-              isPinned={pinnedSet.has(session.id)}
-              isArchived={archivedSessions.has(session.id)}
-              displayName={getDisplayName(session)}
-              multiSelect={multiSelect}
-              isChecked={selectedIds.has(session.id)}
-              onSelect={onLoadSession}
-              onContextMenu={onSessionContextMenu}
-              onRename={onRenameSession}
-              onToggleCheck={onToggleCheck}
-              triggerRename={renamingSessionId === session.id}
-              onRenameDone={onRenameDone}
-              inset="group"
-            />
-          ))}
+          <SortableContext
+            items={sessions.map((session) => session.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            {sessions.map((session) => (
+              <SortableSessionItem
+                key={session.id}
+                session={session}
+                isSelected={selectedId === session.id}
+                isRunning={runningSessions.has(session.id)}
+                isPinned={pinnedSet.has(session.id)}
+                isArchived={archivedSessions.has(session.id)}
+                displayName={getDisplayName(session)}
+                multiSelect={multiSelect}
+                isChecked={selectedIds.has(session.id)}
+                onSelect={onLoadSession}
+                onContextMenu={onSessionContextMenu}
+                onRename={onRenameSession}
+                onToggleCheck={onToggleCheck}
+                triggerRename={renamingSessionId === session.id}
+                onRenameDone={onRenameDone}
+                inset="group"
+                dragEnabled={sessionDragEnabled}
+                groupId={group.id}
+              />
+            ))}
+          </SortableContext>
         </div>
       )}
 

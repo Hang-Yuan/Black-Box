@@ -47,6 +47,11 @@ const activeProvider = providerData.providers?.find(
   (provider) => provider.id === providerData.activeProviderId,
 );
 if (!activeProvider) throw new Error('Isolated provider config has no active provider');
+providerData.version = 4;
+providerData.defaultApi = activeProvider.id;
+providerData.defaultMainModel = 'haiku';
+providerData.defaultAuxiliaryModel = 'haiku';
+writeFileSync(providerFile, `${JSON.stringify(providerData, null, 2)}\n`, 'utf8');
 
 const modelTier = process.env.BLACKBOX_SMOKE_MODEL_TIER || 'haiku';
 if (!['haiku', 'sonnet'].includes(modelTier)) {
@@ -96,8 +101,6 @@ const definition = {
   target: { type: 'project', projectId: workspace },
   cwds: [workspace],
   target_thread_id: null,
-  provider_id: activeProvider.id,
-  provider_revision: Number(activeProvider.revision || 1),
   created_at: 0,
   updated_at: 0,
 };
@@ -377,10 +380,10 @@ try {
     .filter((event) => event.eventType === 'tool_use')
     .map((event) => event.toolName)
     .filter(Boolean);
-  if (run.status !== 'PENDING_REVIEW') {
-    throw new Error(`Scheduled run did not reach review: ${run.error || run.status}`);
+  if (run.status !== 'SUCCEEDED') {
+    throw new Error(`Scheduled run did not succeed: ${run.error || run.status}`);
   }
-  report.checks.pendingReviewRecorded = true;
+  report.checks.succeededRecorded = true;
   report.checks.bashToolRecorded = report.toolUses.includes('Bash');
   if (!report.checks.bashToolRecorded) throw new Error('Scheduled run trace did not record Bash');
   report.checks.resultMarkerVerified = existsSync(resultFile)

@@ -96,13 +96,21 @@ struct SessionMetadataImports {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConversationRuntimePreference {
-    /// `None` means the conversation explicitly uses the native Claude login.
+    /// `None` is a legacy or incomplete route and is migrated to user defaults
+    /// before the next conversation turn starts.
     provider_id: Option<String>,
     /// Stable logical tier; provider-specific model IDs remain in providers.json.
     selected_model: String,
+    /// Stable logical tier used by subagents and retrieval spawned from this conversation.
+    #[serde(default = "default_conversation_auxiliary_model")]
+    auxiliary_model: String,
     /// Native-only exact model override from ANTHROPIC_CUSTOM_MODEL_OPTION.
     #[serde(default)]
     custom_model_id: Option<String>,
+}
+
+fn default_conversation_auxiliary_model() -> String {
+    "sonnet".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -390,6 +398,14 @@ fn normalize_conversation_runtime_preferences(
                 "fable" | "opus" | "sonnet" | "haiku"
             ) {
                 return None;
+            }
+
+            preference.auxiliary_model = preference.auxiliary_model.trim().to_lowercase();
+            if !matches!(
+                preference.auxiliary_model.as_str(),
+                "fable" | "opus" | "sonnet" | "haiku"
+            ) {
+                preference.auxiliary_model = default_conversation_auxiliary_model();
             }
 
             preference.provider_id = preference.provider_id.and_then(|provider_id| {

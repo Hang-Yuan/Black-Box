@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   clearConversationViewStateForTests,
   loadChatScrollPosition,
+  loadConversationPanelState,
   loadFileScrollPosition,
   loadFileTreeScrollPosition,
   saveChatScrollPosition,
+  saveConversationPanelState,
   saveFileScrollPosition,
   saveFileTreeScrollPosition,
 } from '../lib/conversation-view-state';
@@ -13,6 +15,7 @@ import {
   saveConversationFileState,
   useFileStore,
 } from '../stores/fileStore';
+import { useSettingsStore } from '../stores/settingsStore';
 
 describe('conversation reading position', () => {
   beforeEach(() => {
@@ -24,6 +27,11 @@ describe('conversation reading position', () => {
       loadingFolders: new Set(),
       previewSnapshots: {},
       explorerSnapshots: {},
+    });
+    useSettingsStore.setState({
+      secondaryPanelOpen: false,
+      secondaryPanelTab: 'files',
+      secondaryPanelWidth: 300,
     });
   });
 
@@ -50,6 +58,21 @@ describe('conversation reading position', () => {
     expect(loadFileTreeScrollPosition('session-a', '/tmp/project')).toBe(680);
     expect(loadFileTreeScrollPosition('session-b', '/tmp/project')).toBe(120);
     expect(loadFileTreeScrollPosition('session-a', '/tmp/other')).toBe(42);
+  });
+
+  it('keeps the right panel open state, tab, and width per conversation', () => {
+    saveConversationPanelState('session-a', { open: true, tab: 'activity', width: 420 });
+    saveConversationPanelState('session-b', { open: false, tab: 'files', width: 300 });
+    expect(loadConversationPanelState('session-a')).toEqual({
+      open: true,
+      tab: 'activity',
+      width: 420,
+    });
+    expect(loadConversationPanelState('session-b')).toEqual({
+      open: false,
+      tab: 'files',
+      width: 300,
+    });
   });
 
   it('restores each conversation open document and unsaved edit buffer', () => {
@@ -124,6 +147,11 @@ describe('conversation reading position', () => {
   });
 
   it('switches preview and explorer state as one conversation transaction', () => {
+    useSettingsStore.setState({
+      secondaryPanelOpen: true,
+      secondaryPanelTab: 'activity',
+      secondaryPanelWidth: 410,
+    });
     useFileStore.setState({
       selectedFile: '/tmp/project-a/report.md',
       fileContent: 'draft A',
@@ -135,6 +163,11 @@ describe('conversation reading position', () => {
     });
     saveConversationFileState('session-a');
 
+    useSettingsStore.setState({
+      secondaryPanelOpen: false,
+      secondaryPanelTab: 'files',
+      secondaryPanelWidth: 320,
+    });
     useFileStore.setState({
       selectedFile: '/tmp/project-b/notes.md',
       fileContent: 'notes B',
@@ -153,5 +186,10 @@ describe('conversation reading position', () => {
     expect(Array.from(useFileStore.getState().expandedFolders)).toEqual([
       '/tmp/project-a/docs',
     ]);
+    expect(useSettingsStore.getState()).toMatchObject({
+      secondaryPanelOpen: true,
+      secondaryPanelTab: 'activity',
+      secondaryPanelWidth: 410,
+    });
   });
 });

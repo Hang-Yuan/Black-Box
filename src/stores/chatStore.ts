@@ -188,11 +188,22 @@ export interface SessionMeta {
   modelSwitchPendingText?: string;
   /** Explicit teardown intent for the current shutdown path.
    *  Used to distinguish user Stop from switch/delete/rewind finalization. */
-  teardownReason?: 'stop' | 'rewind' | 'plan-approve' | 'delete' | 'switch';
+  teardownReason?:
+    | 'stop'
+    | 'rewind'
+    | 'plan-approve'
+    | 'delete'
+    | 'archive'
+    | 'idle-timeout'
+    | 'switch';
   /** The latest user turn has been rendered locally but the model has not yet
    *  emitted any stream event acknowledging it. Used so Stop can retract and
    *  merge that turn back into the next draft instead of leaving a ghost bubble. */
   pendingTurnMessageId?: string;
+  /** True while the current foreground turn was launched through the Goal
+   *  composer entry point. This is a display signal for the live turn, not a
+   *  separate Goal lifecycle or durable Goal state. */
+  goalRequestActive?: boolean;
   pendingTurnInput?: string;
   pendingTurnAttachments?: FileAttachment[];
   /** Original text for the active turn. Kept through the result boundary so a
@@ -647,7 +658,11 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             isStreaming: false,
             partialText: '',
             partialThinking: '',
-            sessionMeta: { ...tab.sessionMeta, apiRetry: undefined },
+            sessionMeta: {
+              ...tab.sessionMeta,
+              apiRetry: undefined,
+              goalRequestActive: undefined,
+            },
           }
           : {}),
         // Sync activity status with session status

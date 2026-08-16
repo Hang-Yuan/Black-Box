@@ -135,6 +135,26 @@ describe('appearance system regressions', () => {
     expect(userAvatar).not.toContain('stroke="white"');
   });
 
+  it('keeps provider thinking as small, default-collapsed transcript rows', () => {
+    const thinkingBlock = messageBubble.slice(
+      messageBubble.indexOf('function ThinkingMsg'),
+      messageBubble.indexOf('/* PermissionMsg'),
+    );
+    expect(thinkingBlock).toContain('<details className="group">');
+    expect(thinkingBlock).not.toMatch(/<details[^>]*\sopen(?:=|\s|>)/);
+    expect(thinkingBlock).toContain('text-[11px]');
+    expect(thinkingBlock).toContain("{t('msg.thinking')}");
+  });
+
+  it('bounds expanded Bash commands inside an internally scrollable frame', () => {
+    const expandedToolStart = messageBubble.indexOf('const renderExpandedContent');
+    const expandedToolEnd = messageBubble.indexOf('// Determine if expand makes sense', expandedToolStart);
+    const expandedToolBlock = messageBubble.slice(expandedToolStart, expandedToolEnd);
+    expect(expandedToolBlock).toContain('rounded-lg border');
+    expect(expandedToolBlock).toContain('max-h-60 overflow-auto overscroll-contain');
+    expect(expandedToolBlock).toContain('bg-bg-secondary/35');
+  });
+
   it('routes primary glow, drag, provider, and crash surfaces through appearance tokens', () => {
     expect(chatPanel).toContain('var(--color-accent-glow)');
     expect(chatPanel).not.toContain('rgba(59,111,224,0.12)');

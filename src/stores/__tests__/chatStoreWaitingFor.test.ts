@@ -117,6 +117,18 @@ describe('chatStore · metadata-only waitingFor', () => {
     },
   );
 
+  it('keeps the Goal live marker through busy states and clears it at settlement', () => {
+    beginTab('goal-live');
+    const store = useChatStore.getState();
+    store.setSessionMeta('goal-live', { goalRequestActive: true });
+
+    store.setSessionStatus('goal-live', 'reconnecting');
+    expect(useChatStore.getState().getTab('goal-live')?.sessionMeta.goalRequestActive).toBe(true);
+
+    store.setSessionStatus('goal-live', 'completed');
+    expect(useChatStore.getState().getTab('goal-live')?.sessionMeta.goalRequestActive).toBeUndefined();
+  });
+
   it('isolates simultaneous waiting kinds across tabs', () => {
     beginTab('tab-a');
     beginTab('tab-b');

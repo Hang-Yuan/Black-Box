@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { bridge, type ProvidersFile } from '../lib/tauri-bridge';
+import { isModelTier, type ModelTier } from './settingsStore';
 import {
   PROVIDER_PRESETS,
   inferProviderAuthScheme,
@@ -36,6 +37,9 @@ export interface ApiProvider {
 
 interface ProviderState {
   providers: ApiProvider[];
+  defaultApi: string | null;
+  defaultMainModel: ModelTier | null;
+  defaultAuxiliaryModel: ModelTier | null;
   activeProviderId: string | null;
   loaded: boolean;
 
@@ -46,7 +50,21 @@ interface ProviderState {
   deleteProvider: (id: string) => Promise<void>;
   clearProviderCredential: (id: string) => Promise<void>;
   setActive: (id: string | null) => void;
+  setDefaultApi: (id: string | null) => void;
+  setDefaultMainModel: (model: ModelTier | null) => void;
+  setDefaultAuxiliaryModel: (model: ModelTier | null) => void;
   getActive: () => ApiProvider | null;
+}
+
+const LEGACY_SYSTEM_API_ID = 'system';
+
+export function hasUsableProviderCredential(
+  provider: Pick<ApiProvider, 'apiKey' | 'credentialState'> | null | undefined,
+): boolean {
+  return Boolean(
+    provider
+    && (provider.apiKey?.trim() || provider.credentialState === 'local_file'),
+  );
 }
 
 function generateId(): string {
@@ -337,16 +355,37 @@ function enqueueProviderSave(
     if (_persistedGeneration >= _dirtyGeneration) return;
 
     const targetGeneration = _dirtyGeneration;
-    const { providers, activeProviderId } = get();
+    const {
+      providers,
+      activeProviderId,
+      defaultApi,
+      defaultMainModel,
+      defaultAuxiliaryModel,
+    } = get();
     const capturedActiveProviderId = activeProviderId;
+    const capturedDefaultApi = defaultApi;
+    const capturedDefaultMainModel = defaultMainModel;
+    const capturedDefaultAuxiliaryModel = defaultAuxiliaryModel;
     const snapshots = new Map(providers.map((provider) => [provider.id, provider]));
     const data: ProvidersFile = {
-      version: 3,
+      version: 4,
+      defaultApi,
+      defaultMainModel,
+      defaultAuxiliaryModel,
       activeProviderId,
       providers,
     };
     const saved = await bridge.saveProviders(data);
     set((state) => ({
+      defaultApi: state.defaultApi === capturedDefaultApi
+        ? saved.defaultApi
+        : state.defaultApi,
+      defaultMainModel: state.defaultMainModel === capturedDefaultMainModel
+        ? saved.defaultMainModel
+        : state.defaultMainModel,
+      defaultAuxiliaryModel: state.defaultAuxiliaryModel === capturedDefaultAuxiliaryModel
+        ? saved.defaultAuxiliaryModel
+        : state.defaultAuxiliaryModel,
       activeProviderId: state.activeProviderId === capturedActiveProviderId
         ? saved.activeProviderId
         : state.activeProviderId,
@@ -385,6 +424,9 @@ function debouncedSave(state: ProviderState) {
 
 export const useProviderStore = create<ProviderState>()((set, get) => ({
   providers: [],
+  defaultApi: null,
+  defaultMainModel: null,
+  defaultAuxiliaryModel: null,
   activeProviderId: null,
   loaded: false,
 
@@ -396,6 +438,14 @@ export const useProviderStore = create<ProviderState>()((set, get) => ({
       try {
         let data = await bridge.loadProviders();
         let needsSave = false;
+
+        // `system` was the retired native-login pseudo-provider. Defaults now
+        // name one real, credentialed API provider; keep old files readable
+        // while forcing an explicit replacement before any new process starts.
+        if (data.defaultApi === LEGACY_SYSTEM_API_ID) {
+          data.defaultApi = null;
+          needsSave = true;
+        }
 
         // If providers.json is empty, try migrating from old settingsStore data
         if (data.providers.length === 0) {
@@ -424,10 +474,28 @@ export const useProviderStore = create<ProviderState>()((set, get) => ({
           return { ...presetMigrated, authScheme };
         });
 
+        if (data.defaultApi) {
+          const defaultProvider = data.providers.find(
+            (provider) => provider.id === data.defaultApi,
+          );
+          if (
+            !defaultProvider
+            || !hasUsableProviderCredential(defaultProvider)
+          ) {
+            data.defaultApi = null;
+            needsSave = true;
+          }
+        }
+
         if (needsSave) data = await bridge.saveProviders(data);
 
         set({
           providers: data.providers as ApiProvider[],
+          defaultApi: data.defaultApi,
+          defaultMainModel: isModelTier(data.defaultMainModel) ? data.defaultMainModel : null,
+          defaultAuxiliaryModel: isModelTier(data.defaultAuxiliaryModel)
+            ? data.defaultAuxiliaryModel
+            : null,
           activeProviderId: data.activeProviderId,
           loaded: true,
         });
@@ -501,6 +569,9 @@ export const useProviderStore = create<ProviderState>()((set, get) => ({
     const saved = await bridge.deleteProvider(id);
     set({
       providers: saved.providers as ApiProvider[],
+      defaultApi: saved.defaultApi,
+      defaultMainModel: saved.defaultMainModel,
+      defaultAuxiliaryModel: saved.defaultAuxiliaryModel,
       activeProviderId: saved.activeProviderId,
     });
   },
@@ -512,6 +583,9 @@ export const useProviderStore = create<ProviderState>()((set, get) => ({
     const saved = await bridge.clearProviderCredential(id);
     set({
       providers: saved.providers as ApiProvider[],
+      defaultApi: saved.defaultApi,
+      defaultMainModel: saved.defaultMainModel,
+      defaultAuxiliaryModel: saved.defaultAuxiliaryModel,
       activeProviderId: saved.activeProviderId,
     });
   },
@@ -519,6 +593,36 @@ export const useProviderStore = create<ProviderState>()((set, get) => ({
   setActive: (id) => {
     if (get().activeProviderId === id) return;
     set({ activeProviderId: id });
+    markProviderStateDirty();
+    debouncedSave(get());
+  },
+
+  setDefaultApi: (id) => {
+    if (id) {
+      const provider = get().providers.find((candidate) => candidate.id === id);
+      if (
+        !provider
+        || !hasUsableProviderCredential(provider)
+      ) return;
+    }
+    if (get().defaultApi === id) return;
+    set({ defaultApi: id });
+    markProviderStateDirty();
+    debouncedSave(get());
+  },
+
+  setDefaultMainModel: (model) => {
+    if (model && !isModelTier(model)) return;
+    if (get().defaultMainModel === model) return;
+    set({ defaultMainModel: model });
+    markProviderStateDirty();
+    debouncedSave(get());
+  },
+
+  setDefaultAuxiliaryModel: (model) => {
+    if (model && !isModelTier(model)) return;
+    if (get().defaultAuxiliaryModel === model) return;
+    set({ defaultAuxiliaryModel: model });
     markProviderStateDirty();
     debouncedSave(get());
   },

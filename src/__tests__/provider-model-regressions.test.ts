@@ -105,6 +105,25 @@ describe('provider editing regressions', () => {
     expect(quickSelector).not.toContain('{provider.apiKey}');
   });
 
+  it('exposes three user-owned system defaults without provider star shortcuts', () => {
+    expect(providerManager).toContain('data-testid="default-system-configuration"');
+    expect(providerManager).toContain('data-testid="default-system-api"');
+    expect(providerManager).toContain('data-testid="default-main-model"');
+    expect(providerManager).toContain('data-testid="default-auxiliary-model"');
+    expect(providerManager).toContain('setDefaultApi');
+    expect(providerManager).toContain('setDefaultMainModel');
+    expect(providerManager).toContain('setDefaultAuxiliaryModel');
+    expect(providerManager).not.toContain('onSetDefault');
+    expect(providerManager).not.toContain('★');
+    expect(quickSelector).toContain('data-testid="default-system-configuration-entry"');
+    expect(providerManager).not.toContain("t('provider.systemLogin')");
+    expect(providerManager).not.toContain('provider-inherit-button');
+    expect(providerManager).not.toContain('setActive(null)');
+    expect(quickSelector).not.toContain("t('provider.systemLogin')");
+    expect(quickSelector).not.toContain('select(null)');
+    expect(inputBar).toContain('ensureConversationRuntimeReady(tabId)');
+  });
+
   it('keeps locally stored credentials out of exports and removes Keychain migration UX', () => {
     const exportBlock = apiConfig.slice(
       apiConfig.indexOf('export function exportProvider'),
@@ -114,7 +133,7 @@ describe('provider editing regressions', () => {
     expect(providerManager).not.toContain('legacyCredentialCount');
     expect(providerManager).not.toContain('migrationConfirm');
     expect(providerManager).not.toContain('migrateLegacyCredentials');
-    expect(providerStore).toContain('version: 3');
+    expect(providerStore).toContain('version: 4');
     expect(providerStore).toContain('credentialRef: persisted.credentialRef');
   });
 
@@ -270,7 +289,7 @@ describe('single spawn configuration capture', () => {
     useSettingsStore.setState({ customModelId: null });
   });
 
-  it('uses an explicit custom model only on the native Claude route', () => {
+  it('fails closed when no credentialed provider route is active', () => {
     useProviderStore.setState({
       providers: [],
       activeProviderId: null,
@@ -284,12 +303,9 @@ describe('single spawn configuration capture', () => {
       agentTeamsEnabled: false,
     });
 
-    expect(captureSpawnConfiguration()).toMatchObject({
-      ok: true,
-      providerId: '',
-      model: 'claude-custom-native',
-      auxiliaryModelTier: 'haiku',
-      auxiliaryModel: 'claude-haiku-4-5-20251001',
+    expect(captureSpawnConfiguration()).toEqual({
+      ok: false,
+      reason: 'provider_unavailable',
     });
     useSettingsStore.setState({ customModelId: null });
   });
@@ -404,7 +420,8 @@ describe('single spawn configuration capture', () => {
     expect(chatPanel).toContain('const spawnConfig = await flushAndCaptureSpawnConfiguration();');
     expect(historicalFork).toContain('const config = await flushAndCaptureSpawnConfiguration();');
     expect(automations).toContain('await useProviderStore.getState().flushSave();');
-    expect(automations).toContain('const persistedProviders = useProviderStore.getState().providers;');
+    expect(automations).not.toContain('const persistedProviders = useProviderStore.getState().providers;');
+    expect(automations).not.toContain('provider_revision:');
     expect(sessionLifecycle).toContain('await useProviderStore.getState().flushSave();');
     expect(streamProcessor).toContain('const sessionHashMismatch = tab?.sessionMeta.spawnConfigHash !== undefined');
     expect(streamProcessor).toContain('hashMismatch || sessionHashMismatch || stdinMismatch');

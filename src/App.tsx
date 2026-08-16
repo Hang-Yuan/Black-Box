@@ -7,6 +7,7 @@ import { CommandPalette } from './components/commands/CommandPalette';
 import { SettingsPanel } from './components/settings/SettingsPanel';
 import { ExtensionCenter } from './components/extensions/ExtensionCenter';
 import { AutomationCenter } from './components/automations/AutomationCenter';
+import { AutomationSessionMonitor } from './components/automations/AutomationSessionMonitor';
 import { TaskCenterView } from './components/activity/TaskCenterView';
 import { ImageLightbox } from './components/shared/ImageLightbox';
 import { ChangelogModal } from './components/shared/ChangelogModal';
@@ -15,6 +16,7 @@ import { useSettingsStore } from './stores/settingsStore';
 import { useProviderStore, type ApiProvider } from './stores/providerStore';
 import {
   restoreConversationFileState,
+  resetConversationFileState,
   saveConversationFileState,
   useFileStore,
 } from './stores/fileStore';
@@ -30,6 +32,8 @@ import { buildNativeWorkflowCommand } from './lib/native-workflow';
 import { parseSessionMessages } from './lib/session-loader';
 import {
   settleOrphanedBackendProcesses,
+  startWarmBackendProcessReaper,
+  teardownTabBackendProcesses,
   teardownSession,
   waitForStdinCleared,
 } from './lib/sessionLifecycle';
@@ -181,6 +185,9 @@ function App() {
         const state = useProviderStore.getState();
         return {
           loaded: state.loaded,
+          defaultApi: state.defaultApi,
+          defaultMainModel: state.defaultMainModel,
+          defaultAuxiliaryModel: state.defaultAuxiliaryModel,
           activeProviderId: state.activeProviderId,
           providers: state.providers.map((provider) => ({
             id: provider.id,
@@ -528,6 +535,7 @@ function App() {
         }
         if (!cwd) {
           useSessionStore.getState().setSelectedSession(null);
+          resetConversationFileState();
           useSettingsStore.getState().setWorkingDirectory('');
           return { action: 'newSession' };
         }
@@ -601,7 +609,8 @@ function App() {
       },
       closeWindow() {
         // The dev socket may evaluate a mutating expression more than once.
-        // Never issue duplicate native close commands (Tauri close is one-shot).
+        // Ignore only an overlapping native close request. Once the macOS
+        // window is hidden, later hide/show cycles remain valid.
         if ((window as any).__blackbox_close_started) {
           return { closeRequested: true, duplicateIgnored: true };
         }
@@ -610,8 +619,10 @@ function App() {
         void getCurrentWindow().close()
           .then(() => {
             (window as any).__blackbox_close_result = { state: 'resolved' };
+            (window as any).__blackbox_close_started = false;
           })
           .catch((error) => {
+            (window as any).__blackbox_close_started = false;
             (window as any).__blackbox_close_result = {
               state: 'rejected',
               error: error instanceof Error ? error.message : String(error),
@@ -640,11 +651,7 @@ function App() {
         const sessionId = useSessionStore.getState().selectedSessionId;
         if (!sessionId) return { deleted: false, reason: 'no active session' };
         const session = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
-        const stdinId = useChatStore.getState().tabs.get(sessionId)?.sessionMeta?.stdinId;
-        if (stdinId) {
-          await teardownSession(stdinId, sessionId, 'delete');
-          await waitForStdinCleared(sessionId, stdinId).catch(() => {});
-        }
+        await teardownTabBackendProcesses(sessionId, 'delete');
         if (session?.path) {
           await bridge.deleteSession(sessionId, session.path);
         } else {
@@ -655,6 +662,7 @@ function App() {
         useAgentStore.getState().clearCacheForTab(sessionId);
         useAgentStore.getState().clearAgents();
         useSessionStore.getState().setSelectedSession(null);
+        resetConversationFileState();
         useSettingsStore.getState().setWorkingDirectory('');
         await useSessionStore.getState().fetchSessions();
         return {
@@ -681,9 +689,19 @@ function App() {
   // After refresh, frontend state (stdinToTab, listeners) is wiped, but Rust ProcessManager
   // may still hold live child processes. Kill any that have no corresponding frontend mapping.
   useEffect(() => {
-    void settleOrphanedBackendProcesses().catch((error) => {
-      console.error('[BLACKBOX] Startup CLI recovery failed:', error);
-    });
+    let disposed = false;
+    let stopWarmReaper: (() => void) | undefined;
+    void settleOrphanedBackendProcesses()
+      .then(() => {
+        if (!disposed) stopWarmReaper = startWarmBackendProcessReaper();
+      })
+      .catch((error) => {
+        console.error('[BLACKBOX] Startup CLI recovery failed:', error);
+      });
+    return () => {
+      disposed = true;
+      stopWarmReaper?.();
+    };
   }, []);
 
   // macOS Full Disk Access check — detect TCC restrictions on startup
@@ -894,6 +912,7 @@ function App() {
 
   return (
     <>
+      <AutomationSessionMonitor />
       <AppShell
         sidebar={<Sidebar />}
         main={mainView === 'extensions'

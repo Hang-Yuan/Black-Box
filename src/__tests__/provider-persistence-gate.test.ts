@@ -39,6 +39,9 @@ describe('provider persistence barrier', () => {
     const { loadProviders, saveProviders, useProviderStore } = await freshModules();
     loadProviders.mockResolvedValue({
       version: 3,
+      defaultApi: null,
+      defaultMainModel: null,
+      defaultAuxiliaryModel: null,
       activeProviderId: 'qwen-old',
       providers: [provider({
         id: 'qwen-old',
@@ -76,6 +79,9 @@ describe('provider persistence barrier', () => {
     const { loadProviders, saveProviders, useProviderStore } = await freshModules();
     loadProviders.mockResolvedValue({
       version: 3,
+      defaultApi: null,
+      defaultMainModel: null,
+      defaultAuxiliaryModel: null,
       activeProviderId: 'gemini-old',
       providers: [provider({
         id: 'gemini-old',
@@ -113,6 +119,9 @@ describe('provider persistence barrier', () => {
     const { loadProviders, saveProviders, useProviderStore } = await freshModules();
     loadProviders.mockResolvedValue({
       version: 3,
+      defaultApi: null,
+      defaultMainModel: null,
+      defaultAuxiliaryModel: null,
       activeProviderId: 'deepseek-current',
       providers: [provider({
         id: 'deepseek-current',
@@ -150,6 +159,30 @@ describe('provider persistence barrier', () => {
     await useProviderStore.getState().flushSave();
 
     expect(saveProviders).not.toHaveBeenCalled();
+  });
+
+  it('keeps all system defaults when the visible conversation switches routes', async () => {
+    const { saveProviders, useProviderStore } = await freshModules();
+    saveProviders.mockImplementation(async (data) => data);
+    useProviderStore.setState({
+      providers: [provider()],
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+      activeProviderId: 'relay',
+      loaded: true,
+    });
+
+    useProviderStore.getState().setActive(null);
+    await useProviderStore.getState().flushSave();
+
+    expect(saveProviders).toHaveBeenCalledTimes(1);
+    expect(saveProviders.mock.calls[0][0]).toMatchObject({
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+      activeProviderId: null,
+    });
   });
 
   it('persists an immediate key switch before capturing backend spawn metadata', async () => {

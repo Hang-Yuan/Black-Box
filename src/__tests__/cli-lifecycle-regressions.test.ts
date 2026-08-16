@@ -11,10 +11,15 @@ const resolver = readFileSync(
   resolve(__dirname, '../../src-tauri/src/commands/cli_resolver.rs'),
   'utf8',
 );
+const clientRuntime = readFileSync(
+  resolve(__dirname, '../../src-tauri/src/client_runtime.rs'),
+  'utf8',
+);
 
 describe('Claude CLI lifecycle regressions', () => {
   it('routes updates through the installation owner', () => {
-    expect(backend).toContain('CliInstallMethod::Native => run_cli_owner_update(&path, &["update"])');
+    expect(backend).toContain('CliInstallMethod::Native =>');
+    expect(backend).toContain('run_native_cli_owner_update(&app, &path, expected_version.as_deref())');
     expect(backend).toContain('"brew", &["upgrade", "--cask", "claude-code"]');
     expect(backend).toContain('"winget"');
     expect(backend).toContain('@anthropic-ai/claude-code@latest');
@@ -39,6 +44,31 @@ describe('Claude CLI lifecycle regressions', () => {
     expect(cliTab).toContain("t('cli.confirmStopSessionsForUpdate')");
     expect(backend).toContain('.manage(CliMaintenanceState::default())');
     expect(backend).toContain('CLI_UPDATE_IN_PROGRESS.store(true');
+  });
+
+  it('reports native updater bytes and reconnects remounted settings to the same update lease', () => {
+    expect(backend).toContain('native_owner_staging_bytes');
+    expect(backend).toContain('native_owner_update_percent');
+    expect(backend).toContain('"native_stalled"');
+    expect(backend).toContain('maintenance_in_progress: cli_update_in_progress()');
+    expect(backend).toContain('while cli_update_in_progress()');
+    expect(cliTab).toContain('blockers.maintenanceInProgress');
+    expect(cliTab).toContain('setObservingExistingUpdate(true)');
+    expect(cliTab).toContain("t('cli.nativeDownloadStalled')");
+  });
+
+  it('prevents Claude background updates while keeping the visible manual owner path', () => {
+    expect(clientRuntime).toContain('DISABLE_BACKGROUND_AUTOUPDATER_ENV');
+    expect(clientRuntime).toContain('command.env(DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1")');
+    expect(resolver).toContain('DISABLE_BACKGROUND_AUTOUPDATER_ENV');
+    expect(backend).toContain('.env(client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1")');
+    expect(backend).toContain('Some("claude update".to_string())');
+  });
+
+  it('uses a transparent menu-bar template instead of the opaque application icon', () => {
+    expect(backend).toContain('fn menu_bar_template_icon()');
+    expect(backend).toContain('tray = tray.icon(menu_bar_template_icon())');
+    expect(backend).not.toContain('tray = tray.icon(icon.clone())');
   });
 
   it('shows source, release channel, auto-update state, and manual command', () => {

@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { useProviderStore, type ApiProvider } from '../../stores/providerStore';
+import {
+  hasUsableProviderCredential,
+  useProviderStore,
+  type ApiProvider,
+} from '../../stores/providerStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useT } from '../../lib/i18n';
 import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
+import { getModelDisplayOptions } from '../../lib/api-provider';
 
 export function maskedProviderKey(provider: ApiProvider): string {
   if (provider.credentialHint?.trim()) return provider.credentialHint.trim();
@@ -25,6 +30,9 @@ function KeyIcon() {
 export function ProviderQuickSelector() {
   const t = useT();
   const providers = useProviderStore((state) => state.providers);
+  const defaultApi = useProviderStore((state) => state.defaultApi);
+  const defaultMainModel = useProviderStore((state) => state.defaultMainModel);
+  const defaultAuxiliaryModel = useProviderStore((state) => state.defaultAuxiliaryModel);
   const activeProviderId = useProviderStore((state) => state.activeProviderId);
   const loaded = useProviderStore((state) => state.loaded);
   const setActive = useProviderStore((state) => state.setActive);
@@ -54,9 +62,22 @@ export function ProviderQuickSelector() {
   useEffect(() => subscribeHeaderPopover('provider', () => setOpen(false)), []);
 
   const active = providers.find((provider) => provider.id === activeProviderId) ?? null;
-  const activeLabel = active?.name || (activeProviderId ? t('provider.unnamed') : t('provider.inheritShort'));
+  const activeLabel = active?.name
+    || (activeProviderId ? t('provider.unnamed') : t('provider.notConfigured'));
+  const defaultProvider = defaultApi
+    ? providers.find((provider) => provider.id === defaultApi) ?? null
+    : null;
+  const defaultApiLabel = defaultProvider?.name;
+  const defaultModelOptions = getModelDisplayOptions(defaultProvider);
+  const defaultMainLabel = defaultModelOptions.find((option) => option.id === defaultMainModel)?.short;
+  const defaultAuxiliaryLabel = defaultModelOptions.find(
+    (option) => option.id === defaultAuxiliaryModel,
+  )?.short;
+  const defaultsSummary = defaultApiLabel && defaultMainLabel && defaultAuxiliaryLabel
+    ? `${defaultApiLabel} · ${defaultMainLabel} · ${defaultAuxiliaryLabel}`
+    : t('provider.notConfigured');
 
-  const select = (providerId: string | null) => {
+  const select = (providerId: string) => {
     setActive(providerId);
     setOpen(false);
   };
@@ -99,39 +120,47 @@ export function ProviderQuickSelector() {
           </div>
           <button
             type="button"
-            role="menuitemradio"
-            aria-checked={!activeProviderId}
-            onClick={() => select(null)}
-            className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-smooth
-              ${!activeProviderId
-                ? 'bg-accent/10 text-accent'
-                : 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'}`}
+            data-testid="default-system-configuration-entry"
+            onClick={() => {
+              useSettingsStore.getState().openSettings('provider');
+              setOpen(false);
+            }}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs
+              text-text-muted transition-smooth hover:bg-bg-secondary hover:text-text-primary"
           >
-            <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-bg-tertiary">
+            <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
               <KeyIcon />
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block truncate font-medium">{t('provider.inherit')}</span>
-              <span className="block truncate text-[10px] text-text-tertiary">{t('provider.inheritDesc')}</span>
+              <span className="block truncate font-medium">{t('provider.systemDefaults')}</span>
+              <span className="block truncate text-[10px] text-text-tertiary">
+                {defaultsSummary}
+              </span>
             </span>
-            {!activeProviderId && <span className="text-accent">✓</span>}
+            <span className="text-text-tertiary">›</span>
           </button>
 
+          <div className="mx-2 my-1 border-t border-border-subtle" />
           {providers.map((provider) => {
             const selected = provider.id === activeProviderId;
             const keyHint = maskedProviderKey(provider);
+            const available = hasUsableProviderCredential(provider);
             return (
               <button
                 key={provider.id}
                 type="button"
                 role="menuitemradio"
                 aria-checked={selected}
+                aria-disabled={!available}
+                disabled={!available}
                 data-provider-id={provider.id}
                 onClick={() => select(provider.id)}
                 className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-smooth
                   ${selected
                     ? 'bg-accent/10 text-accent'
-                    : 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'}`}
+                    : available
+                      ? 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'
+                      : 'cursor-not-allowed text-text-tertiary opacity-50'}`}
               >
                 <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md bg-bg-tertiary">
                   <KeyIcon />

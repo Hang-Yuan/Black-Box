@@ -1,4 +1,8 @@
-import { useProviderStore, type ApiProvider } from '../stores/providerStore';
+import {
+  hasUsableProviderCredential,
+  useProviderStore,
+  type ApiProvider,
+} from '../stores/providerStore';
 import {
   MODEL_OPTIONS,
   isModelTier,
@@ -289,6 +293,10 @@ export type SpawnConfigurationError =
   | Extract<ModelResolution, { ok: false }>
   | {
       ok: false;
+      reason: 'provider_unavailable';
+    }
+  | {
+      ok: false;
       reason: 'thinking_required';
       tier: ModelTier;
       providerName: string;
@@ -312,6 +320,9 @@ export function getSpawnConfigurationErrorMessage(
   error: SpawnConfigurationError,
   translate: (key: string) => string,
 ): string {
+  if (error.reason === 'provider_unavailable') {
+    return translate('provider.runtimeRouteUnavailable');
+  }
   if (error.reason === 'thinking_required') {
     return translate('provider.thinkingRequired')
       .replace('{provider}', error.providerName)
@@ -392,12 +403,15 @@ export function captureSpawnConfiguration(): SpawnConfigurationCapture {
   const settings = useSettingsStore.getState();
   const providerId = providerState.activeProviderId ?? '';
   const provider = providerState.providers.find((entry) => entry.id === providerId) ?? null;
-  // Native custom models never cross into a third-party provider route.
+  if (
+    !providerId
+    || !provider
+    || !hasUsableProviderCredential(provider)
+  ) {
+    return { ok: false, reason: 'provider_unavailable' };
+  }
   const selectedModel = normalizeModelTier(settings.selectedModel);
-  const nativeCustomModel = provider ? null : settings.customModelId;
-  const resolution: ModelResolution = nativeCustomModel
-    ? { ok: true, model: nativeCustomModel }
-    : resolveModelAgainstProvider(selectedModel, provider);
+  const resolution = resolveModelAgainstProvider(selectedModel, provider);
   if (!resolution.ok) return resolution;
   const auxiliaryModelTier = normalizeModelTier(settings.auxiliaryModel);
   const auxiliaryResolution = resolveModelAgainstProvider(auxiliaryModelTier, provider);
@@ -434,7 +448,7 @@ export function captureSpawnConfiguration(): SpawnConfigurationCapture {
     configHash: [
       providerId,
       selectedModel,
-      nativeCustomModel ?? '',
+      '', // retired native custom-model slot; retained for hash compatibility
       auxiliaryModelTier,
       settings.thinkingLevel,
       settings.agentTeamsEnabled ? 'teams' : 'solo',

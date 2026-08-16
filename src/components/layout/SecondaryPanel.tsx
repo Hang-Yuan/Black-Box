@@ -23,6 +23,14 @@ export function SecondaryPanel() {
   const setTab = useSettingsStore((s) => s.setSecondaryTab);
   const togglePanel = useSettingsStore((s) => s.toggleSecondaryPanel);
 
+  const closePanel = () => {
+    window.dispatchEvent(new Event('blackbox:chat-layout-will-change'));
+    togglePanel();
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      window.dispatchEvent(new Event('blackbox:chat-layout-did-change'));
+    }));
+  };
+
   // Window dragging handled via CSS -webkit-app-region: drag on the top strip
 
   return (
@@ -51,7 +59,7 @@ export function SecondaryPanel() {
             </button>
           ))}
         </div>
-        <button onClick={togglePanel}
+        <button onClick={closePanel}
           className="p-1 rounded-md hover:bg-bg-tertiary
             text-text-tertiary transition-smooth" title={t('panel.close')}>
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none"

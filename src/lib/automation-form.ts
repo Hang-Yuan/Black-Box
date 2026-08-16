@@ -1,14 +1,10 @@
 import type { AutomationDefinition } from './tauri-bridge';
 
-/** Build a new scheduled-task draft from the user's current UI context. */
+/** Build a new scheduled-task draft with project context and inherited system defaults. */
 export function createAutomationDraft(
-  model: string,
   projectDirectory: string,
   targetThreadId: string | null,
   now = Date.now(),
-  providerId: string | null = null,
-  providerRevision: number | null = null,
-  auxiliaryModel = 'sonnet',
 ): AutomationDefinition {
   return {
     version: 1,
@@ -18,8 +14,8 @@ export function createAutomationDraft(
     prompt: '',
     status: 'ACTIVE',
     rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0',
-    model,
-    auxiliary_model: auxiliaryModel,
+    model: null,
+    auxiliary_model: null,
     reasoning_effort: 'high',
     agent_teams_enabled: false,
     data_write_subdirectories: [],
@@ -27,8 +23,7 @@ export function createAutomationDraft(
     target: { type: 'project', projectId: projectDirectory },
     cwds: projectDirectory ? [projectDirectory] : [],
     target_thread_id: targetThreadId,
-    provider_id: providerId,
-    provider_revision: providerRevision,
+    completion_probe: null,
     created_at: now,
     updated_at: now,
   };
@@ -43,9 +38,20 @@ export function prepareAutomationDefinitionForSave(
   draft: AutomationDefinition,
   rrule: string,
 ): AutomationDefinition {
+  // Old definitions can still carry these unknown fields in memory. Strip
+  // them without making infrastructure bindings part of the current API.
+  const legacyDraft = draft as AutomationDefinition & {
+    provider_id?: unknown;
+    provider_revision?: unknown;
+  };
+  const {
+    provider_id: _legacyProviderId,
+    provider_revision: _legacyProviderRevision,
+    ...portableDraft
+  } = legacyDraft;
   const projectId = draft.target?.projectId.trim() || '';
   return {
-    ...draft,
+    ...portableDraft,
     rrule,
     execution_environment: draft.kind === 'heartbeat'
       ? 'local'

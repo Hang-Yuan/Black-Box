@@ -2,8 +2,38 @@ import { create } from 'zustand';
 
 // --- Types ---
 
-export type AgentPhase = 'spawning' | 'thinking' | 'writing' | 'tool' | 'idle' | 'completed' | 'error';
+export type AgentPhase = 'spawning' | 'thinking' | 'writing' | 'tool' | 'idle' | 'completed' | 'interrupted' | 'error';
 export type AgentKind = 'main' | 'subagent' | 'teammate';
+export type AgentActivityKind = 'text' | 'tool';
+
+export interface AgentActivityEntry {
+  id: string;
+  kind: AgentActivityKind;
+  content: string;
+  timestamp: number;
+  toolName?: string;
+}
+
+export interface AgentActivityUpdate {
+  kind: AgentActivityKind;
+  content: string;
+  timestamp?: number;
+  toolName?: string;
+  /** Append a streaming delta to the latest text entry. */
+  append?: boolean;
+}
+
+const TERMINAL_AGENT_PHASES: ReadonlySet<AgentPhase> = new Set([
+  'idle',
+  'completed',
+  'interrupted',
+  'error',
+]);
+
+/** One authority for every surface that answers “is this agent still working?” */
+export function isAgentActive(agent: Pick<AgentNode, 'phase'>): boolean {
+  return !TERMINAL_AGENT_PHASES.has(agent.phase);
+}
 
 export interface AgentNode {
   id: string;
@@ -21,6 +51,12 @@ export interface AgentNode {
   model?: string;
   /** Claude background task id, retained only for event correlation. */
   taskId?: string;
+  /** Tool-use ids observed for the same task, including resumed launches. */
+  toolUseIds?: string[];
+  /** The Agent launch returned before the task itself reached a terminal state. */
+  background?: boolean;
+  /** Sanitized at presentation time; bounded execution detail for the opt-in panel. */
+  activity?: AgentActivityEntry[];
 }
 
 export type TeamTaskStatus = 'pending' | 'in_progress' | 'completed' | 'deleted';
@@ -45,9 +81,10 @@ interface AgentState {
   teamTaskCache: Map<string, Map<string, TeamTask>>;
 
   upsertAgent: (node: Partial<AgentNode> & { id: string }) => void;
+  appendActivity: (id: string, update: AgentActivityUpdate) => void;
   updatePhase: (id: string, phase: AgentPhase, currentTool?: string) => void;
   completeAgent: (id: string, phase?: AgentPhase) => void;
-  completeAll: (phase?: AgentPhase, preserveTeammates?: boolean) => void;
+  completeAll: (phase?: AgentPhase, preserveTeammates?: boolean, preserveBackground?: boolean) => void;
   setAgentIdle: (id: string) => void;
   resetForTurn: (description: string, preserveTeammates: boolean) => void;
   registerTeamTask: (toolUseId: string, input: Record<string, unknown>) => void;
@@ -66,6 +103,57 @@ interface AgentState {
 
 // --- Store ---
 
+const MAX_AGENT_ACTIVITY_ENTRIES = 24;
+const MAX_AGENT_ACTIVITY_CHARS = 6_000;
+let agentActivityCounter = 0;
+
+function mergeAgentActivity(
+  agent: AgentNode,
+  update: AgentActivityUpdate,
+): AgentNode {
+  const content = update.content.slice(0, MAX_AGENT_ACTIVITY_CHARS);
+  if (!content.trim()) return agent;
+  const activity = [...(agent.activity ?? [])];
+  const last = activity[activity.length - 1];
+
+  if (update.kind === 'text' && last?.kind === 'text') {
+    if (update.append) {
+      activity[activity.length - 1] = {
+        ...last,
+        content: `${last.content}${content}`.slice(-MAX_AGENT_ACTIVITY_CHARS),
+        timestamp: update.timestamp ?? Date.now(),
+      };
+      return { ...agent, activity };
+    }
+    if (content === last.content || last.content.startsWith(content)) return agent;
+    if (content.startsWith(last.content)) {
+      activity[activity.length - 1] = {
+        ...last,
+        content,
+        timestamp: update.timestamp ?? Date.now(),
+      };
+      return { ...agent, activity };
+    }
+  }
+
+  if (
+    update.kind === 'tool'
+    && last?.kind === 'tool'
+    && last.toolName === update.toolName
+    && last.content === content
+  ) return agent;
+
+  agentActivityCounter += 1;
+  activity.push({
+    id: `agent_activity_${Date.now()}_${agentActivityCounter}`,
+    kind: update.kind,
+    content,
+    timestamp: update.timestamp ?? Date.now(),
+    toolName: update.toolName,
+  });
+  return { ...agent, activity: activity.slice(-MAX_AGENT_ACTIVITY_ENTRIES) };
+}
+
 export const useAgentStore = create<AgentState>()((set, get) => ({
   agents: new Map(),
   teamTasks: new Map(),
@@ -76,17 +164,27 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     const next = new Map(get().agents);
     const existing = next.get(node.id);
     const merged = { ...existing, ...node } as AgentNode;
-    if (node.phase && !['idle', 'completed', 'error'].includes(node.phase)) {
+    if (node.phase && !TERMINAL_AGENT_PHASES.has(node.phase)) {
       merged.endTime = undefined;
     }
     next.set(node.id, merged);
     set({ agents: next });
   },
 
+  appendActivity: (id, update) => {
+    const next = new Map(get().agents);
+    const agent = next.get(id);
+    if (!agent || agent.isMain) return;
+    const merged = mergeAgentActivity(agent, update);
+    if (merged === agent) return;
+    next.set(id, merged);
+    set({ agents: next });
+  },
+
   updatePhase: (id, phase, currentTool) => {
     const next = new Map(get().agents);
     const agent = next.get(id);
-    if (agent && agent.phase !== 'completed' && agent.phase !== 'error') {
+    if (agent && agent.phase !== 'completed' && agent.phase !== 'interrupted' && agent.phase !== 'error') {
       if (agent.phase === 'writing' && phase === 'thinking') {
         return;
       }
@@ -98,17 +196,18 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   completeAgent: (id, phase = 'completed') => {
     const next = new Map(get().agents);
     const agent = next.get(id);
-    if (agent && agent.phase !== 'completed' && agent.phase !== 'error') {
+    if (agent && agent.phase !== 'completed' && agent.phase !== 'interrupted' && agent.phase !== 'error') {
       next.set(id, { ...agent, phase, endTime: Date.now(), currentTool: undefined });
       set({ agents: next });
     }
   },
 
-  completeAll: (phase = 'completed', preserveTeammates = false) => {
+  completeAll: (phase = 'completed', preserveTeammates = false, preserveBackground = false) => {
     const next = new Map(get().agents);
     let changed = false;
     for (const [id, agent] of next) {
-      if (agent.phase !== 'completed' && agent.phase !== 'error') {
+      if (agent.phase !== 'completed' && agent.phase !== 'interrupted' && agent.phase !== 'error') {
+        if (preserveBackground && agent.background && isAgentActive(agent)) continue;
         const nextPhase = preserveTeammates && agent.kind === 'teammate' && phase === 'completed'
           ? 'idle'
           : phase;
@@ -122,7 +221,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   setAgentIdle: (id) => {
     const next = new Map(get().agents);
     const agent = next.get(id);
-    if (!agent || agent.phase === 'error') return;
+    if (!agent || agent.phase === 'interrupted' || agent.phase === 'error') return;
     next.set(id, {
       ...agent,
       phase: agent.kind === 'teammate' ? 'idle' : 'completed',
@@ -134,10 +233,10 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
   resetForTurn: (description, preserveTeammates) => {
     const agents = new Map<string, AgentNode>();
-    if (preserveTeammates) {
-      for (const [id, agent] of get().agents) {
-        if (agent.kind === 'teammate') agents.set(id, { ...agent });
-      }
+    for (const [id, agent] of get().agents) {
+      const keepTeammate = preserveTeammates && agent.kind === 'teammate';
+      const keepBackground = agent.background && isAgentActive(agent);
+      if (keepTeammate || keepBackground) agents.set(id, { ...agent });
     }
     agents.set('main', {
       id: 'main',
@@ -287,7 +386,31 @@ export function resolveAgentId(
 ): string {
   if (!parentToolUseId) return 'main';
   if (agents.has(parentToolUseId)) return parentToolUseId;
+  for (const [id, agent] of agents) {
+    if (agent.toolUseIds?.includes(parentToolUseId)) return id;
+  }
   return 'main';
+}
+
+/** Resolve task lifecycle events across initial launches and resumed Agents.
+ * Claude may emit a fresh tool-use id for a resumed background task, while
+ * retaining the original task id. */
+export function resolveAgentEventId(
+  toolUseId: string | null | undefined,
+  taskId: string | null | undefined,
+  agents: Map<string, AgentNode>,
+): string | undefined {
+  if (toolUseId && agents.has(toolUseId)) return toolUseId;
+  if (toolUseId) {
+    for (const [id, agent] of agents) {
+      if (agent.toolUseIds?.includes(toolUseId)) return id;
+    }
+  }
+  if (!taskId) return undefined;
+  for (const [id, agent] of agents) {
+    if (agent.taskId === taskId) return id;
+  }
+  return undefined;
 }
 
 /** Compute nesting depth of an agent (main = 0, direct sub-agent = 1, etc.) */
@@ -317,7 +440,7 @@ export function upsertCachedAgent(
     const agents = new Map(caches.get(tabId) ?? []);
     const existing = agents.get(node.id);
     const merged = { ...existing, ...node } as AgentNode;
-    if (node.phase && !['idle', 'completed', 'error'].includes(node.phase)) {
+    if (node.phase && !TERMINAL_AGENT_PHASES.has(node.phase)) {
       merged.endTime = undefined;
     }
     agents.set(node.id, merged);
@@ -336,9 +459,27 @@ export function updateCachedAgentPhase(
     const caches = new Map(state.agentCache);
     const agents = new Map(caches.get(tabId) ?? []);
     const agent = agents.get(id);
-    if (!agent || agent.phase === 'completed' || agent.phase === 'error') return state;
+    if (!agent || agent.phase === 'completed' || agent.phase === 'interrupted' || agent.phase === 'error') return state;
     if (agent.phase === 'writing' && phase === 'thinking') return state;
     agents.set(id, { ...agent, phase, currentTool, endTime: undefined });
+    caches.set(tabId, agents);
+    return { agentCache: caches };
+  });
+}
+
+export function appendCachedAgentActivity(
+  tabId: string,
+  id: string,
+  update: AgentActivityUpdate,
+): void {
+  useAgentStore.setState((state) => {
+    const caches = new Map(state.agentCache);
+    const agents = new Map(caches.get(tabId) ?? []);
+    const agent = agents.get(id);
+    if (!agent || agent.isMain) return state;
+    const merged = mergeAgentActivity(agent, update);
+    if (merged === agent) return state;
+    agents.set(id, merged);
     caches.set(tabId, agents);
     return { agentCache: caches };
   });
@@ -365,12 +506,18 @@ export function settleCachedAgent(
   });
 }
 
-export function settleCachedTurn(tabId: string, failed: boolean, preserveTeammates: boolean): void {
+export function settleCachedTurn(
+  tabId: string,
+  failed: boolean,
+  preserveTeammates: boolean,
+  preserveBackground = false,
+): void {
   useAgentStore.setState((state) => {
     const caches = new Map(state.agentCache);
     const agents = new Map(caches.get(tabId) ?? []);
     for (const [id, agent] of agents) {
-      if (agent.phase === 'completed' || agent.phase === 'error') continue;
+      if (agent.phase === 'completed' || agent.phase === 'interrupted' || agent.phase === 'error') continue;
+      if (preserveBackground && agent.background && isAgentActive(agent)) continue;
       const phase: AgentPhase = failed
         ? 'error'
         : preserveTeammates && agent.kind === 'teammate'
@@ -388,10 +535,10 @@ export function resetCachedTurn(tabId: string, description: string, preserveTeam
     const caches = new Map(state.agentCache);
     const previous = caches.get(tabId) ?? new Map<string, AgentNode>();
     const agents = new Map<string, AgentNode>();
-    if (preserveTeammates) {
-      for (const [id, agent] of previous) {
-        if (agent.kind === 'teammate') agents.set(id, { ...agent });
-      }
+    for (const [id, agent] of previous) {
+      const keepTeammate = preserveTeammates && agent.kind === 'teammate';
+      const keepBackground = agent.background && isAgentActive(agent);
+      if (keepTeammate || keepBackground) agents.set(id, { ...agent });
     }
     agents.set('main', {
       id: 'main',

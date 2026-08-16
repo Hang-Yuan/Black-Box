@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { normalizeSessionTimestamp, parseSessionMessages } from '../session-loader';
 import { useChatStore } from '../../stores/chatStore';
 import { __streamThinkingTesting } from '../../hooks/useStreamProcessor';
+import { buildInterruptedContinuationPrompt } from '../interrupted-continuation';
 
 describe('session-loader tool result recovery', () => {
   it('rehydrates mid-loop queued_command attachments as delivered steer messages', () => {
@@ -55,6 +56,47 @@ describe('session-loader tool result recovery', () => {
     });
   });
 
+  it('projects only user-authored text from interrupted continuation payloads', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        uuid: 'cli-placeholder',
+        timestamp: 1,
+        message: { content: [{ type: 'text', text: 'No response requested.' }] },
+      },
+      {
+        type: 'user',
+        uuid: 'cli-interruption-placeholder',
+        timestamp: 1,
+        message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] },
+      },
+      {
+        type: 'user',
+        uuid: 'continued-user',
+        timestamp: 2,
+        message: {
+          content: [{
+            type: 'text',
+            text: buildInterruptedContinuationPrompt(
+              '这是一段已经显示过的未完成正文。',
+              '那现在的情况是什么？',
+            ),
+          }],
+        },
+      },
+    ]);
+
+    expect(loaded.messages).toEqual([
+      expect.objectContaining({
+        id: 'continued-user',
+        role: 'user',
+        content: '那现在的情况是什么？',
+      }),
+    ]);
+    expect(loaded.messages[0].content).not.toContain('系统注记');
+    expect(loaded.messages[0].content).not.toContain('已输出正文');
+  });
+
   it('normalizes ISO JSONL timestamps to epoch milliseconds', () => {
     const iso = '2026-07-11T17:20:30.456Z';
     expect(normalizeSessionTimestamp(iso)).toBe(Date.parse(iso));
@@ -68,6 +110,73 @@ describe('session-loader tool result recovery', () => {
 
     expect(loaded.mainAgentStartTime).toBe(Date.parse(iso));
     expect(loaded.messages[0]?.timestamp).toBe(Date.parse(iso));
+  });
+
+  it('merges split SDK wrapper records by logical assistant message id', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        uuid: 'thinking-wrapper',
+        timestamp: 1,
+        message: {
+          id: 'logical-message',
+          content: [{ type: 'thinking', thinking: 'internal draft' }],
+        },
+      },
+      {
+        type: 'assistant',
+        uuid: 'text-wrapper',
+        timestamp: 2,
+        message: {
+          id: 'logical-message',
+          content: [{ type: 'text', text: 'final answer' }],
+        },
+      },
+    ]);
+
+    expect(loaded.messages).toEqual([
+      expect.objectContaining({
+        id: 'logical-message__thinking_committed',
+        type: 'thinking',
+        content: 'internal draft',
+      }),
+      expect.objectContaining({
+        id: 'logical-message_text_0',
+        type: 'text',
+        content: 'final answer',
+      }),
+    ]);
+  });
+
+  it('coalesces replayed thinking wrappers into one historical row', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        uuid: 'thinking-wrapper-1',
+        timestamp: 1,
+        message: {
+          id: 'logical-thinking',
+          content: [{ type: 'thinking', thinking: 'first half' }],
+        },
+      },
+      {
+        type: 'assistant',
+        uuid: 'thinking-wrapper-2',
+        timestamp: 2,
+        message: {
+          id: 'logical-thinking',
+          content: [{ type: 'thinking', thinking: 'first half second half' }],
+        },
+      },
+    ]);
+
+    expect(loaded.messages).toEqual([
+      expect.objectContaining({
+        id: 'logical-thinking__thinking_committed',
+        type: 'thinking',
+        content: 'first half second half',
+      }),
+    ]);
   });
 
   it('marks top-level tool_result records as completed even when output is empty', () => {
@@ -243,7 +352,7 @@ describe('session-loader tool result recovery', () => {
     });
   });
 
-  it('restores named teammates without exposing their internal launch metadata', () => {
+  it('restores named teammates while keeping raw task notifications out of chat', () => {
     const loaded = parseSessionMessages([
       {
         type: 'assistant',
@@ -291,8 +400,128 @@ describe('session-loader tool result recovery', () => {
       toolCompleted: true,
     });
     expect(loaded.messages[0].toolResultContent).toBeUndefined();
-    expect(loaded.messages[1].content).toContain('ui-reader: Completed');
-    expect(loaded.messages[1].content).not.toContain('a6d0a11503796be67');
+    expect(loaded.messages).toHaveLength(1);
+  });
+
+  it('restores an unresolved async Agent as interrupted when disk hydration has no live runtime', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        timestamp: 1,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'agent-launch-tool',
+            name: 'Agent',
+            input: { description: 'Inspect background state' },
+          }],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: 2,
+        toolUseResult: {
+          isAsync: true,
+          status: 'async_launched',
+          agentId: 'stable-task-id',
+          description: 'Inspect background state',
+        },
+        message: {
+          content: [{ type: 'tool_result', tool_use_id: 'agent-launch-tool', content: '' }],
+        },
+      },
+    ]);
+
+    expect(loaded.agents).toContainEqual(expect.objectContaining({
+      id: 'agent-launch-tool',
+      taskId: 'stable-task-id',
+      phase: 'interrupted',
+      background: true,
+      endTime: expect.any(Number),
+    }));
+  });
+
+  it('settles a reloaded async Agent by task id when a resumed tool-use id differs', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        timestamp: 1,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'agent-launch-tool',
+            name: 'Agent',
+            input: { description: 'Inspect background state' },
+          }],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: 2,
+        toolUseResult: {
+          isAsync: true,
+          status: 'async_launched',
+          agentId: 'stable-task-id',
+        },
+        message: {
+          content: [{ type: 'tool_result', tool_use_id: 'agent-launch-tool', content: '' }],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: 3,
+        message: {
+          content: `<task-notification>
+            <task-id>stable-task-id</task-id>
+            <tool-use-id>resumed-tool-id</tool-use-id>
+            <status>completed</status>
+          </task-notification>`,
+        },
+      },
+    ]);
+
+    expect(loaded.agents).toContainEqual(expect.objectContaining({
+      id: 'agent-launch-tool',
+      taskId: 'stable-task-id',
+      phase: 'completed',
+      background: true,
+      endTime: 3,
+    }));
+  });
+
+  it('restores forwarded subagent progress into its optional process history', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        timestamp: 1,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'agent-tool',
+            name: 'Agent',
+            input: { description: 'Inspect the runtime' },
+          }],
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: 2,
+        parent_tool_use_id: 'agent-tool',
+        message: {
+          id: 'forwarded-one',
+          content: [
+            { type: 'text', text: 'Checking the event route.' },
+            { type: 'tool_use', id: 'read-tool', name: 'Read', input: {} },
+          ],
+        },
+      },
+    ]);
+
+    expect(loaded.messages.some((message) => message.content.includes('Checking the event route.'))).toBe(false);
+    expect(loaded.agents.find((agent) => agent.id === 'agent-tool')?.activity).toEqual([
+      expect.objectContaining({ kind: 'text', content: 'Checking the event route.' }),
+      expect.objectContaining({ kind: 'tool', toolName: 'Read' }),
+    ]);
   });
 });
 
@@ -301,7 +530,7 @@ describe('background assistant finalization', () => {
     useChatStore.setState({ tabs: new Map(), sessionCache: new Map() });
   });
 
-  it('keeps committed thinking messages when background partials are cleared', () => {
+  it('commits background thinking once before clearing stream state', () => {
     const store = useChatStore.getState();
     store.ensureTab('bg-tab');
     store.updatePartialMessage('bg-tab', 'draft answer');

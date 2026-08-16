@@ -131,6 +131,11 @@ interface SettingsState {
   toggleSecondaryPanel: () => void;
   toggleAgentPanel: () => void;
   setSecondaryTab: (tab: SecondaryPanelTab) => void;
+  setSecondaryPanelState: (state: {
+    open: boolean;
+    tab?: SecondaryPanelTab;
+    width?: number;
+  }) => void;
   setSecondaryPanelWidth: (width: number) => void;
   toggleSettings: () => void;
   openSettings: (tab?: SettingsTab) => void;
@@ -234,6 +239,13 @@ export const useSettingsStore = create<SettingsState>()(
         set(() => ({
           secondaryPanelTab: tab,
           secondaryPanelOpen: true,
+        })),
+
+      setSecondaryPanelState: ({ open, tab, width }) =>
+        set((state) => ({
+          secondaryPanelOpen: open,
+          secondaryPanelTab: tab ?? state.secondaryPanelTab,
+          secondaryPanelWidth: width ?? state.secondaryPanelWidth,
         })),
 
       setSecondaryPanelWidth: (width) =>

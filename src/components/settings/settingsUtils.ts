@@ -22,6 +22,7 @@ export function isNetworkError(msg: string): boolean {
 
 export type CliMaintenanceErrorKind =
   | 'network'
+  | 'maintenanceBusy'
   | 'blockedAutomation'
   | 'blockedSessions'
   | 'runtime'
@@ -43,6 +44,10 @@ export function classifyCliMaintenanceError(message: string): CliMaintenanceErro
   const detail = message.trim();
   const lower = detail.toLowerCase();
 
+  if (lower.includes('cli_maintenance_busy')) {
+    return { kind: 'maintenanceBusy', detail };
+  }
+
   if (
     lower.includes('cli_update_blocked_automation')
     || lower.includes('scheduled task is running')
@@ -53,7 +58,6 @@ export function classifyCliMaintenanceError(message: string): CliMaintenanceErro
 
   if (
     lower.includes('cli_update_blocked_sessions')
-    || lower.includes('cli_maintenance_busy')
     || lower.includes('could not safely stop every conversation')
     || lower.includes('conversation(s) are generating')
     || lower.includes('claude process could not be safely linked')

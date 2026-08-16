@@ -24,6 +24,8 @@ vi.mock('../tauri-bridge', () => ({
 
 import {
   __conversationRuntimePreferencesTesting,
+  applyDefaultRuntimeToConversation,
+  ensureConversationRuntimeReady,
   forgetConversationRuntimePreference,
   initializeConversationRuntimePreferences,
   moveConversationRuntimePreference,
@@ -72,11 +74,15 @@ describe('conversation runtime preferences', () => {
     __conversationRuntimePreferencesTesting.reset();
     useProviderStore.setState({
       providers: [relay],
+      defaultApi: null,
+      defaultMainModel: null,
+      defaultAuxiliaryModel: null,
       activeProviderId: null,
       loaded: true,
     });
     useSettingsStore.setState({
       selectedModel: 'sonnet',
+      auxiliaryModel: 'sonnet',
       customModelId: null,
     });
   });
@@ -95,11 +101,13 @@ describe('conversation runtime preferences', () => {
       'thread-a': {
         providerId: 'relay',
         selectedModel: 'opus',
+        auxiliaryModel: 'sonnet',
         customModelId: null,
       },
       'thread-b': {
         providerId: null,
         selectedModel: 'haiku',
+        auxiliaryModel: 'sonnet',
         customModelId: null,
       },
     });
@@ -123,12 +131,14 @@ describe('conversation runtime preferences', () => {
     expect(await restoreConversationRuntimePreference('thread-a')).toBe(true);
     expect(useProviderStore.getState().activeProviderId).toBe('relay');
     expect(useSettingsStore.getState().selectedModel).toBe('opus');
+    expect(useSettingsStore.getState().auxiliaryModel).toBe('sonnet');
     expect(useSettingsStore.getState().customModelId).toBeNull();
 
     selectThread('thread-b');
     expect(await restoreConversationRuntimePreference('thread-b')).toBe(true);
     expect(useProviderStore.getState().activeProviderId).toBeNull();
     expect(useSettingsStore.getState().selectedModel).toBe('sonnet');
+    expect(useSettingsStore.getState().auxiliaryModel).toBe('sonnet');
     expect(useSettingsStore.getState().customModelId).toBe('claude-native-custom');
   });
 
@@ -145,6 +155,7 @@ describe('conversation runtime preferences', () => {
       'thread-real': {
         providerId: 'relay',
         selectedModel: 'fable',
+        auxiliaryModel: 'sonnet',
         customModelId: null,
       },
     });
@@ -152,7 +163,12 @@ describe('conversation runtime preferences', () => {
   });
 
   it('seeds an untouched draft before a background durable-id promotion', async () => {
-    useProviderStore.setState({ activeProviderId: 'relay' });
+    useProviderStore.setState({
+      activeProviderId: null,
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+    });
     useSettingsStore.getState().setSelectedModel('opus');
     selectThread('draft_background');
     selectThread('thread-other');
@@ -163,6 +179,7 @@ describe('conversation runtime preferences', () => {
       'thread-real': {
         providerId: 'relay',
         selectedModel: 'opus',
+        auxiliaryModel: 'haiku',
         customModelId: null,
       },
     });
@@ -193,6 +210,11 @@ describe('conversation runtime preferences', () => {
   });
 
   it('falls back from a deleted provider and persists the cleaned route', async () => {
+    useProviderStore.setState({
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+    });
     mocks.persistedPreferences = {
       'thread-a': {
         providerId: 'missing-provider',
@@ -203,14 +225,89 @@ describe('conversation runtime preferences', () => {
     selectThread('thread-a');
 
     expect(await restoreConversationRuntimePreference('thread-a')).toBe(true);
-    expect(useProviderStore.getState().activeProviderId).toBeNull();
-    expect(useSettingsStore.getState().selectedModel).toBe('haiku');
+    expect(useProviderStore.getState().activeProviderId).toBe('relay');
+    expect(useSettingsStore.getState().selectedModel).toBe('opus');
     expect(mocks.persistedPreferences).toEqual({
       'thread-a': {
-        providerId: null,
-        selectedModel: 'haiku',
+        providerId: 'relay',
+        selectedModel: 'opus',
+        auxiliaryModel: 'haiku',
         customModelId: null,
       },
+    });
+  });
+
+  it('migrates a legacy system-login conversation to the complete default triple', async () => {
+    useProviderStore.setState({
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+    });
+    mocks.persistedPreferences = {
+      'thread-a': {
+        providerId: null,
+        selectedModel: 'fable',
+        auxiliaryModel: 'sonnet',
+        customModelId: null,
+      },
+    };
+    selectThread('thread-a');
+
+    expect(await restoreConversationRuntimePreference('thread-a')).toBe(true);
+    expect(useProviderStore.getState().activeProviderId).toBe('relay');
+    expect(useSettingsStore.getState().selectedModel).toBe('opus');
+    expect(useSettingsStore.getState().auxiliaryModel).toBe('haiku');
+    expect(mocks.persistedPreferences).toEqual({
+      'thread-a': {
+        providerId: 'relay',
+        selectedModel: 'opus',
+        auxiliaryModel: 'haiku',
+        customModelId: null,
+      },
+    });
+  });
+
+  it('repairs an unavailable visible route before a new turn starts', async () => {
+    useProviderStore.setState({
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+      activeProviderId: null,
+    });
+    selectThread('thread-a');
+
+    expect(await ensureConversationRuntimeReady('thread-a')).toMatchObject({
+      ready: true,
+      switchedToDefault: true,
+      defaultSummary: 'Relay · opus · haiku',
+    });
+    expect(useProviderStore.getState().activeProviderId).toBe('relay');
+    expect(mocks.persistedPreferences).toMatchObject({
+      'thread-a': {
+        providerId: 'relay',
+        selectedModel: 'opus',
+        auxiliaryModel: 'haiku',
+      },
+    });
+  });
+
+  it('applies defaults only to the conversation that remains selected', async () => {
+    useProviderStore.setState({
+      defaultApi: 'relay',
+      defaultMainModel: 'opus',
+      defaultAuxiliaryModel: 'haiku',
+    });
+    selectThread('thread-a');
+    expect(await applyDefaultRuntimeToConversation('thread-a')).toMatchObject({
+      ready: true,
+      switchedToDefault: true,
+    });
+
+    selectThread('thread-b');
+    expect(await applyDefaultRuntimeToConversation('thread-a')).toEqual({
+      ready: false,
+      switchedToDefault: false,
+      reason: 'selection_changed',
     });
   });
 

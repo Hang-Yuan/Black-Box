@@ -313,6 +313,11 @@ export interface CliLifecycleInfo {
 export interface CliUpdateBlockers {
   activeSessionIds: string[];
   runningAutomation: boolean;
+  maintenanceInProgress: boolean;
+  maintenanceDownloaded: number;
+  maintenanceTotal: number;
+  maintenancePercent: number;
+  maintenancePhase: DownloadProgressEvent['phase'] | 'idle';
 }
 
 export interface CliCandidate {
@@ -498,7 +503,7 @@ export interface DownloadProgressEvent {
   total: number;
   percent: number;
   phase: 'version' | 'downloading' | 'installing' | 'complete'
-       | 'native_version' | 'native_manifest' | 'native_download' | 'native_verify' | 'native_install'
+       | 'native_version' | 'native_manifest' | 'native_download' | 'native_stalled' | 'native_verify' | 'native_install'
        | 'npm_fallback'
        | 'node_downloading' | 'node_extracting' | 'node_complete'
        | 'git_downloading' | 'git_extracting' | 'git_complete';
@@ -513,6 +518,13 @@ export interface NodeEnvStatus {
 
 export interface ProvidersFile {
   version: number;
+  /** User-selected API route for fresh conversations and unoverridden schedules. */
+  defaultApi: string | null;
+  /** User-selected lead-model tier for fresh conversations and unoverridden schedules. */
+  defaultMainModel: 'fable' | 'opus' | 'sonnet' | 'haiku' | null;
+  /** User-selected subagent-model tier for fresh conversations and unoverridden schedules. */
+  defaultAuxiliaryModel: 'fable' | 'opus' | 'sonnet' | 'haiku' | null;
+  /** Route currently attached to the visible conversation. */
   activeProviderId: string | null;
   providers: {
     id: string;
@@ -538,6 +550,7 @@ export interface ProvidersFile {
 export interface ConversationRuntimePreference {
   providerId: string | null;
   selectedModel: 'fable' | 'opus' | 'sonnet' | 'haiku';
+  auxiliaryModel: 'fable' | 'opus' | 'sonnet' | 'haiku';
   customModelId: string | null;
 }
 
@@ -573,8 +586,8 @@ export interface AutomationDefinition {
   status: 'ACTIVE' | 'PAUSED';
   rrule: string;
   model: string | null;
-  /** Logical lightweight slot pinned with the task and resolved through the
-   *  task's provider revision at run time. */
+  /** Logical lightweight slot captured with the task and resolved through the
+   *  ordinary new-conversation runtime at execution time. */
   auxiliary_model: string | null;
   reasoning_effort: string | null;
   agent_teams_enabled: boolean;
@@ -583,8 +596,13 @@ export interface AutomationDefinition {
   target: { type: 'project'; projectId: string } | null;
   cwds: string[];
   target_thread_id: string | null;
-  provider_id: string | null;
-  provider_revision: number | null;
+  /** Optional durable JSON receipt used to reconcile a committed task whose
+   * transport or completion-synthesis tail failed. */
+  completion_probe: {
+    relative_path: string;
+    scheduled_date_offset_days: number;
+    json_equals: Record<string, string>;
+  } | null;
   created_at: number;
   updated_at: number;
 }
@@ -612,6 +630,16 @@ export interface AutomationActivitySummary {
   updatedAt: number;
 }
 
+/** Redacted metadata that links a running scheduled task to its durable
+ * conversation. Prompts, output, traces, and provider data stay backend-only. */
+export interface ActiveAutomationSession {
+  runId: string;
+  automationId: string;
+  sessionId: string;
+  title: string;
+  startedAt: number;
+}
+
 export interface AutomationTraceEvent {
   sequence: number;
   eventType: 'tool_use' | 'tool_result' | 'agent_start' | 'agent_result';
@@ -629,7 +657,7 @@ export interface AutomationRun {
   runId: string;
   automationId: string;
   sessionId: string | null;
-  status: 'RUNNING' | 'PENDING_REVIEW' | 'FAILED' | 'CANCELLED' | 'ARCHIVED';
+  status: 'RUNNING' | 'SUCCEEDED' | 'NEEDS_ATTENTION' | 'FAILED' | 'RECOVERED' | 'CANCELLED' | 'ARCHIVED' | 'PENDING_REVIEW';
   readAt: number | null;
   title: string;
   summary: string;
@@ -653,6 +681,10 @@ export interface AutomationRun {
   startedAt: number;
   finishedAt: number | null;
   archivedReason: string | null;
+  retryOfRunId: string | null;
+  recoveredByRunId: string | null;
+  recoveredAt: number | null;
+  recoveryEvidence: string | null;
 }
 
 export interface AutomationWorktreeReview {
@@ -1257,6 +1289,9 @@ export const bridge = {
   listAutomationActivitySummaries: () =>
     invoke<AutomationActivitySummary[]>('list_automation_activity_summaries'),
 
+  listActiveAutomationSessions: () =>
+    invoke<ActiveAutomationSession[]>('list_active_automation_sessions'),
+
   getAutomationPreferences: () =>
     invoke<AutomationPreferences>('get_automation_preferences'),
 
@@ -1277,6 +1312,9 @@ export const bridge = {
 
   runAutomationNow: (id: string) =>
     invoke<string>('run_automation_now', { id }),
+
+  retryAutomationRun: (runId: string) =>
+    invoke<string>('retry_automation_run', { runId }),
 
   cancelAutomationRun: (runId: string) =>
     invoke<void>('cancel_automation_run', { runId }),

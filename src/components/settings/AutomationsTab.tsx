@@ -15,8 +15,9 @@ import { stripFinalInboxDirective } from '../../lib/automation-output';
 import { InlinePatchReview } from '../review/InlinePatchReview';
 import { formatReviewFeedback } from '../../lib/review-feedback';
 import { useReviewStore } from '../../stores/reviewStore';
-import { useProviderStore } from '../../stores/providerStore';
+import { hasUsableProviderCredential, useProviderStore } from '../../stores/providerStore';
 import { getModelDisplayOptions, getSelectedModelOptionId } from '../../lib/api-provider';
+import { useAutomationSessionStore } from '../../stores/automationSessionStore';
 
 type Frequency = 'MINUTELY' | 'HOURLY' | 'DAILY' | 'WEEKLY';
 
@@ -58,12 +59,86 @@ function formatTime(value: number | null, locale: string): string {
   }).format(new Date(value));
 }
 
-function statusColor(status: string) {
-  if (status === 'FAILED') return 'text-red-500 bg-red-500/10';
-  if (status === 'CANCELLED') return 'text-text-muted bg-bg-tertiary';
-  if (status === 'RUNNING') return 'text-blue-500 bg-blue-500/10';
-  if (status === 'PENDING_REVIEW') return 'text-amber-500 bg-amber-500/10';
-  return 'text-text-muted bg-bg-tertiary';
+function runStatusPresentation(status: string, t: (key: string) => string) {
+  switch (status.toUpperCase()) {
+    case 'SUCCEEDED':
+    case 'PENDING_REVIEW':
+      return {
+        label: t('automations.status.succeeded'),
+        className: 'bg-success/15 text-success',
+        dotClassName: 'bg-success',
+      };
+    case 'RECOVERED':
+      return {
+        label: t('automations.status.recovered'),
+        className: 'bg-success/15 text-success',
+        dotClassName: 'bg-success',
+      };
+    case 'NEEDS_ATTENTION':
+      return {
+        label: t('automations.status.needsAttention'),
+        className: 'bg-warning/15 text-warning',
+        dotClassName: 'bg-warning',
+      };
+    case 'FAILED':
+      return {
+        label: t('automations.status.failed'),
+        className: 'bg-error/15 text-error',
+        dotClassName: 'bg-error',
+      };
+    case 'RUNNING':
+      return {
+        label: t('automations.status.running'),
+        className: 'bg-accent/15 text-accent',
+        dotClassName: 'bg-accent animate-pulse-soft',
+      };
+    case 'CANCELLED':
+      return {
+        label: t('automations.status.cancelled'),
+        className: 'bg-bg-tertiary text-text-muted',
+        dotClassName: 'bg-text-tertiary/50',
+      };
+    case 'ARCHIVED':
+      return {
+        label: t('automations.status.archived'),
+        className: 'bg-bg-tertiary text-text-muted',
+        dotClassName: 'bg-text-tertiary/50',
+      };
+    default:
+      return {
+        label: t('automations.status.unknown'),
+        className: 'bg-bg-tertiary text-text-muted',
+        dotClassName: 'bg-text-tertiary/50',
+      };
+  }
+}
+
+function isUnreadAutomationResult(run: AutomationRun): boolean {
+  return !run.readAt && ['SUCCEEDED', 'NEEDS_ATTENTION', 'FAILED', 'RECOVERED', 'PENDING_REVIEW']
+    .includes(run.status.toUpperCase());
+}
+
+function AutomationRunStatusBadges({
+  run,
+  t,
+}: {
+  run: AutomationRun;
+  t: (key: string) => string;
+}) {
+  const presentation = runStatusPresentation(run.status, t);
+  return (
+    <div className="flex shrink-0 items-center justify-end gap-2 whitespace-nowrap">
+      <span className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[9px] font-medium ${presentation.className}`}>
+        <span className={`h-1.5 w-1.5 rounded-full ${presentation.dotClassName}`} />
+        {presentation.label}
+      </span>
+      {isUnreadAutomationResult(run) && (
+        <span className="shrink-0 whitespace-nowrap rounded-full bg-accent/15 px-1.5 py-0.5 text-[9px] font-medium text-accent">
+          {t('automations.unread')}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function traceDotColor(eventType: string, summary: string) {
@@ -98,16 +173,15 @@ interface AutomationsTabProps {
 export function AutomationsTab({ standalone = false, onClose }: AutomationsTabProps = {}) {
   const t = useT();
   const locale = useSettingsStore((state) => state.locale);
-  const selectedModel = useSettingsStore((state) => state.selectedModel);
-  const auxiliaryModel = useSettingsStore((state) => state.auxiliaryModel);
   const workingDirectory = useSettingsStore((state) => state.workingDirectory);
+  const defaultApi = useProviderStore((state) => state.defaultApi);
+  const defaultMainModel = useProviderStore((state) => state.defaultMainModel);
+  const defaultAuxiliaryModel = useProviderStore((state) => state.defaultAuxiliaryModel);
+  const providers = useProviderStore((state) => state.providers);
   const sessions = useSessionStore((state) => state.sessions);
   const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
   const customPreviews = useSessionStore((state) => state.customPreviews);
   const reviewCommentMap = useReviewStore((state) => state.comments);
-  const providers = useProviderStore((state) => state.providers);
-  const activeProviderId = useProviderStore((state) => state.activeProviderId);
-  const providersLoaded = useProviderStore((state) => state.loaded);
   const [items, setItems] = useState<AutomationSummary[]>([]);
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [editing, setEditing] = useState<AutomationDefinition | null>(null);
@@ -126,6 +200,7 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
   const [worktreeRetentionError, setWorktreeRetentionError] = useState('');
   const [worktreeActionRunId, setWorktreeActionRunId] = useState<string | null>(null);
   const [continuingRunId, setContinuingRunId] = useState<string | null>(null);
+  const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
   const [branchEditor, setBranchEditor] = useState<{ runId: string; name: string } | null>(null);
   const [worktreeReviews, setWorktreeReviews] = useState<Record<string, {
     loading: boolean;
@@ -156,26 +231,22 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
         return true;
       });
   }, [sessions]);
-  const editingProvider = useMemo(
-    () => providers.find((provider) => provider.id === editing?.provider_id) ?? null,
-    [editing?.provider_id, providers],
-  );
+  const defaultProvider = defaultApi
+    ? providers.find((provider) => provider.id === defaultApi) ?? null
+    : null;
   const automationModelOptions = useMemo(
-    () => getModelDisplayOptions(editingProvider),
-    [editingProvider],
+    () => getModelDisplayOptions(defaultProvider),
+    [defaultProvider],
   );
-
-  useEffect(() => {
-    if (!providersLoaded) void useProviderStore.getState().load();
-  }, [providersLoaded]);
+  const defaultMainModelLabel = automationModelOptions.find(
+    (option) => option.id === defaultMainModel,
+  )?.label;
+  const defaultAuxiliaryModelLabel = automationModelOptions.find(
+    (option) => option.id === defaultAuxiliaryModel,
+  )?.label;
 
   const load = useCallback(async () => {
     try {
-      // Opening the standalone Scheduled center is the read boundary for its
-      // inbox. Clear every durable unread marker, including older entries that
-      // are outside the 50-row visual history window, so the sidebar cannot
-      // accumulate a permanent 99+ badge.
-      if (standalone) await bridge.markAllAutomationRunsRead();
       const [nextItems, nextRuns] = await Promise.all([
         bridge.listAutomations(), bridge.listAutomationRuns(undefined, 50),
       ]);
@@ -187,7 +258,16 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
       setError(String(reason));
       return [];
     }
-  }, [standalone]);
+  }, []);
+
+  const markAllRunsRead = useCallback(async () => {
+    try {
+      await bridge.markAllAutomationRunsRead();
+      await load();
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }, [load]);
 
   useEffect(() => {
     load();
@@ -376,6 +456,21 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
       if (!session) {
         throw new Error(t('automations.continueUnavailable'));
       }
+      if (run.status === 'RUNNING') {
+        const automationSessions = useAutomationSessionStore.getState();
+        automationSessions.replaceActive([
+          ...Array.from(automationSessions.activeBySession.values()).filter(
+            (item) => item.sessionId !== session.id,
+          ),
+          {
+            runId: run.runId,
+            automationId: run.automationId,
+            sessionId: session.id,
+            title: run.title,
+            startedAt: run.startedAt,
+          },
+        ]);
+      }
       useSettingsStore.setState({ settingsOpen: false });
       window.dispatchEvent(new CustomEvent('blackbox:open-session', {
         detail: { sessionId: session.id, draftText },
@@ -426,7 +521,10 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
     setWorktreeAvailable(null);
     setEditing({
       ...definition,
-      model: normalizeModelTier(definition.model),
+      model: definition.model ? normalizeModelTier(definition.model) : null,
+      auxiliary_model: definition.auxiliary_model
+        ? normalizeModelTier(definition.auxiliary_model)
+        : null,
       execution_environment: definition.kind === 'heartbeat'
         ? 'local'
         : definition.execution_environment,
@@ -498,14 +596,8 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
     setError('');
     try {
       await useProviderStore.getState().flushSave();
-      const persistedProviders = useProviderStore.getState().providers;
       const definition = prepareAutomationDefinitionForSave(
-        {
-          ...editing,
-          provider_revision: editing.provider_id
-            ? persistedProviders.find((provider) => provider.id === editing.provider_id)?.revision ?? null
-            : null,
-        },
+        editing,
         buildRule(frequency, time, interval, days),
       );
       await bridge.upsertAutomation(definition);
@@ -518,16 +610,56 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
     }
   }, [editing, frequency, time, interval, days, load]);
 
+  const prepareProviderForRun = useCallback(async () => {
+    const providerState = useProviderStore.getState();
+    if (!providerState.loaded) await providerState.load();
+    const configured = useProviderStore.getState();
+    if (
+      !configured.defaultApi
+      || !configured.defaultMainModel
+      || !configured.defaultAuxiliaryModel
+    ) {
+      useSettingsStore.getState().openSettings('provider');
+      setError(t('provider.defaultConfigurationIncomplete'));
+      return false;
+    }
+    const selectedProvider = configured.providers.find(
+      (provider) => provider.id === configured.defaultApi,
+    );
+    if (!selectedProvider || !hasUsableProviderCredential(selectedProvider)) {
+      useSettingsStore.getState().openSettings('provider');
+      setError(t('provider.defaultApiCredentialMissing'));
+      return false;
+    }
+    await configured.flushSave();
+    return true;
+  }, [t]);
+
   const runNow = useCallback(async (id: string) => {
     setError('');
     try {
-      await useProviderStore.getState().flushSave();
+      if (!await prepareProviderForRun()) return;
       await bridge.runAutomationNow(id);
       await load();
     } catch (reason) {
       setError(String(reason));
     }
-  }, [load]);
+  }, [load, prepareProviderForRun]);
+
+  const retryRun = useCallback(async (runId: string) => {
+    if (retryingRunId) return;
+    setError('');
+    setRetryingRunId(runId);
+    try {
+      if (!await prepareProviderForRun()) return;
+      await bridge.retryAutomationRun(runId);
+      await load();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRetryingRunId(null);
+    }
+  }, [load, prepareProviderForRun, retryingRunId]);
 
   const changeStatus = useCallback(async (id: string, status: 'ACTIVE' | 'PAUSED') => {
     setError('');
@@ -541,6 +673,10 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
   }, [load]);
 
   const recentRuns = useMemo(() => runs, [runs]);
+  const unreadRunCount = useMemo(
+    () => items.reduce((total, item) => total + item.unreadRuns, 0),
+    [items],
+  );
   const canSave = isAutomationDraftComplete(editing)
     && !(editing?.kind === 'cron'
       && editing.execution_environment === 'worktree'
@@ -557,13 +693,9 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => beginEdit(createAutomationDraft(
-            selectedModel,
             workingDirectory || activeConversation?.projectDir || '',
             activeConversation?.cliResumeId || null,
             Date.now(),
-            activeProviderId,
-            providers.find((provider) => provider.id === activeProviderId)?.revision ?? null,
-            auxiliaryModel,
           ))}
             className="px-3 py-1.5 rounded-md bg-accent text-text-inverse text-[12px] font-medium hover:opacity-90">
             {t('automations.new')}
@@ -746,18 +878,36 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
               <label className="space-y-1">
                 <span>{t('automations.mainModel')}</span>
                 <select
-                  value={getSelectedModelOptionId(editing.model || 'sonnet', automationModelOptions, editingProvider)}
-                  onChange={(event) => setEditing({ ...editing, model: event.target.value })}
+                  value={editing.model
+                    ? getSelectedModelOptionId(editing.model, automationModelOptions, null)
+                    : ''}
+                  onChange={(event) => setEditing({
+                    ...editing,
+                    model: event.target.value || null,
+                  })}
                   className="w-full rounded-md border border-border-subtle bg-bg-card px-3 py-2 text-text-primary">
+                  <option value="">
+                    {t('automations.useSystemDefault')}
+                    {defaultMainModelLabel ? ` · ${defaultMainModelLabel}` : ''}
+                  </option>
                   {automationModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
                 </select>
               </label>
               <label className="space-y-1">
                 <span>{t('automations.auxiliaryModel')}</span>
                 <select
-                  value={getSelectedModelOptionId(editing.auxiliary_model || 'sonnet', automationModelOptions, editingProvider)}
-                  onChange={(event) => setEditing({ ...editing, auxiliary_model: event.target.value })}
+                  value={editing.auxiliary_model
+                    ? getSelectedModelOptionId(editing.auxiliary_model, automationModelOptions, null)
+                    : ''}
+                  onChange={(event) => setEditing({
+                    ...editing,
+                    auxiliary_model: event.target.value || null,
+                  })}
                   className="w-full rounded-md border border-border-subtle bg-bg-card px-3 py-2 text-text-primary">
+                  <option value="">
+                    {t('automations.useSystemDefault')}
+                    {defaultAuxiliaryModelLabel ? ` · ${defaultAuxiliaryModelLabel}` : ''}
+                  </option>
                   {automationModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
                 </select>
                 <span className="block text-[10px] leading-4 text-text-tertiary">{t('automations.auxiliaryModelHint')}</span>
@@ -768,32 +918,6 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   className="w-full rounded-md border border-border-subtle bg-bg-card px-3 py-2 text-text-primary">
                   {['low', 'medium', 'high', 'max'].map((value) => <option key={value}>{value}</option>)}
                 </select>
-              </label>
-              <label className="col-span-2 space-y-1">
-                <span>{t('automations.provider')}</span>
-                <select
-                  value={editing.provider_id || ''}
-                  onChange={(event) => {
-                    const providerId = event.target.value || null;
-                    const provider = providers.find((entry) => entry.id === providerId);
-                    setEditing({
-                      ...editing,
-                      provider_id: providerId,
-                      provider_revision: provider?.revision ?? null,
-                    });
-                  }}
-                  className="w-full rounded-md border border-border-subtle bg-bg-card px-3 py-2 text-text-primary"
-                >
-                  <option value="">{t('automation.provider.native')}</option>
-                  {providers.map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name || t('provider.unnamed')} · {provider.credentialHint || t('provider.noStoredKey')}
-                    </option>
-                  ))}
-                </select>
-                <span className="block text-[10px] leading-4 text-text-tertiary">
-                  {t('automations.providerPinned')}
-                </span>
               </label>
               {editing.kind === 'cron' && (
                 <label className="space-y-1">
@@ -864,7 +988,9 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   {item.agent_teams_enabled && <span className="rounded px-1.5 py-0.5 text-[10px] bg-accent/10 text-accent">team</span>}
                   {item.running && <span className="text-[10px] text-blue-500">{t('automations.running')}</span>}
                   {item.unreadRuns > 0 && (
-                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-label={`${item.unreadRuns} unread`} />
+                    <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[9px] font-medium text-accent">
+                      {t('automations.newResults').replace('{count}', String(item.unreadRuns))}
+                    </span>
                   )}
                 </div>
                 <div className="mt-1 text-[11px] text-text-muted">{t('automations.next')} {formatTime(item.nextRunAt, locale)} · {t('automations.last')} {formatTime(item.lastRunAt, locale)}</div>
@@ -886,7 +1012,15 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
       </div>
 
       <div>
-        <h4 className="mb-2 text-[13px] font-semibold text-text-primary">{t('automations.recentRuns')}</h4>
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <h4 className="text-[13px] font-semibold text-text-primary">{t('automations.recentRuns')}</h4>
+          {unreadRunCount > 0 && (
+            <button type="button" onClick={() => { void markAllRunsRead(); }}
+              className="rounded-md px-2 py-1 text-[10px] text-accent hover:bg-accent/10">
+              {t('automations.markAllRead')}
+            </button>
+          )}
+        </div>
         <div className="space-y-2">
           {recentRuns.length === 0 && <div className="text-[12px] text-text-muted">{t('automations.noRuns')}</div>}
           {recentRuns.map((run) => (
@@ -897,17 +1031,34 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                 void loadWorktreeReview(run);
               }}>
               <summary className="cursor-pointer list-none">
-                <div className="flex items-center justify-between gap-3">
+                <div className="grid grid-cols-[minmax(0,1fr)_max-content] items-center gap-4">
                   <div className="min-w-0">
                     <div className="truncate text-[12px] font-medium text-text-primary">{run.title || run.automationId}</div>
-                    <div className="mt-0.5 truncate text-[11px] text-text-muted">{run.summary || run.error || t('automations.waitingResult')}</div>
+                    <div className="mt-0.5 truncate text-[11px] text-text-muted">
+                      {run.status === 'RECOVERED'
+                        ? t('automations.recoveredSummary')
+                        : run.summary || run.error || t('automations.waitingResult')}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className={`rounded px-1.5 py-0.5 text-[9px] ${statusColor(run.status)}`}>{run.status}</span>
-                    <span className="text-[10px] text-text-tertiary">{formatTime(run.startedAt, locale)}</span>
+                  <div className="flex shrink-0 items-center justify-end gap-3 whitespace-nowrap">
+                    <AutomationRunStatusBadges run={run} t={t} />
+                    <span className="whitespace-nowrap text-right text-[10px] tabular-nums text-text-tertiary">{formatTime(run.startedAt, locale)}</span>
                   </div>
                 </div>
               </summary>
+              {run.status === 'RECOVERED' && (
+                <div className="mt-3 rounded-md border border-success/20 bg-success/5 px-3 py-2 text-[10px] text-text-muted">
+                  {t('automations.recoveredDetail').replace(
+                    '{time}',
+                    run.recoveredAt ? formatTime(run.recoveredAt, locale) : '—',
+                  )}
+                </div>
+              )}
+              {run.retryOfRunId && (
+                <div className="mt-3 rounded-md border border-border-subtle bg-bg-secondary/60 px-3 py-2 text-[10px] text-text-muted">
+                  {t('automations.retryOf').replace('{id}', run.retryOfRunId.slice(0, 8))}
+                </div>
+              )}
               {run.trace?.length > 0 && (
                 <div className="mt-3 rounded-md border border-border-subtle bg-bg-secondary/60 p-3">
                   <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-text-tertiary">{t('automations.trace')}</div>
@@ -1143,6 +1294,17 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   }} className="text-[11px] text-red-500 hover:text-red-400">{t('automations.stop')}</button>
                 ) : (
                   <>
+                    {run.status === 'FAILED' && !run.retryOfRunId && (
+                      <button
+                        disabled={retryingRunId === run.runId}
+                        onClick={() => void retryRun(run.runId)}
+                        className="text-[11px] text-accent hover:text-accent-hover disabled:cursor-wait disabled:opacity-50"
+                      >
+                        {retryingRunId === run.runId
+                          ? t('automations.retrying')
+                          : t('automations.retry')}
+                      </button>
+                    )}
                     {run.sessionId && (
                       <button disabled={continuingRunId === run.runId} onClick={() => void continueAutomationRun(run)}
                         className="text-[11px] text-accent hover:text-accent-hover disabled:cursor-wait disabled:opacity-50">

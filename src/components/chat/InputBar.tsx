@@ -26,6 +26,7 @@ import { useProviderStore } from '../../stores/providerStore';
 import { PROVIDER_PRESETS } from '../../lib/provider-presets';
 import { stripAnsi } from '../../lib/strip-ansi';
 import { usePlanPanelStore } from './ChatPanel';
+import { buildInterruptedContinuationPrompt } from '../../lib/interrupted-continuation';
 import { PlanReviewCard } from './PlanReviewCard';
 import { PermissionCard } from './PermissionCard';
 import { QuestionCard } from './QuestionCard';
@@ -44,6 +45,8 @@ import {
   useComposerModeStore,
 } from '../../stores/composerModeStore';
 import { buildTaskComposerSubmission } from '../../lib/composer-mode';
+import { useAutomationSessionStore } from '../../stores/automationSessionStore';
+import { ensureConversationRuntimeReady } from '../../lib/conversation-runtime-preferences';
 // drag-state import removed — tree drag handled by ChatPanel
 
 /** Thinking effort level configuration data */
@@ -54,20 +57,6 @@ const THINK_LEVELS: { id: ThinkingLevel; labelKey: string }[] = [
   { id: 'high', labelKey: 'think.high' },
   { id: 'max', labelKey: 'think.max' },
 ];
-
-function buildInterruptedContinuationPrompt(interruptedAssistantText: string, nextUserText: string): string {
-  const cleanInterrupted = interruptedAssistantText.trim();
-  const cleanNext = nextUserText.trim();
-  if (!cleanInterrupted) return cleanNext;
-  return [
-    '系统注记：你上一条回复在用户手动停止前，已经输出了下面这段未完成正文。',
-    '请把它视为本会话里你刚刚已经写出的内容，在此基础上继续，不要声称之前没有写过这些内容。',
-    '已输出正文：',
-    cleanInterrupted,
-    '用户接下来的消息是基于这段已输出内容的后续指令：',
-    cleanNext,
-  ].join('\n\n');
-}
 
 /** Thinking effort level selector dropdown for the toolbar */
 function ThinkLevelSelector({ disabled = false }: { disabled?: boolean }) {
@@ -204,6 +193,9 @@ function PlanToggleButton() {
 export function InputBar() {
   const t = useT();
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
+  const activeAutomation = useAutomationSessionStore((state) => (
+    selectedSessionId ? state.activeBySession.get(selectedSessionId) : undefined
+  ));
   const pendingWorkflowSubmission = useWorkflowStore((state) => (
     selectedSessionId ? state.pendingSubmissions[selectedSessionId] : undefined
   ));
@@ -280,7 +272,8 @@ export function InputBar() {
   }, [inputDraft, selectedSessionId]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sessionStatus = useActiveTab((t) => t.sessionStatus);
-  const activityPhase = useActiveTab((t) => t.activityStatus.phase);
+  const activityStatus = useActiveTab((t) => t.activityStatus);
+  const activityPhase = activityStatus.phase;
   const isHydratingFromDisk = useActiveTab((t) => t.sessionMeta.hydratingFromDisk === true);
   const addMessage = useChatStore((s) => s.addMessage);
   const setSessionStatus = useChatStore((s) => s.setSessionStatus);
@@ -467,9 +460,11 @@ export function InputBar() {
         ? t(composerModeTab.busyDelivery === 'queue'
           ? 'input.queuePlaceholder'
           : 'input.steerPlaceholder')
-        : composerModeTab.taskMode
-          ? t(`composerMode.${composerModeTab.taskMode}Placeholder`)
-          : t('input.placeholder');
+        : activeAutomation
+          ? t('input.automationRunningPlaceholder')
+          : composerModeTab.taskMode
+            ? t(`composerMode.${composerModeTab.taskMode}Placeholder`)
+            : t('input.placeholder');
 
   // Whether this is a follow-up (session already has a CLI session ID)
   const hasActiveSession = sessionStatus !== 'idle';
@@ -609,51 +604,26 @@ export function InputBar() {
 
       case 'usage': {
         const meta = getActiveTabState().sessionMeta;
-        const isOfficialProvider = useProviderStore.getState().activeProviderId === null;
-
-        if (isOfficialProvider) {
-          // Official Anthropic account: quota data is only available in the CLI REPL TUI.
-          // Show local session data + a hint to use the terminal.
-          const hasData = meta.cost != null || meta.turns != null
-            || meta.inputTokens != null || meta.outputTokens != null;
-          const totalInput = meta.totalInputTokens ?? 0;
-          const totalOutput = meta.totalOutputTokens ?? 0;
-          feedback('info', hasData ? t('cmd.usageTitle') : t('cmd.noSessionData'), {
-            command: '/usage',
-            title: t('cmd.usageTitle'),
-            rows: [
-              { label: t('cmd.costModel'), value: modelLabel(meta.model || useSettingsStore.getState().selectedModel) },
-              { label: t('cmd.costTurns'), value: meta.turns != null ? String(meta.turns) : '—' },
-              { label: t('cmd.usageTotalSession'), value: totalInput || totalOutput
-                ? `${totalInput.toLocaleString()} in / ${totalOutput.toLocaleString()} out`
-                : '—' },
-            ],
-            hasData,
-            hint: t('cmd.usageOfficialHint'),
-          });
-        } else {
-          // Third-party API provider: show detailed token breakdown.
-          const hasData = meta.inputTokens != null || meta.outputTokens != null
-            || meta.totalInputTokens != null || meta.totalOutputTokens != null;
-          const turnInput = meta.inputTokens ?? 0;
-          const turnOutput = meta.outputTokens ?? 0;
-          const totalInput = meta.totalInputTokens ?? 0;
-          const totalOutput = meta.totalOutputTokens ?? 0;
-          feedback('info', hasData ? t('cmd.usageTitle') : t('cmd.noSessionData'), {
-            command: '/usage',
-            title: t('cmd.usageTitle'),
-            rows: [
-              { label: t('cmd.costModel'), value: modelLabel(meta.model || useSettingsStore.getState().selectedModel) },
-              { label: `${t('cmd.usageCurrentTurn')} — ${t('cmd.usageInput')}`, value: turnInput.toLocaleString() },
-              { label: `${t('cmd.usageCurrentTurn')} — ${t('cmd.usageOutput')}`, value: turnOutput.toLocaleString() },
-              { label: `${t('cmd.usageTotalSession')} — ${t('cmd.usageInput')}`, value: totalInput.toLocaleString() },
-              { label: `${t('cmd.usageTotalSession')} — ${t('cmd.usageOutput')}`, value: totalOutput.toLocaleString() },
-              { label: t('cmd.usageTotal'), value: (totalInput + totalOutput).toLocaleString() },
-              { label: t('cmd.costAmount'), value: meta.cost != null ? `$${meta.cost.toFixed(4)}` : '—' },
-            ],
-            hasData,
-          });
-        }
+        const hasData = meta.inputTokens != null || meta.outputTokens != null
+          || meta.totalInputTokens != null || meta.totalOutputTokens != null;
+        const turnInput = meta.inputTokens ?? 0;
+        const turnOutput = meta.outputTokens ?? 0;
+        const totalInput = meta.totalInputTokens ?? 0;
+        const totalOutput = meta.totalOutputTokens ?? 0;
+        feedback('info', hasData ? t('cmd.usageTitle') : t('cmd.noSessionData'), {
+          command: '/usage',
+          title: t('cmd.usageTitle'),
+          rows: [
+            { label: t('cmd.costModel'), value: modelLabel(meta.model || useSettingsStore.getState().selectedModel) },
+            { label: `${t('cmd.usageCurrentTurn')} — ${t('cmd.usageInput')}`, value: turnInput.toLocaleString() },
+            { label: `${t('cmd.usageCurrentTurn')} — ${t('cmd.usageOutput')}`, value: turnOutput.toLocaleString() },
+            { label: `${t('cmd.usageTotalSession')} — ${t('cmd.usageInput')}`, value: totalInput.toLocaleString() },
+            { label: `${t('cmd.usageTotalSession')} — ${t('cmd.usageOutput')}`, value: totalOutput.toLocaleString() },
+            { label: t('cmd.usageTotal'), value: (totalInput + totalOutput).toLocaleString() },
+            { label: t('cmd.costAmount'), value: meta.cost != null ? `$${meta.cost.toFixed(4)}` : '—' },
+          ],
+          hasData,
+        });
         return;
       }
 
@@ -818,11 +788,19 @@ export function InputBar() {
       useChatStore.getState().setInputDraft(tabId, rawInput);
       return;
     }
+    if (useAutomationSessionStore.getState().activeBySession.has(tabId)) {
+      // The independent scheduled process owns this durable Claude session.
+      // Preserve the draft and wait for the monitor's terminal refresh; a
+      // second --resume process here could interleave writes and tool work.
+      useChatStore.getState().setInputDraft(tabId, rawInput);
+      return;
+    }
     let text = rawInput.trim();
     // What the user should see (and what Stop should restore) can differ from
     // the payload sent to Claude. In particular, /manual <prompt> and the
     // other mode aliases are Black Box UI controls, not part of the prompt.
     let submittedUserText = rawInput.trim();
+    let submittedViaGoal = false;
 
     // Plan approval shortcut: empty Enter triggers approve & execute flow
     const tabState = getActiveTabState();
@@ -882,6 +860,18 @@ export function InputBar() {
 
     if (!text) return;
 
+    const liveRuntimeOwnsRoute = Boolean(
+      tabState.sessionMeta.stdinId && isSessionBusy(tabState.sessionStatus),
+    );
+    if (!liveRuntimeOwnsRoute) {
+      const readiness = await ensureConversationRuntimeReady(tabId);
+      if (!readiness.ready) {
+        useSettingsStore.getState().openSettings('provider');
+        useChatStore.getState().setInputDraft(tabId, rawInput);
+        return;
+      }
+    }
+
     // Goal, Workflow, and Loop remain thin entry points into capabilities
     // exposed by the active Claude runtime. Automatic Workflow is an ordinary
     // prompt that asks that runtime to choose from its real capabilities; it
@@ -902,6 +892,7 @@ export function InputBar() {
       useComposerModeStore.getState().clearTaskMode(tabId);
 
       if (planned.value.kind === 'goal') {
+        submittedViaGoal = true;
         text = planned.value.command;
       }
 
@@ -1135,6 +1126,7 @@ export function InputBar() {
       pendingTurnMessageId?: string;
       pendingTurnInput?: string;
       pendingTurnAttachments?: FileAttachment[];
+      goalRequestActive?: boolean;
       activeTurnInput?: string;
       contextRecoveryAttempts?: number;
     };
@@ -1161,6 +1153,7 @@ export function InputBar() {
         pendingTurnMessageId,
         pendingTurnInput: submittedUserText,
         pendingTurnAttachments: savedFiles,
+        goalRequestActive: submittedViaGoal,
         activeTurnInput: submittedUserText,
         contextRecoveryAttempts: 0,
       };
@@ -2047,7 +2040,7 @@ export function InputBar() {
           <button
             data-testid="send-button"
             onClick={handleSubmit}
-            disabled={isAwaiting || isStopping || isHydratingFromDisk || !taskComposerReady
+            disabled={isAwaiting || isStopping || isHydratingFromDisk || Boolean(activeAutomation) || !taskComposerReady
               || (!input.trim() && !activePrefix)}
             className={`flex-shrink-0 self-end w-8 h-8 rounded-[10px]
               flex items-center justify-center transition-smooth
@@ -2056,13 +2049,15 @@ export function InputBar() {
                 ? 'bg-warning/15 text-warning cursor-not-allowed'
                 : 'bg-accent hover:bg-accent-hover text-text-inverse hover:shadow-glow cursor-pointer'
               }`}
-            title={isAwaiting
-              ? t('input.awaitingInteraction')
-              : isRunning
-                ? t(composerModeTab.busyDelivery === 'queue'
-                  ? 'input.queueSend'
-                  : 'input.steerSend')
-                : undefined}
+            title={activeAutomation
+              ? t('automations.chatSendLocked')
+              : isAwaiting
+                ? t('input.awaitingInteraction')
+                : isRunning
+                  ? t(composerModeTab.busyDelivery === 'queue'
+                    ? 'input.queueSend'
+                    : 'input.steerSend')
+                  : undefined}
           >
             <svg width="16" height="16" viewBox="0 0 16 16"
               fill="none" stroke="currentColor" strokeWidth="2"

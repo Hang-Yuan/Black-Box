@@ -552,7 +552,8 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
         <div className="relative group my-3">
           <CopyButton text={codeText} />
           <pre className="bg-bg-secondary rounded-lg p-4
-            border border-border-subtle overflow-x-auto">
+            border border-border-subtle min-w-0 max-w-full overflow-x-hidden
+            whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
             {children}
           </pre>
         </div>

@@ -238,7 +238,7 @@ function UserMsg({ message }: Props) {
           </div>
         )}
       </div>
-      <UserAvatar size="w-8 h-8 text-xs" className="mt-0.5" />
+      <UserAvatar size="w-[60px] h-[60px] text-lg" className="mt-0.5" />
     </div>
   );
 }
@@ -295,7 +295,7 @@ function CommandFeedbackMsg({ message }: Props) {
     // Preformatted output (e.g. CLI command results)
     if (data.preformatted) {
       return (
-        <div className="ml-11 my-1 animate-fade-in">
+        <div className="ml-[72px] my-1 animate-fade-in">
           <div className="rounded-lg border border-border-subtle
             bg-bg-secondary/50 overflow-hidden max-w-md">
             <div className="flex items-center gap-2 px-3 py-1.5
@@ -312,7 +312,7 @@ function CommandFeedbackMsg({ message }: Props) {
     }
 
     return (
-      <div className="ml-11 my-1 animate-fade-in">
+      <div className="ml-[72px] my-1 animate-fade-in">
         <div className="inline-block rounded-lg border border-border-subtle
           bg-bg-secondary/50 overflow-hidden max-w-xs">
           {/* Header */}
@@ -356,7 +356,7 @@ function CommandFeedbackMsg({ message }: Props) {
   if (cType === 'help') {
     const builtins: Array<{ name: string; desc: string }> = data.builtins || [];
     return (
-      <div className="ml-11 my-1 animate-fade-in">
+      <div className="ml-[72px] my-1 animate-fade-in">
         <div className="rounded-lg border border-border-subtle
           bg-bg-secondary/50 overflow-hidden max-w-md">
           {/* Header */}
@@ -444,15 +444,15 @@ function AssistantMsg({ message, isFirstInGroup = true }: Props) {
     <div className="flex gap-3">
       {/* Avatar: show only for the first message in a consecutive group */}
       {isFirstInGroup ? (
-        <AiAvatar size="w-8 h-8" className="mt-0.5" />
+        <AiAvatar size="w-[60px] h-[60px]" className="mt-0.5" />
       ) : (
-        <div className="w-8 flex-shrink-0" />
+        <div className="w-[60px] flex-shrink-0" />
       )}
       <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
         <MarkdownRenderer content={sanitizeAssistantTextForDisplay(message.content)} />
       </div>
       {/* Right gutter mirrors the avatar so assistant text aligns with the user bubble's right edge */}
-      <div className="w-8 flex-shrink-0" />
+      <div className="w-[60px] flex-shrink-0" />
     </div>
   );
 }
@@ -823,9 +823,13 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     if (hasInput) {
       if (toolName === 'Bash' && input?.command) {
         sections.push(
-          <div key="cmd" className="flex items-start gap-1.5">
-            <span className="text-text-tertiary/60 text-[11px] font-mono select-none">$</span>
-            <pre className="text-[11px] text-text-muted font-mono whitespace-pre-wrap break-all">
+          <div key="cmd" className="flex items-start gap-1.5 rounded-lg border
+            border-border-subtle bg-bg-secondary/35 px-2.5 py-2
+            max-h-60 overflow-auto overscroll-contain">
+            <span className="text-text-tertiary/60 text-[11px] font-mono select-none
+              sticky top-0 flex-shrink-0">$</span>
+            <pre className="min-w-0 text-[11px] text-text-muted font-mono
+              whitespace-pre-wrap break-all leading-relaxed">
               {input.command}
             </pre>
           </div>
@@ -872,7 +876,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const depth = message.subAgentDepth ?? 0;
 
   return (
-    <div className={depth > 0 ? 'ml-16 mr-11 pl-3 border-l-2 border-accent/15' : 'ml-11 mr-11'}>
+    <div className={depth > 0 ? 'ml-[92px] mr-[72px] pl-3 border-l-2 border-accent/15' : 'ml-[72px] mr-[72px]'}>
       <button
         onClick={() => canExpand && setExpanded(!expanded)}
         className={`flex items-center gap-1.5 py-1 text-left group
@@ -937,7 +941,7 @@ function ToolResultMsg({ message }: Props) {
     : '';
 
   return (
-    <div className={depth > 0 ? 'ml-16 mr-11 pl-3 border-l-2 border-accent/15' : 'ml-11 mr-11'}>
+    <div className={depth > 0 ? 'ml-[92px] mr-[72px] pl-3 border-l-2 border-accent/15' : 'ml-[72px] mr-[72px]'}>
       <button
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1.5 py-0.5 cursor-pointer group"
@@ -976,7 +980,7 @@ function ToolResultMsg({ message }: Props) {
 function ThinkingMsg({ message }: Props) {
   const t = useT();
   return (
-    <div className="ml-11 mr-11">
+    <div className="ml-[72px] mr-[72px]">
       <details className="group">
         <summary className="flex items-center gap-1.5 py-1
           cursor-pointer text-[11px] text-text-tertiary list-none select-none">
@@ -1008,7 +1012,7 @@ function PlanMsg({ message }: Props) {
   const items = message.planItems || (typeof message.content === 'string' ? message.content.split('\n').filter(Boolean) : []);
 
   return (
-    <div className="ml-11 mr-11">
+    <div className="ml-[72px] mr-[72px]">
       <button
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1.5 py-1 cursor-pointer"
@@ -1055,7 +1059,7 @@ function TodoMsg({ message }: Props) {
   const inProgressItem = items.find((i) => i.status === 'in_progress');
 
   return (
-    <div className="ml-11 mr-11">
+    <div className="ml-[72px] mr-[72px]">
       {/* Header — collapsible */}
       <button
         onClick={() => setExpanded(!expanded)}

@@ -9,6 +9,7 @@ import {
   type ThreadActivityRow,
 } from '../../lib/global-task-activity';
 import { isSessionBusy, useChatStore } from '../../stores/chatStore';
+import { isAgentActive, useAgentStore } from '../../stores/agentStore';
 import { useLoopStore } from '../../stores/loopStore';
 import { usePlanStore } from '../../stores/planStore';
 import { useSessionStore } from '../../stores/sessionStore';
@@ -23,7 +24,7 @@ export interface ActivityCenterProps {
 const EMPTY_AUTOMATIONS: readonly AutomationActivitySummary[] = [];
 
 const STATUS_LABEL: Readonly<Record<TaskActivityStatus, string>> = {
-  waiting_user: '等待你',
+  waiting_user: '需处理',
   running: '运行中',
   queued: '排队中',
   failed: '失败',
@@ -148,18 +149,34 @@ export function ActivityCenter({
   const sessions = useSessionStore((state) => state.sessions);
   const customPreviews = useSessionStore((state) => state.customPreviews);
   const runningSessions = useSessionStore((state) => state.runningSessions);
+  const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
   const tabs = useChatStore((state) => state.tabs);
+  const visibleAgents = useAgentStore((state) => state.agents);
+  const agentCache = useAgentStore((state) => state.agentCache);
   const plans = usePlanStore((state) => state.plans);
   const workflowRuns = useWorkflowStore((state) => state.liveRuns);
   const loopJobs = useLoopStore((state) => state.jobs);
   const [expandedThreads, setExpandedThreads] = useState<Set<string>>(() => new Set());
 
   const threadSources = useMemo(() => {
+    const threadsWithBackgroundAgents = new Set<string>();
+    for (const [threadId, cachedAgents] of agentCache) {
+      if (threadId === selectedSessionId) continue;
+      if (Array.from(cachedAgents.values()).some((agent) => agent.background && isAgentActive(agent))) {
+        threadsWithBackgroundAgents.add(threadId);
+      }
+    }
+    if (
+      selectedSessionId
+      && Array.from(visibleAgents.values()).some((agent) => agent.background && isAgentActive(agent))
+    ) {
+      threadsWithBackgroundAgents.add(selectedSessionId);
+    }
     const sources = new Map<string, ThreadActivitySource>(sessions.map((session) => [session.id, {
       threadId: session.id,
       title: sessionTitle(session, customPreviews),
       updatedAt: session.modifiedAt,
-      running: runningSessions.has(session.id),
+      running: runningSessions.has(session.id) || threadsWithBackgroundAgents.has(session.id),
       waitingFor: undefined,
     }]));
     for (const [threadId, tab] of tabs) {
@@ -172,12 +189,16 @@ export function ActivityCenter({
           tab.lastAccessedAt,
           tab.sessionMeta.lastProgressAt || 0,
         ),
-        running: Boolean(existing?.running || isSessionBusy(tab.sessionStatus)),
+        running: Boolean(
+          existing?.running
+          || isSessionBusy(tab.sessionStatus)
+          || threadsWithBackgroundAgents.has(threadId)
+        ),
         waitingFor: tab.waitingFor,
       });
     }
     return [...sources.values()];
-  }, [customPreviews, runningSessions, sessions, tabs]);
+  }, [agentCache, customPreviews, runningSessions, selectedSessionId, sessions, tabs, visibleAgents]);
 
   const snapshot = useMemo(() => buildGlobalTaskActivity({
     threads: threadSources,
@@ -296,7 +317,7 @@ export function ActivityCenter({
                         ? `上次 ${formatTime(automation.lastRunAt)}`
                         : '尚未运行'}
                     {automation.unreadRuns > 0 && (
-                      <span className="ml-2 text-warning">{automation.unreadRuns} 条待查看</span>
+                      <span className="ml-2 text-accent">{automation.unreadRuns} 条新结果</span>
                     )}
                   </div>
                 </div>

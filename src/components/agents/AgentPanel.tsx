@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
-import { useAgentStore, AgentNode, AgentPhase } from '../../stores/agentStore';
+import { isAgentActive, useAgentStore, AgentNode, AgentPhase } from '../../stores/agentStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useActiveTab } from '../../stores/chatStore';
 import { useT } from '../../lib/i18n';
@@ -48,6 +48,12 @@ const phaseConfig: Record<AgentPhase, {
     pulse: false,
     labelKey: 'agents.completed',
   },
+  interrupted: {
+    color: 'bg-amber-500',
+    pulseColor: '',
+    pulse: false,
+    labelKey: 'agents.interrupted',
+  },
   error: {
     color: 'bg-red-500',
     pulseColor: '',
@@ -95,11 +101,13 @@ function AgentTreeNode({
   children,
   depth,
   auxiliaryModel,
+  onOpenProcess,
 }: {
   agent: AgentNode;
   children: AgentNode[];
   depth: number;
   auxiliaryModel?: string;
+  onOpenProcess?: (agentId: string) => void;
 }) {
   const t = useT();
   const agents = useAgentStore((s) => s.agents);
@@ -114,7 +122,7 @@ function AgentTreeNode({
   // All agents for recursive rendering
   const allAgents = useMemo(() => Array.from(agents.values()), [agents]);
 
-  const isFinished = agent.phase === 'completed' || agent.phase === 'error' || agent.phase === 'idle';
+  const isFinished = !isAgentActive(agent);
   const label = agent.isMain
     ? t('agents.main')
     : agent.kind === 'teammate'
@@ -124,6 +132,10 @@ function AgentTreeNode({
     ? agent.description
     : '';
   const modelLabel = !agent.isMain ? (agent.model || auxiliaryModel) : undefined;
+  const activity = useMemo(
+    () => (agent.activity ?? []).filter((entry) => entry.content.trim().length > 0),
+    [agent.activity],
+  );
 
   // Phase status text
   const phaseText = agent.phase === 'tool' && agent.currentTool
@@ -166,6 +178,19 @@ function AgentTreeNode({
             {phaseText}{modelLabel ? ` · ${modelLabel}` : ''}
           </span>
         </div>
+        {!agent.isMain && activity.length > 0 && (
+          <button
+            type="button"
+            data-testid={`agent-activity-${agent.id}`}
+            onClick={() => onOpenProcess?.(agent.id)}
+            className="ml-4 mt-1 flex w-[calc(100%-1rem)] items-center gap-1.5
+              border-t border-border-subtle/50 pt-1 text-left text-[9px]
+              text-text-tertiary transition-smooth hover:text-accent"
+          >
+            <span>{t('agents.activity').replace('{count}', String(activity.length))}</span>
+            <span className="truncate text-text-tertiary/60">{t('agents.openInProcessPanel')}</span>
+          </button>
+        )}
       </div>
 
       {/* Children */}
@@ -180,6 +205,7 @@ function AgentTreeNode({
               children={allAgents}
               depth={depth + 1}
               auxiliaryModel={auxiliaryModel}
+              onOpenProcess={onOpenProcess}
             />
           ))}
         </div>
@@ -190,7 +216,7 @@ function AgentTreeNode({
 
 // --- Main panel ---
 
-export function AgentPanel() {
+export function AgentPanel({ onOpenProcess }: { onOpenProcess?: (agentId: string) => void }) {
   const t = useT();
   const agents = useAgentStore((s) => s.agents);
   const teamTasks = useAgentStore((s) => s.teamTasks);
@@ -202,7 +228,11 @@ export function AgentPanel() {
   const agentList = useMemo(() => Array.from(agents.values()), [agents]);
   const mainAgent = useMemo(() => agentList.find((a) => a.isMain), [agentList]);
   const activeCount = useMemo(
-    () => agentList.filter((a) => !['idle', 'completed', 'error'].includes(a.phase)).length,
+    () => agentList.filter(isAgentActive).length,
+    [agentList],
+  );
+  const activeBackgroundCount = useMemo(
+    () => agentList.filter((agent) => !agent.isMain && isAgentActive(agent)).length,
     [agentList],
   );
   const totalCount = agentList.length;
@@ -252,6 +282,16 @@ export function AgentPanel() {
         disabled={teamToggleBusy}
         onToggle={toggleTeams}
       />
+      {activeBackgroundCount > 0 && (
+        <div
+          data-testid="agent-background-summary"
+          className="flex items-center gap-2 border-b border-warning/20 bg-warning/[0.06]
+            px-3 py-2 text-[10px] text-warning"
+        >
+          <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-warning animate-pulse-soft" />
+          <span>{t('agents.backgroundRunning').replace('{count}', String(activeBackgroundCount))}</span>
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2
         border-b border-border-subtle">
@@ -278,6 +318,7 @@ export function AgentPanel() {
             children={agentList}
             depth={0}
             auxiliaryModel={auxiliaryModel}
+            onOpenProcess={onOpenProcess}
           />
         )}
         {/* Orphan agents (parentId doesn't match any known agent) — fallback */}
@@ -290,6 +331,7 @@ export function AgentPanel() {
               children={agentList}
               depth={0}
               auxiliaryModel={auxiliaryModel}
+              onOpenProcess={onOpenProcess}
             />
           ))}
         {tasks.length > 0 && (

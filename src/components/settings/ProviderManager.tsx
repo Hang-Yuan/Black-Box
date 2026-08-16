@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useState, useCallback, useRef } from 'react';
-import { useProviderStore } from '../../stores/providerStore';
+import { hasUsableProviderCredential, useProviderStore } from '../../stores/providerStore';
+import { useSettingsStore, type ModelTier } from '../../stores/settingsStore';
 import { useSessionStore } from '../../stores/sessionStore';
+import { useChatStore } from '../../stores/chatStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { type PresetProvider } from '../../lib/provider-presets';
@@ -8,14 +10,21 @@ import { exportProvider } from '../../lib/api-config';
 import { AddProviderMenu } from './AddProviderMenu';
 import { ProviderCard, type CardTestStatus } from './ProviderCard';
 import { ProviderForm, type TestStatus } from './ProviderForm';
-import { getProviderConnectionTestModel } from '../../lib/api-provider';
+import { getModelDisplayOptions, getProviderConnectionTestModel } from '../../lib/api-provider';
 
 export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: boolean } = {}) {
   const t = useT();
   const providers = useProviderStore((s) => s.providers);
+  const defaultApi = useProviderStore((s) => s.defaultApi);
+  const defaultMainModel = useProviderStore((s) => s.defaultMainModel);
+  const defaultAuxiliaryModel = useProviderStore((s) => s.defaultAuxiliaryModel);
   const activeProviderId = useProviderStore((s) => s.activeProviderId);
   const loaded = useProviderStore((s) => s.loaded);
+  const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
   const setActive = useProviderStore((s) => s.setActive);
+  const setDefaultApi = useProviderStore((s) => s.setDefaultApi);
+  const setDefaultMainModel = useProviderStore((s) => s.setDefaultMainModel);
+  const setDefaultAuxiliaryModel = useProviderStore((s) => s.setDefaultAuxiliaryModel);
   const deleteProvider = useProviderStore((s) => s.deleteProvider);
   const addProvider = useProviderStore((s) => s.addProvider);
 
@@ -37,7 +46,47 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
   }, [loaded]);
 
   const activeProvider = providers.find((p) => p.id === activeProviderId);
-  const activeLabel = activeProvider ? activeProvider.name : t('provider.inherit');
+  const activeLabel = activeProvider ? activeProvider.name : t('provider.notConfigured');
+  const defaultProvider = defaultApi
+    ? providers.find((provider) => provider.id === defaultApi) ?? null
+    : null;
+  const defaultModelOptions = defaultApi
+    ? getModelDisplayOptions(defaultProvider)
+    : [];
+  const defaultsComplete = Boolean(defaultApi && defaultMainModel && defaultAuxiliaryModel);
+  const defaultProviderCredentialMissing = Boolean(
+    defaultApi
+    && (!defaultProvider
+      || !hasUsableProviderCredential(defaultProvider)),
+  );
+  const defaultsRunnable = defaultsComplete && !defaultProviderCredentialMissing;
+
+  const updateDefaultApi = (value: string) => {
+    const next = value || null;
+    setDefaultApi(next);
+    if (!next) return;
+    const nextProvider = providers.find((provider) => provider.id === next) ?? null;
+    const supported = new Set(getModelDisplayOptions(nextProvider).map((option) => option.id));
+    if (defaultMainModel && !supported.has(defaultMainModel)) setDefaultMainModel(null);
+    if (defaultAuxiliaryModel && !supported.has(defaultAuxiliaryModel)) {
+      setDefaultAuxiliaryModel(null);
+    }
+  };
+
+  const applyDefaultsToCurrentConversation = useCallback(() => {
+    if (!defaultsRunnable || !defaultApi || !defaultMainModel || !defaultAuxiliaryModel) return;
+    setActive(defaultApi);
+    useSettingsStore.getState().setSelectedModel(defaultMainModel);
+    useSettingsStore.getState().setAuxiliaryModel(defaultAuxiliaryModel);
+    useSettingsStore.getState().setCustomModelId(null);
+  }, [defaultApi, defaultMainModel, defaultAuxiliaryModel, defaultsRunnable, setActive]);
+
+  useEffect(() => {
+    if (!defaultsRunnable || !selectedSessionId?.startsWith('draft_')) return;
+    const tab = useChatStore.getState().getTab(selectedSessionId);
+    if (tab?.messages.length) return;
+    applyDefaultsToCurrentConversation();
+  }, [applyDefaultsToCurrentConversation, defaultsRunnable, selectedSessionId]);
 
   const handleAddFromPreset = useCallback((preset: PresetProvider) => {
     const existingCount = providers.filter((p) => p.preset === preset.id).length;
@@ -171,22 +220,121 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
             {t('provider.fixedCatalogNotice')}
           </div>
 
-          {/* Inherit system config option */}
-          <div className={`rounded-md text-[13px] transition-smooth border
-            ${!activeProviderId
-              ? 'bg-accent/10 border-accent/30'
-              : 'border-border-subtle hover:bg-bg-secondary'
-            }`}
+          <section
+            data-testid="default-system-configuration"
+            className="rounded-lg border border-accent/25 bg-accent/5 p-3"
           >
-            <button
-              onClick={() => setActive(null)}
-              {...(import.meta.env.DEV && { 'data-testid': 'provider-inherit-button' })}
-              className={`text-left w-full px-3 py-2 ${!activeProviderId ? 'text-accent' : 'text-text-muted'}`}
-            >
-              {t('provider.inherit')}
-              <span className="text-xs text-text-tertiary ml-2">{t('provider.inheritDesc')}</span>
-            </button>
-          </div>
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <h4 className="text-[13px] font-medium text-text-primary">
+                  {t('provider.systemDefaults')}
+                </h4>
+                <p className="mt-0.5 text-[11px] leading-5 text-text-tertiary">
+                  {t('provider.systemDefaultsDesc')}
+                </p>
+              </div>
+              <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px]
+                ${!defaultsComplete
+                  ? 'bg-amber-500/10 text-amber-400'
+                  : defaultProviderCredentialMissing
+                    ? 'bg-red-500/10 text-red-400'
+                    : 'bg-green-500/10 text-green-400'}`}
+              >
+                {!defaultsComplete
+                  ? t('provider.notConfigured')
+                  : defaultProviderCredentialMissing
+                    ? t('provider.unavailable')
+                    : t('provider.configured')}
+              </span>
+            </div>
+
+            <div className="grid gap-2 md:grid-cols-3">
+              <label className="space-y-1">
+                <span className="text-[11px] text-text-muted">{t('provider.defaultApi')}</span>
+                <select
+                  data-testid="default-system-api"
+                  value={defaultApi ?? ''}
+                  onChange={(event) => updateDefaultApi(event.target.value)}
+                  className="w-full rounded-md border border-border-subtle bg-bg-primary px-2 py-1.5
+                    text-[12px] text-text-primary outline-none focus:border-accent/50"
+                >
+                  <option value="">{t('provider.chooseDefault')}</option>
+                  {providers.map((provider) => {
+                    const available = hasUsableProviderCredential(provider);
+                    return (
+                    <option key={provider.id} value={provider.id} disabled={!available}>
+                      {provider.name || t('provider.unnamed')}
+                    </option>
+                    );
+                  })}
+                </select>
+              </label>
+
+              <label className="space-y-1">
+                <span className="text-[11px] text-text-muted">{t('provider.defaultMainModel')}</span>
+                <select
+                  data-testid="default-main-model"
+                  value={defaultMainModel ?? ''}
+                  disabled={!defaultApi}
+                  onChange={(event) => setDefaultMainModel(
+                    (event.target.value || null) as ModelTier | null,
+                  )}
+                  className="w-full rounded-md border border-border-subtle bg-bg-primary px-2 py-1.5
+                    text-[12px] text-text-primary outline-none focus:border-accent/50
+                    disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">{t('provider.chooseDefault')}</option>
+                  {defaultModelOptions.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="space-y-1">
+                <span className="text-[11px] text-text-muted">
+                  {t('provider.defaultAuxiliaryModel')}
+                </span>
+                <select
+                  data-testid="default-auxiliary-model"
+                  value={defaultAuxiliaryModel ?? ''}
+                  disabled={!defaultApi}
+                  onChange={(event) => setDefaultAuxiliaryModel(
+                    (event.target.value || null) as ModelTier | null,
+                  )}
+                  className="w-full rounded-md border border-border-subtle bg-bg-primary px-2 py-1.5
+                    text-[12px] text-text-primary outline-none focus:border-accent/50
+                    disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">{t('provider.chooseDefault')}</option>
+                  {defaultModelOptions.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            {defaultProviderCredentialMissing && (
+              <p className="mt-2 rounded-md bg-red-500/5 px-2 py-1.5 text-[10px] text-red-400">
+                {t('provider.defaultApiCredentialMissing')}
+              </p>
+            )}
+
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <span className="text-[10px] leading-4 text-text-tertiary">
+                {t('provider.currentConversationOverrideHint')}
+              </span>
+              <button
+                type="button"
+                disabled={!defaultsRunnable}
+                onClick={applyDefaultsToCurrentConversation}
+                className="shrink-0 rounded-md border border-border-subtle px-2.5 py-1 text-[11px]
+                  text-text-muted transition-smooth hover:bg-bg-secondary hover:text-text-primary
+                  disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {t('provider.applyDefaultsToConversation')}
+              </button>
+            </div>
+          </section>
 
           {/* Provider cards + inline forms */}
           <div className="space-y-1.5">

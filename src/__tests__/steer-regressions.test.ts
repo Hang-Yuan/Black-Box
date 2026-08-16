@@ -10,6 +10,14 @@ const streamProcessor = readFileSync(
   resolve(__dirname, '../hooks/useStreamProcessor.ts'),
   'utf8',
 );
+const chatPanel = readFileSync(
+  resolve(__dirname, '../components/chat/ChatPanel.tsx'),
+  'utf8',
+);
+const activityPanel = readFileSync(
+  resolve(__dirname, '../components/activity/ActivityPanel.tsx'),
+  'utf8',
+);
 
 describe('live steer regressions', () => {
   it('sends guidance directly to the active stdin without starting a new turn', () => {
@@ -47,5 +55,14 @@ describe('live steer regressions', () => {
     expect(inputBar).toContain("? 'input.queuePlaceholder'");
     expect(inputBar).toContain("? 'input.queueSend'");
     expect(inputBar).toContain('!floatingCard');
+  });
+
+  it('keeps the composer clean while the Agent button exposes background status', () => {
+    expect(inputBar).not.toContain('data-testid="ongoing-background-work-notice"');
+    expect(chatPanel).toContain('data-testid="agent-panel-toggle"');
+    expect(chatPanel).toContain('<AgentPanel onOpenProcess={openAgentProcess} />');
+    expect(activityPanel).toContain('data-testid="activity-panel"');
+    expect(activityPanel).toContain("t('input.backgroundWorkStalled')");
+    expect(inputBar).toContain('editable={!isStopping && !isHydratingFromDisk}');
   });
 });

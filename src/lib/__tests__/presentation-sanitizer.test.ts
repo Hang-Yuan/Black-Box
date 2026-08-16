@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  isCliPlaceholder,
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from '../presentation-sanitizer';
 
 describe('agent presentation sanitizer', () => {
-  it('keeps stable teammate status while removing private ids and XML wrappers', () => {
+  it('removes the complete raw task notification while preserving surrounding lead prose', () => {
     const raw = `Waiting for the teammate.
 
 <task-notification id="a6d0a11503796be67">
@@ -15,8 +16,9 @@ The marker is UI_AGENT_TEAM_MARKER_R2O.
 </task-notification>`;
 
     const safe = sanitizeAssistantTextForDisplay(raw);
-    expect(safe).toContain('ui-reader: Completed');
-    expect(safe).toContain('UI_AGENT_TEAM_MARKER_R2O');
+    expect(safe).toBe('Waiting for the teammate.\n\n');
+    expect(safe).not.toContain('ui-reader: Completed');
+    expect(safe).not.toContain('UI_AGENT_TEAM_MARKER_R2O');
     expect(safe).not.toContain('a6d0a11503796be67');
     expect(safe).not.toContain('task-notification');
   });
@@ -42,6 +44,14 @@ Useful result`;
     expect(sanitizeToolResultForDisplay('Agent', internal)).toBe('');
     expect(sanitizeToolResultForDisplay('SendMessage', internal)).toBe('');
     expect(sanitizeToolResultForDisplay('Read', 'visible file content')).toBe('visible file content');
+  });
+
+  it('shares one placeholder filter across live and restored projections', () => {
+    expect(isCliPlaceholder(' No response requested. ')).toBe(true);
+    expect(isCliPlaceholder(' [Request interrupted by user] ')).toBe(true);
+    expect(sanitizeAssistantTextForDisplay('No response requested.')).toBe('');
+    expect(sanitizeAssistantTextForDisplay('[Request interrupted by user]')).toBe('');
+    expect(sanitizeAssistantTextForDisplay('A real response.')).toBe('A real response.');
   });
 
 });

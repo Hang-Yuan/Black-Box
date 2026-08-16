@@ -37,6 +37,11 @@ const conversationListSource = readFileSync(
   'utf-8',
 );
 
+const sessionLifecycleSource = readFileSync(
+  resolve(__dirname, '../lib/sessionLifecycle.ts'),
+  'utf-8',
+);
+
 const planReviewCardSource = readFileSync(
   resolve(__dirname, '../components/chat/PlanReviewCard.tsx'),
   'utf-8',
@@ -92,7 +97,8 @@ describe('stdin route regressions', () => {
   });
 
   it('delete flow falls back to persisted stdin routes when the tab is not loaded', () => {
-    expect(conversationListSource).toContain('Object.entries(useSessionStore.getState().stdinToTab)');
+    expect(conversationListSource).toContain("teardownTabBackendProcesses(sessionId, 'delete')");
+    expect(sessionLifecycleSource).toContain('Object.entries(useSessionStore.getState().stdinToTab)');
   });
 
   it('stale plan review cards do not execute after the live session is gone', () => {

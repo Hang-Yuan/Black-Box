@@ -26,8 +26,10 @@ describe('session metadata authority regressions', () => {
     expect(persistence).not.toContain('data.length > 0');
   });
 
-  it('keeps archive groups collapsed without displaying an ever-growing total', () => {
-    expect(conversations).toContain('setArchiveExpandedGroups(new Set())');
+  it('keeps new archive groups collapsed, restores explicit visibility, and hides lifetime totals', () => {
+    expect(conversations).toContain('archiveExpandedGroups.has(group.id)');
+    expect(conversations).toContain('initialSidebarVisibility.archiveExpandedGroups');
+    expect(conversations).not.toContain('setArchiveExpandedGroups(new Set())');
     expect(conversations).toContain("conversationView === 'archived'");
     expect(conversations).toContain("['archived', t('conv.archivedView')]");
     expect(conversations).toContain('<span className="truncate">{label}</span>');

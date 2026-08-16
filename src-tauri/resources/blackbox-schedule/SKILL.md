@@ -17,6 +17,13 @@ Use `scripts/automation_cli.py` for every task mutation. Never edit
 - Use `cron` when every run should be independent and appear as a separate
   Scheduled result. Bind it to exactly one project directory.
 
+Every trigger creates or resumes an ordinary durable Blackbox conversation and
+sends the saved prompt into it. The run inherits the user's explicit Default
+system configuration (default API, main model, and subagent model) at trigger
+time. Optional task-level model fields may override the two model defaults. A
+scheduled-task definition must never store a provider id, provider revision,
+API key, or other credential binding.
+
 ## Create or update
 
 1. Resolve relative time from the real system clock.
@@ -41,8 +48,6 @@ Use `scripts/automation_cli.py` for every task mutation. Never edit
   "target": {"type": "project", "projectId": "/absolute/project/path"},
   "cwds": ["/absolute/project/path"],
   "target_thread_id": null,
-  "provider_id": null,
-  "provider_revision": null,
   "created_at": 0,
   "updated_at": 0
 }

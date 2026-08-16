@@ -83,7 +83,6 @@ export function ProviderCard({
         </div>
       </div>
 
-      {/* Test button — same style as form test button */}
       <button
         onClick={(e) => { e.stopPropagation(); onTest(); }}
         disabled={testStatus === 'testing'}

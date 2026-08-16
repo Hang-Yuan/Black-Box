@@ -1,15 +1,35 @@
+/** Claude CLI state-machine placeholders that never belong in user-visible prose. */
+export const CLI_INTERNAL_PLACEHOLDERS: readonly string[] = [
+  'No response requested.',
+  'No response requested',
+  '[Request interrupted by user]',
+  '(no content)',
+  'No content',
+];
+
+export function isCliPlaceholder(text: string | undefined | null): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return CLI_INTERNAL_PLACEHOLDERS.some((placeholder) => trimmed === placeholder);
+}
+
 /**
  * Remove Claude Code's private agent coordination metadata from anything that
  * can reach the visible conversation, exports, or a restored session.
  *
- * Stable teammate names and useful status/result prose are preserved. Internal
- * agent ids and private JSONL output paths are implementation details and must
- * never become product UI.
+ * Raw task notifications belong to the Agent activity projection. The lead
+ * agent may synthesize their useful result afterward, but the notification
+ * envelope and its verbatim subagent report must never become chat prose.
  */
 export function sanitizeAssistantTextForDisplay(value: unknown): string {
   if (typeof value !== 'string') return value == null ? '' : JSON.stringify(value);
+  if (isCliPlaceholder(value)) return '';
 
-  let text = value;
+  let text = value.replace(
+    /<task-notification\b[^>]*>[\s\S]*?<\/task-notification>\s*/gi,
+    '',
+  );
   for (const tag of ['task-id', 'tool-use-id', 'output-file', 'usage', 'note']) {
     text = text.replace(new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>\\s*`, 'gi'), '');
   }
@@ -28,7 +48,7 @@ export function sanitizeAssistantTextForDisplay(value: unknown): string {
     .replace(/\/private\/tmp\/claude-[^\s<>'"`]+/gi, '[internal agent output hidden]')
     .replace(/\n{3,}/g, '\n\n');
 
-  return text;
+  return isCliPlaceholder(text) ? '' : text;
 }
 
 export function sanitizeToolResultForDisplay(

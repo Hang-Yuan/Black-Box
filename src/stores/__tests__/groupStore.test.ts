@@ -151,6 +151,66 @@ describe('groupStore', () => {
     });
   });
 
+  describe('moveSession (conversation drag-and-drop)', () => {
+    it('reorders a conversation within its current group', () => {
+      const g = useGroupStore.getState().createGroup('~/ws', '组');
+      useGroupStore.getState().addToGroup('a', g);
+      useGroupStore.getState().addToGroup('b', g);
+      useGroupStore.getState().addToGroup('c', g);
+      useGroupStore.getState().moveSession('a', g, 'c');
+      expect(useGroupStore.getState().getGroupOfSession('a')?.sessionIds)
+        .toEqual(['b', 'c', 'a']);
+    });
+
+    it('moves a conversation between groups at the dropped row', () => {
+      const a = useGroupStore.getState().createGroup('~/ws', 'A');
+      const b = useGroupStore.getState().createGroup('~/ws', 'B');
+      useGroupStore.getState().addToGroup('moving', a);
+      useGroupStore.getState().addToGroup('before', b);
+      useGroupStore.getState().addToGroup('after', b);
+      useGroupStore.getState().moveSession('moving', b, 'after');
+      expect(useGroupStore.getState().groups.find((group) => group.id === a)?.sessionIds)
+        .toEqual([]);
+      expect(useGroupStore.getState().groups.find((group) => group.id === b)?.sessionIds)
+        .toEqual(['before', 'moving', 'after']);
+    });
+
+    it('appends an ungrouped conversation when dropped on a group header', () => {
+      const g = useGroupStore.getState().createGroup('~/ws', '组');
+      useGroupStore.getState().addToGroup('existing', g);
+      useGroupStore.getState().moveSession('ungrouped', g);
+      expect(useGroupStore.getState().groups.find((group) => group.id === g)?.sessionIds)
+        .toEqual(['existing', 'ungrouped']);
+    });
+
+    it('returns a conversation to ungrouped and clears its in-group pin', () => {
+      const g = useGroupStore.getState().createGroup('~/ws', '组');
+      useGroupStore.getState().addToGroup('s1', g);
+      useGroupStore.getState().pinInGroup(g, 's1');
+      useGroupStore.getState().moveSession('s1', null);
+      const group = useGroupStore.getState().groups.find((candidate) => candidate.id === g)!;
+      expect(group.sessionIds).toEqual([]);
+      expect(group.pinnedInGroup).toEqual([]);
+    });
+
+    it('preserves an in-group pin while reordering in the same group', () => {
+      const g = useGroupStore.getState().createGroup('~/ws', '组');
+      useGroupStore.getState().addToGroup('a', g);
+      useGroupStore.getState().addToGroup('b', g);
+      useGroupStore.getState().pinInGroup(g, 'a');
+      useGroupStore.getState().moveSession('a', g, 'b');
+      expect(useGroupStore.getState().groups.find((group) => group.id === g)?.pinnedInGroup)
+        .toEqual(['a']);
+    });
+
+    it('keeps the source membership when a stale target group is supplied', () => {
+      const g = useGroupStore.getState().createGroup('~/ws', '组');
+      useGroupStore.getState().addToGroup('s1', g);
+      useGroupStore.getState().moveSession('s1', 'missing');
+      expect(useGroupStore.getState().getGroupOfSession('s1')?.id).toBe(g);
+    });
+  });
+
   describe('reorderGroups', () => {
     it('fixes the order of groups within a workspace', () => {
       const a = useGroupStore.getState().createGroup('~/ws', 'A');

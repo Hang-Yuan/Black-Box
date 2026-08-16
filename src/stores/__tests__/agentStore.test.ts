@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
+  appendCachedAgentActivity,
+  isAgentActive,
   registerCachedTeamTask,
+  resetCachedTurn,
+  resolveAgentEventId,
   resolveCachedTeamTask,
   settleCachedAgent,
+  settleCachedTurn,
   updateCachedTeamTask,
   useAgentStore,
 } from '../agentStore';
@@ -20,6 +25,15 @@ function resetAgents() {
 describe('agentStore', () => {
   beforeEach(() => {
     resetAgents();
+  });
+
+  it('uses one terminal-phase contract for every agent activity surface', () => {
+    for (const phase of ['spawning', 'thinking', 'writing', 'tool'] as const) {
+      expect(isAgentActive({ phase })).toBe(true);
+    }
+    for (const phase of ['idle', 'completed', 'interrupted', 'error'] as const) {
+      expect(isAgentActive({ phase })).toBe(false);
+    }
   });
 
   describe('completeAll is idempotent', () => {
@@ -80,6 +94,44 @@ describe('agentStore', () => {
       });
       useAgentStore.getState().completeAll();
       expect(useAgentStore.getState().agents.get('err')?.phase).toBe('error');
+    });
+
+    it('interrupted historical agents stay terminal', () => {
+      const s = useAgentStore.getState();
+      s.upsertAgent({
+        id: 'interrupted',
+        parentId: 'main',
+        description: 'historical background task',
+        phase: 'interrupted',
+        startTime: 1,
+        endTime: 100,
+        isMain: false,
+        background: true,
+      });
+      useAgentStore.getState().completeAll();
+      expect(useAgentStore.getState().agents.get('interrupted')).toMatchObject({
+        phase: 'interrupted',
+        endTime: 100,
+      });
+    });
+
+    it('settles the main turn while preserving an asynchronously launched Agent', () => {
+      const s = useAgentStore.getState();
+      s.upsertAgent({
+        id: 'main', parentId: null, description: 'main', phase: 'writing',
+        startTime: 1, isMain: true, kind: 'main',
+      });
+      s.upsertAgent({
+        id: 'agent-tool', parentId: 'main', description: 'background', phase: 'thinking',
+        startTime: 2, isMain: false, kind: 'subagent', taskId: 'task-7', background: true,
+      });
+
+      useAgentStore.getState().completeAll('completed', false, true);
+
+      expect(useAgentStore.getState().agents.get('main')?.phase).toBe('completed');
+      expect(useAgentStore.getState().agents.get('agent-tool')).toMatchObject({
+        phase: 'thinking', taskId: 'task-7', background: true,
+      });
     });
   });
 
@@ -187,6 +239,46 @@ describe('agentStore', () => {
     });
   });
 
+  describe('optional subagent process projection', () => {
+    it('coalesces streamed text and keeps it off the main agent', () => {
+      const store = useAgentStore.getState();
+      store.upsertAgent({
+        id: 'main', parentId: null, description: 'lead', phase: 'thinking',
+        startTime: 1, isMain: true, kind: 'main',
+      });
+      store.upsertAgent({
+        id: 'sub', parentId: 'main', description: 'reader', phase: 'thinking',
+        startTime: 2, isMain: false, kind: 'subagent',
+      });
+
+      useAgentStore.getState().appendActivity('main', { kind: 'text', content: 'hidden' });
+      useAgentStore.getState().appendActivity('sub', { kind: 'text', content: 'Checking ', append: true });
+      useAgentStore.getState().appendActivity('sub', { kind: 'text', content: 'files', append: true });
+      useAgentStore.getState().appendActivity('sub', { kind: 'tool', content: 'Read', toolName: 'Read' });
+
+      expect(useAgentStore.getState().agents.get('main')?.activity).toBeUndefined();
+      expect(useAgentStore.getState().agents.get('sub')?.activity?.map((entry) => entry.content)).toEqual([
+        'Checking files',
+        'Read',
+      ]);
+    });
+
+    it('updates the background tab cache without contaminating the foreground tree', () => {
+      useAgentStore.setState({
+        agentCache: new Map([['tab-bg', new Map([['sub', {
+          id: 'sub', parentId: 'main', description: 'reader', phase: 'thinking',
+          startTime: 1, isMain: false, kind: 'subagent' as const,
+        }]])]]),
+      });
+
+      appendCachedAgentActivity('tab-bg', 'sub', { kind: 'text', content: 'Background detail' });
+
+      expect(useAgentStore.getState().agentCache.get('tab-bg')?.get('sub')?.activity?.[0].content)
+        .toBe('Background detail');
+      expect(useAgentStore.getState().agents.size).toBe(0);
+    });
+  });
+
   describe('Agent Teams lifecycle', () => {
     it('settles the lead and ordinary subagents while keeping teammates reusable', () => {
       const s = useAgentStore.getState();
@@ -230,6 +322,30 @@ describe('agentStore', () => {
       expect(state.agents.get('teammate')).toMatchObject({ kind: 'teammate', name: 'reader' });
       expect(state.agents.get('main')).toMatchObject({ kind: 'main', phase: 'spawning' });
       expect(state.teamTasks.get('1')?.subject).toBe('Inspect A');
+    });
+
+    it('keeps an active background Agent when the user starts another turn', () => {
+      const s = useAgentStore.getState();
+      s.upsertAgent({
+        id: 'agent-tool', parentId: 'main', description: 'background', phase: 'thinking',
+        startTime: 1, isMain: false, kind: 'subagent', taskId: 'task-9', background: true,
+      });
+
+      useAgentStore.getState().resetForTurn('follow-up', false);
+
+      expect(useAgentStore.getState().agents.get('agent-tool')).toMatchObject({
+        phase: 'thinking', taskId: 'task-9', background: true,
+      });
+      expect(useAgentStore.getState().agents.get('main')?.description).toBe('follow-up');
+    });
+
+    it('correlates resumed task events through taskId when tool-use ids differ', () => {
+      const agents = new Map<string, AgentNode>([['initial-tool', {
+        id: 'initial-tool', parentId: 'main', description: 'background', phase: 'thinking',
+        startTime: 1, isMain: false, kind: 'subagent', taskId: 'stable-task', background: true,
+      }]]);
+
+      expect(resolveAgentEventId('resumed-tool', 'stable-task', agents)).toBe('initial-tool');
     });
 
     it('correlates TaskCreate results and later TaskUpdate changes', () => {
@@ -281,6 +397,28 @@ describe('agentStore', () => {
       useAgentStore.getState().clearCacheForTab('task-only-tab');
 
       expect(useAgentStore.getState().teamTaskCache.has('task-only-tab')).toBe(false);
+    });
+
+    it('preserves cached background work across turn settlement and reset', () => {
+      useAgentStore.setState({
+        agentCache: new Map([['tab-bg', new Map<string, AgentNode>([
+          ['main', {
+            id: 'main', parentId: null, description: 'main', phase: 'writing',
+            startTime: 1, isMain: true, kind: 'main',
+          }],
+          ['agent-tool', {
+            id: 'agent-tool', parentId: 'main', description: 'background', phase: 'thinking',
+            startTime: 2, isMain: false, kind: 'subagent', taskId: 'task-bg', background: true,
+          }],
+        ])]]),
+      });
+
+      settleCachedTurn('tab-bg', false, false, true);
+      expect(useAgentStore.getState().agentCache.get('tab-bg')?.get('main')?.phase).toBe('completed');
+      expect(useAgentStore.getState().agentCache.get('tab-bg')?.get('agent-tool')?.phase).toBe('thinking');
+
+      resetCachedTurn('tab-bg', 'next', false);
+      expect(useAgentStore.getState().agentCache.get('tab-bg')?.get('agent-tool')?.phase).toBe('thinking');
     });
   });
 });

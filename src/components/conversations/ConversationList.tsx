@@ -3,6 +3,7 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import {
+  resetConversationFileState,
   restoreConversationFileState,
   saveConversationFileState,
   useFileStore,
@@ -22,8 +23,7 @@ import { initGroupPersistence } from '../../stores/groupPersistence';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import {
   settleOrphanedBackendProcesses,
-  teardownSession,
-  waitForStdinCleared,
+  teardownTabBackendProcesses,
 } from '../../lib/sessionLifecycle';
 import {
   filterSessionsForConversationView,
@@ -35,6 +35,10 @@ import {
   forgetConversationRuntimePreference,
   restoreConversationRuntimePreference,
 } from '../../lib/conversation-runtime-preferences';
+import {
+  loadConversationSidebarVisibility,
+  saveConversationSidebarVisibility,
+} from '../../lib/conversation-sidebar-visibility';
 
 function closePlanPanelForComparison() {
   window.dispatchEvent(new CustomEvent('blackbox:close-plan-panel'));
@@ -174,7 +178,10 @@ export function ConversationList() {
   const groups = useGroupStore((s) => s.groups);
   const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; groupId: string } | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [initialSidebarVisibility] = useState(loadConversationSidebarVisibility);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
+    () => new Set(initialSidebarVisibility.activeCollapsedGroups),
+  );
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<SessionListItem | null>(null);
@@ -190,15 +197,39 @@ export function ConversationList() {
   const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null);
 
   // Smart collapse (Phase 2)
-  const [manualExpanded, setManualExpanded] = useState<Set<string>>(new Set());
-  const [manualCollapsed, setManualCollapsed] = useState<Set<string>>(new Set());
+  const [manualExpanded, setManualExpanded] = useState<Set<string>>(
+    () => new Set(initialSidebarVisibility.activeExpandedProjects),
+  );
+  const [manualCollapsed, setManualCollapsed] = useState<Set<string>>(
+    () => new Set(initialSidebarVisibility.activeCollapsedProjects),
+  );
 
   // The archive is a separate conversation view, not a destructive move. Task
-  // groups keep their ledger identity but start collapsed every time history is
-  // opened. Workspace headers stay visible so archived group names are easy to find.
+  // groups keep their ledger identity. Newly seen archive groups start collapsed;
+  // explicit project/group visibility survives view switches and app restarts.
   const [conversationView, setConversationView] = useState<ConversationView>('active');
-  const [archiveExpandedGroups, setArchiveExpandedGroups] = useState<Set<string>>(new Set());
-  const [archiveCollapsedProjects, setArchiveCollapsedProjects] = useState<Set<string>>(new Set());
+  const [archiveExpandedGroups, setArchiveExpandedGroups] = useState<Set<string>>(
+    () => new Set(initialSidebarVisibility.archiveExpandedGroups),
+  );
+  const [archiveCollapsedProjects, setArchiveCollapsedProjects] = useState<Set<string>>(
+    () => new Set(initialSidebarVisibility.archiveCollapsedProjects),
+  );
+
+  useEffect(() => {
+    saveConversationSidebarVisibility({
+      activeExpandedProjects: Array.from(manualExpanded),
+      activeCollapsedProjects: Array.from(manualCollapsed),
+      activeCollapsedGroups: Array.from(collapsedGroups),
+      archiveCollapsedProjects: Array.from(archiveCollapsedProjects),
+      archiveExpandedGroups: Array.from(archiveExpandedGroups),
+    });
+  }, [
+    archiveCollapsedProjects,
+    archiveExpandedGroups,
+    collapsedGroups,
+    manualCollapsed,
+    manualExpanded,
+  ]);
 
   // Black Box's on-disk session_metadata.json is the sole authority for pins,
   // archive state, task groups, and ordering. React state is only the hydrated
@@ -455,11 +486,6 @@ export function ConversationList() {
     setGroupMenu(null);
     setMultiSelect(false);
     setSelectedIds(new Set());
-    if (view === 'archived') {
-      // History can be large: task groups always enter collapsed by default.
-      setArchiveExpandedGroups(new Set());
-      setArchiveCollapsedProjects(new Set());
-    }
   }, []);
 
   // --- Session loading (slim version using session-loader) ---
@@ -635,21 +661,7 @@ export function ConversationList() {
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {
     try {
-      // Kill running process before deleting (S8 fix — prevent residual processes)
-      const tab = useChatStore.getState().getTab(sessionId);
-      const routedStdinIds = Object.entries(useSessionStore.getState().stdinToTab)
-        .filter(([, tabId]) => tabId === sessionId)
-        .map(([stdinId]) => stdinId);
-      const stdinIds = Array.from(new Set([
-        ...(tab?.sessionMeta.stdinId ? [tab.sessionMeta.stdinId] : []),
-        ...routedStdinIds,
-      ]));
-      for (const stdinId of stdinIds) {
-        await teardownSession(stdinId, sessionId, 'delete');
-        if (tab?.sessionMeta.stdinId === stdinId) {
-          await waitForStdinCleared(sessionId, stdinId).catch(() => {});
-        }
-      }
+      await teardownTabBackendProcesses(sessionId, 'delete');
 
       if (sessionPath) {
         await bridge.deleteSession(sessionId, sessionPath);
@@ -660,6 +672,7 @@ export function ConversationList() {
       if (selectedId === sessionId) {
         setSelected('');
         useChatStore.getState().resetTab(sessionId);
+        resetConversationFileState();
         useSettingsStore.getState().setWorkingDirectory('');
       }
       useChatStore.getState().removeFromCache(sessionId);
@@ -883,6 +896,14 @@ export function ConversationList() {
     [],
   );
 
+  const handleMoveSession = useCallback((
+    sessionId: string,
+    targetGroupId: string | null,
+    beforeSessionId?: string,
+  ) => {
+    useGroupStore.getState().moveSession(sessionId, targetGroupId, beforeSessionId);
+  }, []);
+
   // Pin / Archive handlers
   const handleTogglePin = useCallback((session: SessionListItem) => {
     const next = new Set(pinnedSessions);
@@ -892,7 +913,13 @@ export function ConversationList() {
   }, [pinnedSessions, persistPinned]);
 
   const handleToggleArchive = useCallback((session: SessionListItem) => {
+    const archiving = !archivedSessions.has(session.id);
     persistArchived(toggleArchivedSession(archivedSessions, session.id));
+    if (archiving) {
+      void teardownTabBackendProcesses(session.id, 'archive').catch((error) => {
+        console.error('[BLACKBOX] Failed to close archived session process:', error);
+      });
+    }
   }, [archivedSessions, persistArchived]);
 
   // --- Session group handlers ---
@@ -1003,12 +1030,19 @@ export function ConversationList() {
 
   const handleBatchArchive = useCallback(() => {
     if (selectedIds.size === 0) return;
+    const archiving = conversationView !== 'archived';
+    const sessionIds = Array.from(selectedIds);
     const next = new Set(archivedSessions);
-    for (const id of selectedIds) {
+    for (const id of sessionIds) {
       if (conversationView === 'archived') next.delete(id);
       else next.add(id);
     }
     persistArchived(next);
+    if (archiving) {
+      void Promise.allSettled(
+        sessionIds.map((sessionId) => teardownTabBackendProcesses(sessionId, 'archive')),
+      );
+    }
     setSelectedIds(new Set());
     setMultiSelect(false);
   }, [selectedIds, archivedSessions, conversationView, persistArchived]);
@@ -1172,7 +1206,11 @@ export function ConversationList() {
           onRenameGroupCommit={handleRenameGroupCommit}
           onRenameGroupCancel={() => setRenamingGroupId(null)}
           onReorderGroups={handleReorderGroups}
+          onMoveSession={handleMoveSession}
           onNewSessionInGroup={handleNewSessionInGroup}
+          sessionDragEnabled={
+            conversationView === 'active' && !multiSelect && !searchQuery.trim()
+          }
           readOnly={conversationView === 'archived'}
         />
         );

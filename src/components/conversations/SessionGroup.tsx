@@ -1,15 +1,17 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   DndContext,
   PointerSensor,
   useSensor,
   useSensors,
+  useDroppable,
   closestCenter,
   type DragEndEvent,
+  type DragStartEvent,
 } from '@dnd-kit/core';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { SessionListItem } from '../../lib/tauri-bridge';
-import { SessionItem } from './SessionItem';
+import { SortableSessionItem } from './SortableSessionItem';
 import { TaskGroup } from './TaskGroup';
 import { partitionWorkspaceSessions } from '../../stores/groupSelectors';
 import { reorderByDragEnd } from '../../stores/groupDnd';
@@ -62,9 +64,48 @@ interface SessionGroupProps {
   onRenameGroupCommit: (groupId: string, label: string) => void;
   onRenameGroupCancel: () => void;
   onReorderGroups: (workspace: string, orderedGroupIds: string[]) => void;
+  onMoveSession: (
+    sessionId: string,
+    targetGroupId: string | null,
+    beforeSessionId?: string,
+  ) => void;
   onNewSessionInGroup: (groupId: string) => void;
+  sessionDragEnabled: boolean;
   /** Archived history preserves the ledger but does not mutate its structure. */
   readOnly?: boolean;
+}
+
+interface UngroupedDropZoneProps {
+  id: string;
+  enabled: boolean;
+  activeSessionDrag: string | null;
+  children: React.ReactNode;
+}
+
+/** Must render beneath DndContext so the ungrouped ledger is a real drop target. */
+function UngroupedDropZone({
+  id,
+  enabled,
+  activeSessionDrag,
+  children,
+}: UngroupedDropZoneProps) {
+  const { setNodeRef, isOver } = useDroppable({
+    id,
+    disabled: !enabled,
+    data: { kind: 'ungrouped' },
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`mx-1 rounded-md transition-colors
+        ${isOver && activeSessionDrag
+          ? 'bg-accent/10 ring-1 ring-inset ring-accent/35'
+          : ''}`}
+    >
+      {children}
+    </div>
+  );
 }
 
 export function SessionGroup({
@@ -96,10 +137,13 @@ export function SessionGroup({
   onRenameGroupCommit,
   onRenameGroupCancel,
   onReorderGroups,
+  onMoveSession,
   onNewSessionInGroup,
+  sessionDragEnabled,
   readOnly = false,
 }: SessionGroupProps) {
   const t = useT();
+  const [activeSessionDrag, setActiveSessionDrag] = useState<string | null>(null);
 
   // Split this workspace's sessions into task groups + ungrouped, then within
   // ungrouped: global-pinned first, the rest grouped by date.
@@ -142,13 +186,48 @@ export function SessionGroup({
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
   );
+  const ungroupedDropId = `ungrouped:${projectKey}`;
+
+  const handleDragStart = (event: DragStartEvent) => {
+    const activeId = String(event.active.id);
+    const groupIds = new Set(taskGroups.map((taskGroup) => taskGroup.group.id));
+    setActiveSessionDrag(groupIds.has(activeId) ? null : activeId);
+  };
+
   const handleGroupDragEnd = (e: DragEndEvent) => {
+    setActiveSessionDrag(null);
     if (readOnly) return;
     const { active, over } = e;
-    if (!over || active.id === over.id) return;
+    if (!over) return;
+    const activeId = String(active.id);
+    const overId = String(over.id);
     const currentOrder = taskGroups.map((tg) => tg.group.id);
-    const next = reorderByDragEnd(currentOrder, String(active.id), String(over.id));
-    onReorderGroups(projectKey, next);
+    if (currentOrder.includes(activeId)) {
+      const overGroup = taskGroups.find(({ group, sessions: members }) => (
+        group.id === overId || members.some((session) => session.id === overId)
+      ));
+      if (!overGroup || overGroup.group.id === activeId) return;
+      const next = reorderByDragEnd(currentOrder, activeId, overGroup.group.id);
+      onReorderGroups(projectKey, next);
+      return;
+    }
+
+    if (!sessionDragEnabled || activeId === overId) return;
+    const targetGroup = taskGroups.find(({ group, sessions: members }) => (
+      group.id === overId || members.some((session) => session.id === overId)
+    ));
+    if (targetGroup) {
+      const beforeSessionId = targetGroup.sessions.some((session) => session.id === overId)
+        ? overId
+        : undefined;
+      onMoveSession(activeId, targetGroup.group.id, beforeSessionId);
+      return;
+    }
+
+    const overIsUngrouped = overId === ungroupedDropId
+      || pinnedItems.some((session) => session.id === overId)
+      || dateGroups.some(({ items }) => items.some((session) => session.id === overId));
+    if (overIsUngrouped) onMoveSession(activeId, null);
   };
 
   return (
@@ -196,11 +275,21 @@ export function SessionGroup({
       {/* Sessions */}
       {isExpanded && (
         <div className="pt-2">
-          {/* Global-pinned sessions (cross-group, top of workspace) */}
-          {pinnedItems.length > 0 && (
-            <>
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragStart={handleDragStart}
+            onDragCancel={() => setActiveSessionDrag(null)}
+            onDragEnd={handleGroupDragEnd}
+          >
+            {/* Global-pinned sessions (cross-group, top of workspace) */}
+            {pinnedItems.length > 0 && (
+              <SortableContext
+                items={pinnedItems.map((session) => session.id)}
+                strategy={verticalListSortingStrategy}
+              >
               {pinnedItems.map((session) => (
-                <SessionItem
+                <SortableSessionItem
                   key={session.id}
                   session={session}
                   isSelected={selectedId === session.id}
@@ -216,17 +305,14 @@ export function SessionGroup({
                   onToggleCheck={onToggleCheck}
                   triggerRename={renamingSessionId === session.id}
                   onRenameDone={onRenameDone}
+                  dragEnabled={sessionDragEnabled}
+                  groupId={null}
                 />
               ))}
-            </>
-          )}
+              </SortableContext>
+            )}
 
-          {/* Task groups — drag the six-dot handle to reorder (within workspace) */}
-          <DndContext
-            sensors={sensors}
-            collisionDetection={closestCenter}
-            onDragEnd={handleGroupDragEnd}
-          >
+            {/* Task groups — drag the six-dot handle to reorder (within workspace) */}
             <SortableContext
               items={taskGroups.map((tg) => tg.group.id)}
               strategy={verticalListSortingStrategy}
@@ -256,44 +342,67 @@ export function SessionGroup({
                   onRenameCancel={onRenameGroupCancel}
                   onNewSessionInGroup={onNewSessionInGroup}
                   readOnly={readOnly}
+                  sessionDragEnabled={sessionDragEnabled}
                 />
               ))}
             </SortableContext>
-          </DndContext>
 
-          {/* Ungrouped — date-grouped sessions */}
-          {dateGroups.length > 0 && taskGroups.length > 0 && (
-            <div className="px-7 pt-1.5 pb-0.5 text-[10px] text-text-tertiary/80 select-none">
-              未归类
-            </div>
-          )}
-          {dateGroups.map(({ category, label: dateLabel, items }) => (
-            <div key={category}>
-              <div className="text-[10px] text-text-tertiary/70 font-medium px-6 py-0.5 mt-0.5
-                select-none">
-                {dateLabel}
-              </div>
-              {items.map((session) => (
-                <SessionItem
-                  key={session.id}
-                  session={session}
-                  isSelected={selectedId === session.id}
-                  isRunning={runningSessions.has(session.id)}
-                  isPinned={false}
-                  isArchived={archivedSessions.has(session.id)}
-                  displayName={getDisplayName(session)}
-                  multiSelect={multiSelect}
-                  isChecked={selectedIds.has(session.id)}
-                  onSelect={onLoadSession}
-                  onContextMenu={onContextMenu}
-                  onRename={onRename}
-                  onToggleCheck={onToggleCheck}
-                  triggerRename={renamingSessionId === session.id}
-                  onRenameDone={onRenameDone}
-                />
+            {/* Ungrouped — date-grouped sessions and an explicit detach target. */}
+            <UngroupedDropZone
+              id={ungroupedDropId}
+              enabled={sessionDragEnabled}
+              activeSessionDrag={activeSessionDrag}
+            >
+              {taskGroups.length > 0 && (
+                <div className="px-6 pt-1.5 pb-0.5 text-[10px] text-text-tertiary/80 select-none">
+                  未归类
+                  {activeSessionDrag && (
+                    <span className="ml-1 text-accent/80">· 松开移出分组</span>
+                  )}
+                </div>
+              )}
+              {dateGroups.length === 0 && taskGroups.length > 0 && activeSessionDrag && (
+                <div className="mx-2 mb-1 rounded border border-dashed border-border-subtle
+                  px-3 py-2 text-center text-[10px] text-text-tertiary">
+                  拖到这里移出分组
+                </div>
+              )}
+              {dateGroups.map(({ category, label: dateLabel, items }) => (
+                <div key={category}>
+                  <div className="text-[10px] text-text-tertiary/70 font-medium px-6 py-0.5 mt-0.5
+                    select-none">
+                    {dateLabel}
+                  </div>
+                  <SortableContext
+                    items={items.map((session) => session.id)}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    {items.map((session) => (
+                      <SortableSessionItem
+                        key={session.id}
+                        session={session}
+                        isSelected={selectedId === session.id}
+                        isRunning={runningSessions.has(session.id)}
+                        isPinned={false}
+                        isArchived={archivedSessions.has(session.id)}
+                        displayName={getDisplayName(session)}
+                        multiSelect={multiSelect}
+                        isChecked={selectedIds.has(session.id)}
+                        onSelect={onLoadSession}
+                        onContextMenu={onContextMenu}
+                        onRename={onRename}
+                        onToggleCheck={onToggleCheck}
+                        triggerRename={renamingSessionId === session.id}
+                        onRenameDone={onRenameDone}
+                        dragEnabled={sessionDragEnabled}
+                        groupId={null}
+                      />
+                    ))}
+                  </SortableContext>
+                </div>
               ))}
-            </div>
-          ))}
+            </UngroupedDropZone>
+          </DndContext>
         </div>
       )}
     </div>

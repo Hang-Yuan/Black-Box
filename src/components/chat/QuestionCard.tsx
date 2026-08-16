@@ -1,8 +1,9 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { type ChatMessage, useChatStore } from '../../stores/chatStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { buildAskUserQuestionAnswers } from '../../lib/ask-user-question';
+import { teardownSession } from '../../lib/sessionLifecycle';
 
 /** Decode literal Unicode escape sequences (e.g. `\u2014`) that appear in text. */
 function decodeUnicodeEscapes(text: string): string {
@@ -34,6 +35,7 @@ export function QuestionCard({ message, floating }: Props) {
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [useOther, setUseOther] = useState<Record<number, boolean>>({});
   const [answeredMap, setAnsweredMap] = useState<Record<number, string>>({});
+  const recoveryStartedRef = useRef(false);
 
   const currentQ = questions[currentIdx];
   const isFullyResolved = message.resolved;
@@ -95,7 +97,10 @@ export function QuestionCard({ message, floating }: Props) {
   // "loading" label. After 5s without a requestId, surface a "retry sync" hint
   // — four-reviewer consensus rejected the legacy sendStdin 5s fallback because
   // it pollutes the conversation without unblocking the CLI.
-  const awaitingSdkPatch = !isFullyResolved && !message.permissionData?.requestId;
+  const awaitingSdkPatch = !isFullyResolved
+    && !isExpired
+    && !isFailed
+    && !message.permissionData?.requestId;
   const [showRetryHint, setShowRetryHint] = useState(false);
   useEffect(() => {
     if (!awaitingSdkPatch) {
@@ -119,6 +124,46 @@ export function QuestionCard({ message, floating }: Props) {
     if (match && stdinId) return { tabId: match.tabId, stdinId };
     return null;
   }, [message.owner, message.id]);
+
+  const recoverStuckInteraction = useCallback(async () => {
+    if (recoveryStartedRef.current || isFullyResolved || !awaitingSdkPatch) return;
+    recoveryStartedRef.current = true;
+    const owner = resolveOwner();
+    if (!owner) {
+      recoveryStartedRef.current = false;
+      return;
+    }
+    const { setInteractionState, setActivityStatus } = useChatStore.getState();
+    setInteractionState(
+      owner.tabId,
+      message.id,
+      'expired',
+      t('msg.questionSyncReleased'),
+    );
+    try {
+      await bridge.interruptSession(owner.stdinId);
+      setActivityStatus(owner.tabId, { phase: 'thinking' });
+    } catch (interruptError) {
+      try {
+        await teardownSession(owner.stdinId, owner.tabId, 'stop');
+      } catch (stopError) {
+        setInteractionState(
+          owner.tabId,
+          message.id,
+          'failed',
+          `${String(interruptError)}; ${String(stopError)}`,
+        );
+      }
+    }
+  }, [isFullyResolved, awaitingSdkPatch, resolveOwner, message.id, t]);
+
+  useEffect(() => {
+    if (!awaitingSdkPatch || isFullyResolved) return;
+    const timer = setTimeout(() => {
+      void recoverStuckInteraction();
+    }, 15_000);
+    return () => clearTimeout(timer);
+  }, [awaitingSdkPatch, isFullyResolved, recoverStuckInteraction]);
 
   const handleConfirm = useCallback(async () => {
     if (isFullyResolved || isSending || awaitingSdkPatch) return;
@@ -189,7 +234,7 @@ export function QuestionCard({ message, floating }: Props) {
   }, [isFullyResolved, isSending, awaitingSdkPatch, message.id, message.permissionData, message.toolInput, resolveOwner]);
 
   return (
-    <div className={`${floating ? '' : 'ml-11'} animate-scale-in ${isFullyResolved ? 'opacity-80' : ''}`}>
+    <div className={`${floating ? '' : 'ml-[72px]'} animate-scale-in ${isFullyResolved ? 'opacity-80' : ''}`}>
       <div className={`rounded-lg border overflow-hidden transition-all duration-200
         ${isFullyResolved
           ? 'border-border-subtle bg-bg-secondary/20'
@@ -352,10 +397,17 @@ export function QuestionCard({ message, floating }: Props) {
 
             {/* Awaiting-sync hint (Phase 4 §5.3 S3) */}
             {awaitingSdkPatch && showRetryHint && (
-              <div className="mb-2 text-[11px] text-warning bg-warning/5 rounded-md px-2.5 py-1.5
+              <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-warning bg-warning/5 rounded-md px-2.5 py-1.5
                 border border-warning/20">
-                {t('msg.questionAwaitingSync')
-                  ?? '权限同步超时：正在等待 CLI 发送 control_request。若长时间未恢复，请打断后重试。'}
+                <span>{t('msg.questionAwaitingSync')}</span>
+                <button
+                  type="button"
+                  onClick={() => void recoverStuckInteraction()}
+                  data-testid="ask-question-release-stuck"
+                  className="flex-shrink-0 rounded px-2 py-1 font-semibold border border-warning/30 hover:bg-warning/10"
+                >
+                  {t('msg.questionReleaseStuck')}
+                </button>
               </div>
             )}
 

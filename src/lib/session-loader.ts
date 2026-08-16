@@ -1,10 +1,19 @@
 import type { ChatMessage } from '../stores/chatStore';
 import { generateMessageId } from '../stores/chatStore';
-import type { AgentKind, AgentPhase } from '../stores/agentStore';
+import type { AgentActivityEntry, AgentKind, AgentPhase } from '../stores/agentStore';
 import {
+  isForwardedSubagentEvent,
+  isFailedAgentTaskStatus,
+  messageTextContent,
+  parseAgentTaskNotification,
+  parseAsyncAgentLaunch,
+} from './agent-lifecycle';
+import {
+  isCliPlaceholder,
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from './presentation-sanitizer';
+import { unwrapInterruptedContinuationPrompt } from './interrupted-continuation';
 
 export interface AgentData {
   id: string;
@@ -12,10 +21,15 @@ export interface AgentData {
   description: string;
   phase: AgentPhase;
   startTime: number;
-  endTime: number;
+  endTime?: number;
   isMain: boolean;
   kind?: AgentKind;
   name?: string;
+  model?: string;
+  taskId?: string;
+  toolUseIds?: string[];
+  background?: boolean;
+  activity?: AgentActivityEntry[];
 }
 
 export interface LoadedSession {
@@ -51,6 +65,16 @@ function isSystemText(text: string): boolean {
     || t.includes('</system-reminder>');
 }
 
+function mergeLoadedThinkingContent(current: string, incoming: string): string {
+  const base = current.trim();
+  const next = incoming.trim();
+  if (!base) return next;
+  if (!next || next === base) return base;
+  if (next.startsWith(base)) return next;
+  if (base.startsWith(next)) return base;
+  return `${base}\n\n${next}`;
+}
+
 /** Parse raw JSONL messages into structured session data */
 export function parseSessionMessages(rawMessages: any[]): LoadedSession {
   const messages: ChatMessage[] = [];
@@ -73,6 +97,46 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
 
   // Collect tool_use_id → index mapping for binding tool results
   const toolUseIdToIndex = new Map<string, number>();
+  const agentIdToIndex = new Map<string, number>([['main', 0]]);
+
+  const upsertLoadedAgent = (agent: AgentData) => {
+    const existingIndex = agentIdToIndex.get(agent.id);
+    if (existingIndex === undefined) {
+      agentIdToIndex.set(agent.id, agents.length);
+      agents.push(agent);
+      return;
+    }
+    agents[existingIndex] = { ...agents[existingIndex], ...agent };
+  };
+
+  const resolveLoadedAgentId = (toolUseId?: string, taskId?: string) => {
+    if (toolUseId && agentIdToIndex.has(toolUseId)) return toolUseId;
+    if (toolUseId) {
+      const aliasMatch = agents.find((agent) => agent.toolUseIds?.includes(toolUseId));
+      if (aliasMatch) return aliasMatch.id;
+    }
+    if (!taskId) return undefined;
+    return agents.find((agent) => agent.taskId === taskId)?.id;
+  };
+
+  const appendLoadedAgentActivity = (
+    agentId: string | undefined,
+    entry: AgentActivityEntry,
+  ) => {
+    if (!agentId) return;
+    const index = agentIdToIndex.get(agentId);
+    if (index === undefined || agents[index].isMain) return;
+    const agent = agents[index];
+    const activity = [...(agent.activity ?? [])];
+    const last = activity[activity.length - 1];
+    if (
+      last
+      && last.kind === entry.kind
+      && last.content === entry.content
+      && last.toolName === entry.toolName
+    ) return;
+    agents[index] = { ...agent, activity: [...activity, entry].slice(-24) };
+  };
 
   const extractToolResultText = (payload: any): string => {
     if (typeof payload === 'string') return payload;
@@ -109,6 +173,41 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     // Skip system-injected meta messages
     if (msg.isMeta) continue;
 
+    const taskNotification = parseAgentTaskNotification(messageTextContent(msg));
+    if (taskNotification) {
+      const agentId = resolveLoadedAgentId(
+        taskNotification.toolUseId,
+        taskNotification.taskId,
+      );
+      if (agentId) {
+        const index = agentIdToIndex.get(agentId)!;
+        const agent = agents[index];
+        const resultText = taskNotification.resultText
+          ? sanitizeAssistantTextForDisplay(taskNotification.resultText).trim().slice(0, 6_000)
+          : '';
+        agents[index] = {
+          ...agent,
+          phase: isFailedAgentTaskStatus(taskNotification.status)
+            ? 'error'
+            : agent.kind === 'teammate'
+              ? 'idle'
+              : 'completed',
+          endTime: normalizeSessionTimestamp(msg.timestamp),
+          ...(resultText ? {
+            activity: [
+              ...(agent.activity ?? []),
+              {
+                id: `${msg.uuid || taskNotification.taskId || taskNotification.toolUseId}_result`,
+                kind: 'text' as const,
+                content: resultText,
+                timestamp: normalizeSessionTimestamp(msg.timestamp),
+              },
+            ].slice(-24),
+          } : {}),
+        };
+      }
+    }
+
     // Claude Code persists streaming input sent while the agent loop is busy
     // as a queue-operation plus a queued_command attachment, not as a normal
     // user record. Rehydrate the attachment once so live Steer guidance stays
@@ -121,7 +220,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       && typeof msg.attachment?.prompt === 'string'
     ) {
       const content = msg.attachment.prompt.trim();
-      if (content && !isSystemText(content)) {
+      if (content && !isSystemText(content) && !isCliPlaceholder(content)) {
         messages.push({
           id: msg.uuid || generateMessageId(),
           role: 'user',
@@ -156,6 +255,36 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       const topLevelResultText = extractToolResultText(
         hasTopLevelToolUseResult ? topLevelToolUseResult : topLevelToolResult,
       );
+      const asyncLaunch = parseAsyncAgentLaunch(msg);
+      if (asyncLaunch) {
+        const agentId = resolveLoadedAgentId(asyncLaunch.toolUseId, asyncLaunch.taskId)
+          ?? asyncLaunch.toolUseId
+          ?? asyncLaunch.taskId;
+        const existingIndex = agentIdToIndex.get(agentId);
+        const existing = existingIndex === undefined ? undefined : agents[existingIndex];
+        upsertLoadedAgent({
+          id: agentId,
+          parentId: existing?.parentId ?? 'main',
+          description: asyncLaunch.description ?? existing?.description ?? 'Background Agent',
+          // Disk hydration has no owning CLI process. An async launch without a
+          // durable terminal notification is historical unfinished work, not a
+          // live background Agent. Keep its process history visible while
+          // preventing false "still running" banners after restart.
+          phase: 'interrupted',
+          startTime: existing?.startTime ?? normalizeSessionTimestamp(msg.timestamp),
+          endTime: Date.now(),
+          isMain: false,
+          kind: existing?.kind ?? 'subagent',
+          name: existing?.name,
+          model: asyncLaunch.model ?? existing?.model,
+          taskId: asyncLaunch.taskId,
+          toolUseIds: Array.from(new Set([
+            ...(existing?.toolUseIds ?? []),
+            ...(asyncLaunch.toolUseId ? [asyncLaunch.toolUseId] : []),
+          ])),
+          background: true,
+        });
+      }
       for (const b of blocks) {
         if (b?.tool_use_id && (b?.type === 'tool_result' || hasTopLevelToolUseResult || hasTopLevelToolResult)) {
           const blockResultText = extractToolResultText(b.content ?? b.output);
@@ -180,13 +309,16 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       const blocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
       const userTexts: string[] = [];
       for (const b of blocks) {
-        const text = typeof b === 'string' ? b : b?.type === 'text' ? b.text : '';
-        if (text && !isSystemText(text)) userTexts.push(text);
+        const rawText = typeof b === 'string' ? b : b?.type === 'text' ? b.text : '';
+        const text = typeof rawText === 'string'
+          ? unwrapInterruptedContinuationPrompt(rawText)
+          : '';
+        if (text && !isSystemText(text) && !isCliPlaceholder(text)) userTexts.push(text);
       }
       // Fallback for plain string content
       if (blocks.length === 0 && typeof msg.message?.content === 'string') {
-        const text = msg.message.content;
-        if (!isSystemText(text)) userTexts.push(text);
+        const text = unwrapInterruptedContinuationPrompt(msg.message.content);
+        if (!isSystemText(text) && !isCliPlaceholder(text)) userTexts.push(text);
       }
       let content = userTexts.join('');
       // Extract file attachments from text
@@ -220,26 +352,86 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     } else if (msg.type === 'assistant') {
       const blocks = msg.message?.content;
       if (Array.isArray(blocks)) {
-        for (const block of blocks) {
+        const forwardedSubagentEvent = isForwardedSubagentEvent(msg);
+        const forwardedAgentId = forwardedSubagentEvent
+          ? resolveLoadedAgentId(msg.parent_tool_use_id)
+          : undefined;
+        const logicalMessageId = typeof msg.message?.id === 'string' && msg.message.id.trim()
+          ? msg.message.id.trim()
+          : msg.uuid;
+        for (const [blockIdx, block] of blocks.entries()) {
           if (block.type === 'text') {
+            if (forwardedSubagentEvent) {
+              const displayText = sanitizeAssistantTextForDisplay(block.text).trim().slice(0, 6_000);
+              if (displayText && !isSystemText(displayText)) {
+                appendLoadedAgentActivity(forwardedAgentId, {
+                  id: `${logicalMessageId || generateMessageId()}_agent_text_${blockIdx}`,
+                  kind: 'text',
+                  content: displayText,
+                  timestamp: normalizeSessionTimestamp(msg.timestamp),
+                });
+              }
+              continue;
+            }
             const displayText = sanitizeAssistantTextForDisplay(block.text);
-            if (isSystemText(displayText)) continue;
-            messages.push({
-              id: msg.uuid || generateMessageId(),
+            if (!displayText.trim() || isSystemText(displayText)) continue;
+            const textId = logicalMessageId
+              ? `${logicalMessageId}_text_${blockIdx}`
+              : generateMessageId();
+            const textMessage: ChatMessage = {
+              id: textId,
               role: 'assistant',
               type: 'text',
               content: displayText,
               timestamp: normalizeSessionTimestamp(msg.timestamp),
-            });
+            };
+            const existingTextIndex = messages.findIndex((message) => message.id === textId);
+            if (existingTextIndex >= 0) messages[existingTextIndex] = textMessage;
+            else messages.push(textMessage);
+          } else if (block.type === 'thinking') {
+            // Subagent detail belongs in the Process panel. Main-agent
+            // provider thinking remains available in the conversation as the
+            // same compact, default-collapsed row used by the live stream.
+            if (forwardedSubagentEvent) continue;
+            const thinkingContent = typeof block.thinking === 'string'
+              ? block.thinking.trim()
+              : '';
+            if (!thinkingContent) continue;
+            const thinkingId = logicalMessageId
+              ? `${logicalMessageId}__thinking_committed`
+              : generateMessageId();
+            const existingThinkingIndex = messages.findIndex(
+              (message) => message.id === thinkingId && message.type === 'thinking',
+            );
+            if (existingThinkingIndex >= 0) {
+              const existingThinking = messages[existingThinkingIndex];
+              messages[existingThinkingIndex] = {
+                ...existingThinking,
+                content: mergeLoadedThinkingContent(
+                  existingThinking.content,
+                  thinkingContent,
+                ),
+              };
+            } else {
+              messages.push({
+                id: thinkingId,
+                role: 'assistant',
+                type: 'thinking',
+                content: thinkingContent,
+                timestamp: normalizeSessionTimestamp(msg.timestamp),
+              });
+            }
           } else if (block.type === 'tool_use') {
             // Rebuild agent tree from Agent/Task tool_use blocks
             if (block.name === 'Task' || block.name === 'Agent') {
               const teammateName = typeof block.input?.name === 'string'
                 ? block.input.name.trim()
                 : '';
-              agents.push({
+              upsertLoadedAgent({
                 id: block.id || generateMessageId(),
-                parentId: 'main',
+                parentId: forwardedSubagentEvent
+                  ? resolveLoadedAgentId(msg.parent_tool_use_id) ?? 'main'
+                  : 'main',
                 description: teammateName || block.input?.description || block.input?.prompt || 'Agent',
                 phase: 'completed',
                 startTime: normalizeSessionTimestamp(msg.timestamp),
@@ -248,6 +440,17 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 kind: teammateName ? 'teammate' : 'subagent',
                 name: teammateName || undefined,
               });
+            }
+
+            if (forwardedSubagentEvent) {
+              appendLoadedAgentActivity(forwardedAgentId, {
+                id: `${block.id || logicalMessageId || generateMessageId()}_agent_tool_${blockIdx}`,
+                kind: 'tool',
+                content: block.name || 'Tool',
+                toolName: block.name,
+                timestamp: normalizeSessionTimestamp(msg.timestamp),
+              });
+              continue;
             }
 
             let chatMsg: ChatMessage;
@@ -310,14 +513,6 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 };
               }
             }
-          } else if (block.type === 'thinking') {
-            messages.push({
-              id: generateMessageId(),
-              role: 'assistant',
-              type: 'thinking',
-              content: block.thinking || '',
-              timestamp: normalizeSessionTimestamp(msg.timestamp),
-            });
           }
         }
       }

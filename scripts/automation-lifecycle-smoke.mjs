@@ -83,7 +83,6 @@ const definition = {
   target: { type: 'project', projectId: workspace },
   cwds: [workspace],
   target_thread_id: null,
-  provider_id: null,
   created_at: 0,
   updated_at: 0,
 };

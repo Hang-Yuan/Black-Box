@@ -24,4 +24,15 @@ describe('scheduled output presentation', () => {
       'The required lock could not be created.\n::automation-failed{summary="Lock denied"}',
     )).toBe('The required lock could not be created.');
   });
+
+  it('removes a final needs-attention control directive while preserving the report', () => {
+    expect(stripFinalInboxDirective(
+      'The report is ready.\n::automation-needs-attention{title="Choose release" summary="Approve one candidate"}',
+    )).toBe('The report is ready.');
+  });
+
+  it('strips only the final control directive when earlier examples are present', () => {
+    const output = 'Example\n::inbox-item{title="Done"}\n::automation-needs-attention{title="Review"}';
+    expect(stripFinalInboxDirective(output)).toBe('Example\n::inbox-item{title="Done"}');
+  });
 });

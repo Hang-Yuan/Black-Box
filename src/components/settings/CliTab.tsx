@@ -1,5 +1,11 @@
 import { useEffect, useState, useCallback } from 'react';
-import { bridge, type CliCandidate, type CliLifecycleInfo, type CliStatus } from '../../lib/tauri-bridge';
+import {
+  bridge,
+  type CliCandidate,
+  type CliLifecycleInfo,
+  type CliStatus,
+  type DownloadProgressEvent,
+} from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { APP_NAME } from '../../lib/edition';
 import { stripAnsi } from '../../lib/strip-ansi';
@@ -11,6 +17,20 @@ import {
 } from '../../lib/sessionLifecycle';
 
 type CliCheckStatus = 'idle' | 'checking' | 'found' | 'not_found' | 'installing' | 'installed' | 'install_failed' | 'updating' | 'updated' | 'update_failed';
+type CliProgressPhase = DownloadProgressEvent['phase'] | 'idle' | 'configuring';
+
+function formatDownloadBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unit]}`;
+}
 
 const SOURCE_I18N_KEYS: Record<string, string> = {
   official: 'cli.source.official',
@@ -82,7 +102,10 @@ export function CliTab() {
   const [sdkCapabilities, setSdkCapabilities] = useState<CliStatus['sdk_capabilities']>(null);
   const [sdkError, setSdkError] = useState('');
   const [downloadPercent, setDownloadPercent] = useState(0);
-  const [phase, setPhase] = useState<'idle' | 'downloading' | 'configuring' | 'npm_fallback' | 'node_downloading' | 'node_extracting' | 'git_downloading' | 'git_extracting' | 'native_version' | 'native_manifest' | 'native_download' | 'native_verify' | 'native_install'>('idle');
+  const [downloadedBytes, setDownloadedBytes] = useState(0);
+  const [downloadTotalBytes, setDownloadTotalBytes] = useState(0);
+  const [phase, setPhase] = useState<CliProgressPhase>('idle');
+  const [observingExistingUpdate, setObservingExistingUpdate] = useState(false);
   const [installIntent, setInstallIntent] = useState<'install' | 'reinstall'>('install');
   const [lifecycle, setLifecycle] = useState<CliLifecycleInfo | null>(null);
   const [commandCopied, setCommandCopied] = useState(false);
@@ -91,7 +114,11 @@ export function CliTab() {
 
   // Auto-check on mount
   useEffect(() => {
-    Promise.all([bridge.checkClaudeCli(), bridge.getCliLifecycle()]).then(([result, nextLifecycle]) => {
+    Promise.all([
+      bridge.checkClaudeCli(),
+      bridge.getCliLifecycle(),
+      bridge.getCliUpdateBlockers(),
+    ]).then(([result, nextLifecycle, blockers]) => {
       setLifecycle(nextLifecycle);
       if (result.installed) {
         setCliVersion(result.version ?? null);
@@ -99,7 +126,16 @@ export function CliTab() {
         setGitBashMissing(result.git_bash_missing ?? false);
         setSdkCapabilities(result.sdk_capabilities ?? null);
         setSdkError('');
-        setStatus('found');
+        if (blockers.maintenanceInProgress) {
+          setDownloadedBytes(blockers.maintenanceDownloaded);
+          setDownloadTotalBytes(blockers.maintenanceTotal);
+          setDownloadPercent(blockers.maintenancePercent);
+          setPhase(blockers.maintenancePhase);
+          setObservingExistingUpdate(true);
+          setStatus('updating');
+        } else {
+          setStatus('found');
+        }
       } else {
         setSdkCapabilities(null);
         setSdkError(result.sdk_error || '');
@@ -141,15 +177,50 @@ export function CliTab() {
     }
   }, []);
 
+  // Closing and reopening Settings must reconnect to the same backend update
+  // instead of presenting a second Update button. The backend owns the lease
+  // and progress snapshot, so this view can safely observe it across remounts.
+  useEffect(() => {
+    if (!observingExistingUpdate) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const blockers = await bridge.getCliUpdateBlockers();
+        if (cancelled) return;
+        if (blockers.maintenanceInProgress) {
+          setDownloadedBytes(blockers.maintenanceDownloaded);
+          setDownloadTotalBytes(blockers.maintenanceTotal);
+          setDownloadPercent(blockers.maintenancePercent);
+          setPhase(blockers.maintenancePhase);
+          return;
+        }
+        setObservingExistingUpdate(false);
+        await handleCheck();
+      } catch {
+        // A transient polling failure does not authorize another updater.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 1_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [handleCheck, observingExistingUpdate]);
+
   const handleInstall = useCallback(async () => {
     setInstallIntent('install');
     setStatus('installing');
     setErrorMsg('');
+    setDownloadedBytes(0);
+    setDownloadTotalBytes(0);
     setDownloadPercent(0);
     setPhase('downloading');
 
     const { onDownloadProgress } = await import('../../lib/tauri-bridge');
     const unlisten = await onDownloadProgress((event) => {
+      setDownloadedBytes(event.downloaded);
+      setDownloadTotalBytes(event.total);
       setDownloadPercent(event.percent);
       const p = event.phase;
       if (p === 'native_version' || p === 'native_manifest' || p === 'native_download'
@@ -196,6 +267,9 @@ export function CliTab() {
 
   const prepareCliMaintenance = useCallback(async (): Promise<boolean> => {
     const blockers = await bridge.getCliUpdateBlockers();
+    if (blockers.maintenanceInProgress) {
+      throw new Error('CLI_MAINTENANCE_BUSY');
+    }
     if (blockers.runningAutomation) {
       throw new Error(`CLI_UPDATE_BLOCKED_AUTOMATION: ${t('cli.updateBlockedAutomation')}`);
     }
@@ -228,7 +302,10 @@ export function CliTab() {
   }, [t]);
 
   const handleUpdate = useCallback(async () => {
+    setObservingExistingUpdate(false);
     setErrorMsg('');
+    setDownloadedBytes(0);
+    setDownloadTotalBytes(0);
     setDownloadPercent(0);
     setPhase('idle');
 
@@ -246,12 +323,18 @@ export function CliTab() {
 
     const { onDownloadProgress } = await import('../../lib/tauri-bridge');
     const unlisten = await onDownloadProgress((event) => {
+      setDownloadedBytes(event.downloaded);
+      setDownloadTotalBytes(event.total);
       setDownloadPercent(event.percent);
       const p = event.phase;
       if (p === 'npm_fallback') {
         setPhase('npm_fallback');
       } else if (p === 'native_download') {
         setPhase('native_download');
+      } else if (p === 'native_stalled') {
+        setPhase('native_stalled');
+      } else if (p === 'native_manifest' || p === 'native_verify') {
+        setPhase(p);
       } else if (p === 'complete' || event.percent >= 100) {
         setPhase('configuring');
       }
@@ -279,6 +362,8 @@ export function CliTab() {
   const handleReinstall = useCallback(async () => {
     setInstallIntent('reinstall');
     setErrorMsg('');
+    setDownloadedBytes(0);
+    setDownloadTotalBytes(0);
     setDownloadPercent(0);
     setPhase('configuring');
     try {
@@ -294,6 +379,8 @@ export function CliTab() {
     setStatus('installing');
     const { onDownloadProgress } = await import('../../lib/tauri-bridge');
     const unlisten = await onDownloadProgress((event) => {
+      setDownloadedBytes(event.downloaded);
+      setDownloadTotalBytes(event.total);
       setDownloadPercent(event.percent);
       setPhase(event.percent >= 100 ? 'configuring' : 'downloading');
     });
@@ -320,6 +407,12 @@ export function CliTab() {
     const { relaunch } = await import('@tauri-apps/plugin-process');
     await relaunch();
   }, []);
+
+  const downloadedDetail = formatDownloadBytes(downloadedBytes);
+  const totalDetail = formatDownloadBytes(downloadTotalBytes);
+  const progressDetail = downloadedDetail
+    ? `${downloadedDetail}${totalDetail ? ` / ${totalDetail}` : ''}`
+    : '';
 
   return (
     <div className="space-y-4">
@@ -462,11 +555,18 @@ export function CliTab() {
             <span className="text-[13px] text-text-muted">
               {phase === 'npm_fallback' ? t('setup.npmFallback')
                 : phase === 'native_download' ? t('setup.nativeDownload')
+                : phase === 'native_stalled' ? t('cli.nativeDownloadStalled')
+                : phase === 'native_manifest' ? t('setup.nativeManifest')
+                : phase === 'native_verify' ? t('setup.nativeVerify')
                 : phase === 'configuring' ? t('cli.configuring')
                 : t('cli.updating')}
             </span>
-            {downloadPercent > 0 && downloadPercent < 100 && (
-              <span className="text-[13px] text-text-tertiary">{downloadPercent}%</span>
+            {(progressDetail || (downloadPercent > 0 && downloadPercent < 100)) && (
+              <span className="text-[13px] text-text-tertiary">
+                {downloadPercent > 0 && downloadPercent < 100 ? `${downloadPercent}%` : ''}
+                {downloadPercent > 0 && downloadPercent < 100 && progressDetail ? ' · ' : ''}
+                {progressDetail}
+              </span>
             )}
           </div>
           <div className="w-full h-2 rounded-full bg-bg-tertiary overflow-hidden">

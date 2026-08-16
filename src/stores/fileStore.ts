@@ -1,6 +1,11 @@
 import { create } from 'zustand';
 import { bridge, FileNode, RecentProject } from '../lib/tauri-bridge';
 import {
+  loadConversationPanelState,
+  saveConversationPanelState,
+} from '../lib/conversation-view-state';
+import { useSettingsStore } from './settingsStore';
+import {
   computeRevealExpansions,
   DIRECTORY_LANDING_FILE_NAMES,
   findBestWorkspaceSearchMatch,
@@ -704,10 +709,35 @@ export function saveConversationFileState(sessionId: string): void {
   const state = useFileStore.getState();
   state.savePreviewState(sessionId);
   state.saveExplorerState(sessionId);
+  // AppShell records the logical panel state before temporarily collapsing it
+  // for a full file preview. Do not overwrite that state with the transient
+  // collapsed shell when a file is still open.
+  if (!state.selectedFile || !loadConversationPanelState(sessionId)) {
+    const settings = useSettingsStore.getState();
+    saveConversationPanelState(sessionId, {
+      open: settings.secondaryPanelOpen,
+      tab: settings.secondaryPanelTab,
+      width: settings.secondaryPanelWidth,
+    });
+  }
 }
 
 export function restoreConversationFileState(sessionId: string): void {
   const state = useFileStore.getState();
   state.restorePreviewState(sessionId);
   state.restoreExplorerState(sessionId);
+  const settings = useSettingsStore.getState();
+  const panel = loadConversationPanelState(sessionId);
+  settings.setSecondaryPanelState({
+    open: panel?.open ?? false,
+    tab: panel?.tab ?? 'files',
+    width: panel?.width ?? settings.secondaryPanelWidth,
+  });
+}
+
+export function resetConversationFileState(): void {
+  const state = useFileStore.getState();
+  state.closePreview();
+  state.restoreExplorerState('__blackbox_no_conversation__');
+  useSettingsStore.getState().setSecondaryPanelState({ open: false, tab: 'files' });
 }

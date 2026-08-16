@@ -2,7 +2,6 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
@@ -48,6 +47,10 @@ if (!automationBase) throw new Error('BLACKBOX_AUTOMATION_HOME is required');
 const providers = JSON.parse(readFileSync(resolvedProvider, 'utf8'));
 const activeProvider = providers.providers?.find((item) => item.id === providers.activeProviderId);
 if (!activeProvider) throw new Error('Active provider is missing');
+providers.version = 4;
+providers.defaultApi = activeProvider.id;
+providers.defaultMainModel = 'haiku';
+providers.defaultAuxiliaryModel = 'haiku';
 const smokeModel = process.env.BLACKBOX_SMOKE_MODEL
   || activeProvider.modelMappings?.find((item) => item.tier === 'haiku')?.providerModel
   || 'claude-haiku-4-5-20251001';
@@ -161,7 +164,11 @@ if (httpMcpMode) {
 
 const isolatedClaude = join(process.env.HOME, '.claude', 'local', 'claude');
 if (!existsSync(isolatedClaude)) symlinkSync(resolvedClaude, isolatedClaude);
-copyFileSync(resolvedProvider, join(resolve(automationHome), 'providers.json'));
+writeFileSync(
+  join(resolve(automationHome), 'providers.json'),
+  `${JSON.stringify(providers, null, 2)}\n`,
+  'utf8',
+);
 
 function pluginCli(args) {
   const result = spawnSync(resolvedClaude, args, {
@@ -367,8 +374,6 @@ try {
     target: { type: 'project', projectId: workspace },
     cwds: [workspace],
     target_thread_id: null,
-    provider_id: activeProvider.id,
-    provider_revision: Number(activeProvider.revision || 1),
     created_at: 0,
     updated_at: 0,
   };
@@ -384,13 +389,13 @@ try {
     }
     const runs = cli('runs', report.taskId);
     run = runs[0];
-    if (run && ['PENDING_REVIEW', 'FAILED'].includes(run.status)) break;
+    if (run && ['SUCCEEDED', 'FAILED'].includes(run.status)) break;
     await sleep(2_000);
   }
   if (!run) throw new Error('No scheduled run was recorded before timeout');
   cli('pause', report.taskId);
   report.runStatus = run.status;
-  if (run.status !== 'PENDING_REVIEW') throw new Error(`Scheduled run failed: ${run.error || run.summary}`);
+  if (run.status !== 'SUCCEEDED') throw new Error(`Scheduled run failed: ${run.error || run.summary}`);
   report.sessionId = run.sessionId || null;
   if (!report.sessionId || report.sessionId !== run.runId) {
     throw new Error(`Scheduled run did not persist its run UUID as the Claude session ID: ${report.sessionId || 'missing'}`);
@@ -517,8 +522,6 @@ try {
       target: null,
       cwds: [report.executionCwd || workspace],
       target_thread_id: report.sessionId,
-      provider_id: activeProvider.id,
-      provider_revision: Number(activeProvider.revision || 1),
       created_at: 0,
       updated_at: 0,
     }, null, 2)}\n`, 'utf8');
@@ -529,7 +532,7 @@ try {
     if (!resumeRun) throw new Error('Resume run finished without a run record');
     report.resumeRunId = resumeRun.runId;
     report.resumeStatus = resumeRun.status;
-    report.resumeContextVerified = resumeRun.status === 'PENDING_REVIEW'
+    report.resumeContextVerified = resumeRun.status === 'SUCCEEDED'
       && resumeRun.sessionId === report.sessionId
       && String(resumeRun.output || '').includes(marker);
     if (!report.resumeContextVerified) {

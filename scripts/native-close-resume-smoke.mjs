@@ -129,7 +129,7 @@ async function waitForAppExit(timeout = 30_000) {
 
 async function closeAppGracefully() {
   if (!appProcess || appProcess.exitCode != null) return;
-  cli(['exec', 'window.__blackbox_test.closeWindow()']);
+  cli(['exec', 'window.__blackbox_test.quitApp()']);
   await waitForAppExit();
   appProcess = null;
   socketPath = null;
@@ -248,14 +248,14 @@ async function reloadWebview(expectedSession) {
 
 async function nativeCloseAndRelaunch(expectedSession, label) {
   cli(['exec', 'window.__blackbox_test.closeWindow()']);
-  const exitCode = await waitForAppExit();
-  appProcess = null;
-  socketPath = null;
-  if (exitCode !== 0) throw new Error(`Native close exited with code ${exitCode}`);
-  const launch = await startApp(label);
+  await sleep(750);
+  if (!appProcess || appProcess.exitCode != null) {
+    throw new Error(`Native window close terminated the resident app during ${label}`);
+  }
+  cli(['exec', 'window.__blackbox_test.focusWindow()']);
   await waitForSelectedSession(expectedSession);
   await waitForEditor();
-  return launch;
+  return { ...report.launches.at(-1), hiddenWindowCycle: label };
 }
 
 async function nativeQuitAndRelaunch(expectedSession, label) {

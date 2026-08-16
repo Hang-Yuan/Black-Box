@@ -3,9 +3,16 @@ export interface ScrollPosition {
   atBottom: boolean;
 }
 
+export interface ConversationPanelState {
+  open: boolean;
+  tab: 'activity' | 'files';
+  width: number;
+}
+
 const chatPositions = new Map<string, ScrollPosition>();
 const filePositions = new Map<string, number>();
 const fileTreePositions = new Map<string, number>();
+const panelStates = new Map<string, ConversationPanelState>();
 
 function filePositionKey(sessionId: string, filePath: string, mode: string): string {
   return `${sessionId}\u0000${filePath}\u0000${mode}`;
@@ -55,8 +62,23 @@ export function loadFileTreeScrollPosition(
   return fileTreePositions.get(fileTreePositionKey(sessionId, rootPath)) ?? null;
 }
 
+export function saveConversationPanelState(
+  sessionId: string,
+  state: ConversationPanelState,
+): void {
+  panelStates.set(sessionId, { ...state });
+}
+
+export function loadConversationPanelState(
+  sessionId: string,
+): ConversationPanelState | null {
+  const state = panelStates.get(sessionId);
+  return state ? { ...state } : null;
+}
+
 export function clearConversationViewStateForTests(): void {
   chatPositions.clear();
   filePositions.clear();
   fileTreePositions.clear();
+  panelStates.clear();
 }

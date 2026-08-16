@@ -145,7 +145,7 @@ export function PermissionCard({ message }: Props) {
   }, [handleRespond, isPending]);
 
   return (
-    <div className={`ml-11 animate-scale-in ${isResolved || isExpired ? 'opacity-60' : ''}`}
+    <div className={`ml-[72px] animate-scale-in ${isResolved || isExpired ? 'opacity-60' : ''}`}
       {...(import.meta.env.DEV && { 'data-testid': 'permission-card' })}>
       <div className={`rounded-lg border overflow-hidden transition-all duration-200
         ${isResolved || isExpired

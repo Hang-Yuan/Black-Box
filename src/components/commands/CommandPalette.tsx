@@ -3,7 +3,7 @@ import { useSettingsStore } from '../../stores/settingsStore';
 import { useChatStore } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useAgentStore } from '../../stores/agentStore';
-import { saveConversationFileState } from '../../stores/fileStore';
+import { resetConversationFileState, saveConversationFileState } from '../../stores/fileStore';
 import { useT } from '../../lib/i18n';
 
 interface CommandItem {
@@ -41,6 +41,7 @@ export function CommandPalette() {
         }
         // In v2, navigating away doesn't reset the previous tab
         useSessionStore.getState().setSelectedSession(null);
+        resetConversationFileState();
         useSettingsStore.getState().setWorkingDirectory('');
       },
     },

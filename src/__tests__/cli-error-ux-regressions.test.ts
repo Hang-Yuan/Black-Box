@@ -10,6 +10,7 @@ const i18n = readFileSync(resolve(root, 'lib/i18n.ts'), 'utf8');
 describe('CLI maintenance error experience', () => {
   it.each([
     ['TelemetrySafeError: Download timed out: exceeded the total deadline', 'network'],
+    ['CLI_MAINTENANCE_BUSY', 'maintenanceBusy'],
     ['CLI_UPDATE_BLOCKED_AUTOMATION', 'blockedAutomation'],
     ['CLI_UPDATE_BLOCKED_SESSIONS:session-a', 'blockedSessions'],
     ['Selected SDK runtime is missing or broken', 'runtime'],
@@ -32,6 +33,7 @@ describe('CLI maintenance error experience', () => {
   it('ships localized title/action pairs for every classified failure', () => {
     for (const kind of [
       'network',
+      'maintenanceBusy',
       'blockedAutomation',
       'blockedSessions',
       'runtime',

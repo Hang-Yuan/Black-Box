@@ -10,10 +10,12 @@ import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-
  */
 export function GoalControl({
   active = false,
+  running = false,
   disabled = false,
   onSelect,
 }: {
   active?: boolean;
+  running?: boolean;
   disabled?: boolean;
   onSelect: () => void;
 }) {
@@ -51,17 +53,23 @@ export function GoalControl({
         type="button"
         data-testid="goal-button"
         data-active={active ? 'true' : 'false'}
+        data-goal-live={running ? 'true' : 'false'}
         data-runtime-available={nativeAvailable ? 'true' : 'false'}
+        aria-busy={running}
         onClick={selectMode}
         disabled={disabled || !nativeAvailable}
         className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px]
           transition-smooth disabled:cursor-not-allowed disabled:opacity-40 ${active
             ? 'border-accent/40 bg-accent/15 text-accent'
+            : running
+            ? 'border-accent/25 bg-accent/10 text-accent'
             : 'border-border-subtle text-text-tertiary hover:bg-bg-secondary hover:text-text-primary'
           }`}
         title={nativeAvailable ? t('goal.nativeHint') : t('goal.unavailable')}
       >
-        <span className={`h-1.5 w-1.5 rounded-full ${active ? 'bg-accent' : 'bg-text-tertiary/40'}`} />
+        <span className={`h-1.5 w-1.5 rounded-full ${running
+          ? 'bg-accent animate-pulse-soft'
+          : active ? 'bg-accent' : 'bg-text-tertiary/40'}`} />
         <span className="blackbox-toolbar-full-label">Goal</span>
         <span className="blackbox-toolbar-compact-label" aria-hidden="true">G</span>
       </button>

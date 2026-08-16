@@ -1,19 +1,22 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { getPlanProgress } from '../../lib/plan-contract';
 import { bridge, type AutomationActivitySummary } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { useActiveTab } from '../../stores/chatStore';
-import { useAgentStore, type AgentNode } from '../../stores/agentStore';
+import { isAgentActive, useAgentStore, type AgentNode } from '../../stores/agentStore';
 import { usePlanStore } from '../../stores/planStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useWorkflowStore, type LiveWorkflowRun } from '../../stores/workflowStore';
 import { useLoopStore } from '../../stores/loopStore';
+import { sanitizeAssistantTextForDisplay } from '../../lib/presentation-sanitizer';
+import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 
 type Tone = 'active' | 'done' | 'waiting' | 'idle' | 'error';
 
 const EMPTY_WORKFLOW_RUNS: LiveWorkflowRun[] = [];
 const AUTOMATION_POLL_INTERVAL_MS = 2_500;
+const RUNTIME_STALL_WARNING_MS = 120_000;
 
 const TONE_CLASS: Record<Tone, string> = {
   active: 'bg-accent animate-pulse-soft',
@@ -38,8 +41,15 @@ function Section({
   active?: boolean;
   children: React.ReactNode;
 }) {
+  const sectionRef = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    if (active && sectionRef.current) sectionRef.current.open = true;
+  }, [active]);
   return (
-    <details open={active} className="group border-b border-border-subtle/70 last:border-b-0">
+    <details
+      ref={sectionRef}
+      className="group border-b border-border-subtle/70 last:border-b-0"
+    >
       <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-[10px]
         font-semibold uppercase tracking-[0.12em] text-text-tertiary hover:bg-bg-secondary/35">
         <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"
@@ -66,18 +76,37 @@ function workflowTone(run: LiveWorkflowRun): Tone {
 }
 
 function agentTone(agent: AgentNode): Tone {
-  if (agent.phase === 'error') return 'error';
+  if (agent.phase === 'interrupted' || agent.phase === 'error') return 'error';
   if (agent.phase === 'completed') return 'done';
   if (agent.phase === 'idle' || agent.phase === 'spawning') return 'waiting';
   return 'active';
 }
 
+function formatLastActivity(
+  now: number,
+  lastProgressAt: number | undefined,
+  t: (key: string) => string,
+): string {
+  if (!lastProgressAt) return t('input.activityUnknown');
+  const elapsedSeconds = Math.max(0, Math.floor((now - lastProgressAt) / 1000));
+  if (elapsedSeconds < 5) return t('input.activityNow');
+  if (elapsedSeconds < 60) {
+    return t('input.activitySecondsAgo').replace('{count}', String(elapsedSeconds));
+  }
+  return t('input.activityMinutesAgo').replace(
+    '{count}',
+    String(Math.floor(elapsedSeconds / 60)),
+  );
+}
+
 export function ActivityPanel() {
   const t = useT();
+  const panelRef = useRef<HTMLDivElement>(null);
   const tabId = useSessionStore((state) => state.selectedSessionId);
   const allLoopJobs = useLoopStore((state) => state.jobs);
   const sessionStatus = useActiveTab((tab) => tab.sessionStatus);
   const activityStatus = useActiveTab((tab) => tab.activityStatus);
+  const lastProgressAt = useActiveTab((tab) => tab.sessionMeta.lastProgressAt);
   const auxiliaryModel = useActiveTab((tab) => tab.sessionMeta.configSnapshot?.auxiliaryModel);
   const loopSessionLive = useActiveTab((tab) => Boolean(
     tab.sessionMeta.stdinId && tab.sessionMeta.stdinReady,
@@ -89,8 +118,11 @@ export function ActivityPanel() {
   const applyRuntimeProgress = useWorkflowStore((state) => state.applyRuntimeProgress);
   const teamTasks = useAgentStore((state) => state.teamTasks);
   const agents = useAgentStore((state) => state.agents);
+  const agentTeamsEnabled = useSettingsStore((state) => state.agentTeamsEnabled);
+  const setAgentTeamsEnabled = useSettingsStore((state) => state.setAgentTeamsEnabled);
   const [automations, setAutomations] = useState<AutomationActivitySummary[]>([]);
   const [automationError, setAutomationError] = useState('');
+  const [now, setNow] = useState(Date.now());
 
   const tasks = useMemo(
     () => Array.from(teamTasks.values()).filter((task) => task.status !== 'deleted'),
@@ -107,7 +139,7 @@ export function ActivityPanel() {
     [agents],
   );
   const activeAgents = useMemo(
-    () => visibleAgents.filter((agent) => !['idle', 'completed', 'error'].includes(agent.phase)),
+    () => visibleAgents.filter(isAgentActive),
     [visibleAgents],
   );
   const orderedRuns = useMemo(
@@ -136,6 +168,10 @@ export function ActivityPanel() {
   const activeLoop = loopSessionLive && loopJobs.some((job) => job.status === 'running');
   const activeTasks = tasks.filter((task) => task.status === 'in_progress').length;
   const automationRunning = automations.some((automation) => automation.running);
+  const stalled = sessionStatus === 'running'
+    && Boolean(lastProgressAt)
+    && now - (lastProgressAt ?? now) > RUNTIME_STALL_WARNING_MS;
+  const lastActivity = formatLastActivity(now, lastProgressAt, t);
   const backgroundActive = ['thinking', 'writing', 'tool', 'awaiting']
     .includes(activityStatus.phase);
   const busy = sessionStatus === 'running'
@@ -146,7 +182,9 @@ export function ActivityPanel() {
     || activeTasks > 0
     || activeAgents.length > 0
     || automationRunning;
-  const activityLabel = automationRunning
+  const activityLabel = stalled
+    ? t('input.backgroundWorkStalled')
+    : automationRunning
     ? t('activity.scheduled')
     : activityStatus.phase === 'tool'
     ? `${t('chat.runningTool')}${activityStatus.toolName ? ` · ${activityStatus.toolName}` : ''}`
@@ -172,6 +210,34 @@ export function ActivityPanel() {
       .then(setAutomations)
       .catch((error) => setAutomationError(String(error)));
   };
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const focusAgentProcess = (event: Event) => {
+      const agentId = (event as CustomEvent<{ agentId?: string }>).detail?.agentId;
+      if (!agentId) return;
+      const card = Array.from(
+        panelRef.current?.querySelectorAll<HTMLElement>('[data-activity-agent-id]') ?? [],
+      ).find((element) => element.dataset.activityAgentId === agentId);
+      if (!card) return;
+      let ancestor = card.parentElement;
+      while (ancestor && ancestor !== panelRef.current) {
+        if (ancestor instanceof HTMLDetailsElement) ancestor.open = true;
+        ancestor = ancestor.parentElement;
+      }
+      const process = card.querySelector<HTMLDetailsElement>(
+        '[data-testid^="activity-panel-agent-process-"]',
+      );
+      if (process) process.open = true;
+      card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    };
+    window.addEventListener('blackbox:focus-agent-process', focusAgentProcess);
+    return () => window.removeEventListener('blackbox:focus-agent-process', focusAgentProcess);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -237,11 +303,17 @@ export function ActivityPanel() {
     }
   };
 
+  const toggleAgentTeams = () => {
+    if (sessionStatus === 'running' || sessionStatus === 'stopping') return;
+    if (!agentTeamsEnabled && !window.confirm(t('agents.teams.confirm'))) return;
+    setAgentTeamsEnabled(!agentTeamsEnabled);
+  };
+
   return (
-    <div data-testid="activity-panel" className="flex h-full flex-col bg-bg-chat">
+    <div ref={panelRef} data-testid="activity-panel" className="flex h-full flex-col bg-bg-chat">
       <div className="border-b border-border-subtle px-3 py-3">
         <div className="flex items-center gap-2">
-          <StatusDot tone={busy ? 'active' : 'idle'} />
+          <StatusDot tone={stalled ? 'error' : busy ? 'active' : 'idle'} />
           <div className="min-w-0 flex-1">
             <div className="text-xs font-medium text-text-primary">
               {busy ? t('activity.running') : t('activity.idle')}
@@ -249,7 +321,43 @@ export function ActivityPanel() {
             <div className="mt-0.5 truncate text-[10px] text-text-tertiary">
               {busy ? activityLabel : t('activity.currentTaskHint')}
             </div>
+            {busy && (
+              <div className={`mt-0.5 text-[9px] ${stalled ? 'text-error' : 'text-text-tertiary'}`}>
+                {t('input.lastActivity').replace('{time}', lastActivity)}
+              </div>
+            )}
           </div>
+        </div>
+        <div
+          data-testid="activity-agent-teams-control"
+          className="mt-2 flex items-center justify-between gap-3 rounded-md bg-bg-secondary/45 px-2 py-1.5"
+        >
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-medium text-text-primary">{t('agents.teams.title')}</span>
+              <span className="rounded bg-warning/10 px-1 py-0.5 text-[8px] uppercase text-warning">
+                {t('agents.teams.experimental')}
+              </span>
+            </div>
+            <div className="mt-0.5 truncate text-[9px] text-text-tertiary">
+              {agentTeamsEnabled ? t('agents.teams.enabledHint') : t('agents.teams.disabledHint')}
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={agentTeamsEnabled}
+            data-testid="agent-teams-toggle"
+            disabled={sessionStatus === 'running' || sessionStatus === 'stopping'}
+            onClick={toggleAgentTeams}
+            className={`relative h-5 w-9 flex-shrink-0 rounded-full transition-colors
+              ${agentTeamsEnabled ? 'bg-accent' : 'bg-bg-tertiary'} disabled:opacity-40`}
+          >
+            <span
+              className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
+              style={{ transform: `translateX(${agentTeamsEnabled ? 16 : 0}px)` }}
+            />
+          </button>
         </div>
         <div className="mt-2 grid grid-cols-3 gap-1.5 text-center text-[9px] text-text-tertiary">
           <div className="rounded-md bg-bg-secondary/60 px-1 py-1.5">
@@ -360,9 +468,15 @@ export function ActivityPanel() {
             const taskDescription = agent.description && agent.description !== agent.name
               ? agent.description
               : '';
+            const agentActivity = (agent.activity ?? [])
+              .map((entry) => entry.kind === 'text'
+                ? { ...entry, content: sanitizeAssistantTextForDisplay(entry.content).trim() }
+                : entry)
+              .filter((entry) => entry.content.length > 0);
             return (
               <div
                 key={agent.id}
+                data-activity-agent-id={agent.id}
                 data-activity-agent-name={agent.name || agent.description || ''}
                 data-activity-agent-phase={agent.phase}
                 className="flex items-start gap-2 rounded-md bg-bg-secondary/35 px-2 py-1.5"
@@ -380,6 +494,40 @@ export function ActivityPanel() {
                   <div className="truncate text-[9px] text-text-tertiary">
                     {phaseLabel}{modelLabel ? ` · ${modelLabel}` : ''}
                   </div>
+                  {agentActivity.length > 0 && (
+                    <details
+                      data-testid={`activity-panel-agent-process-${agent.id}`}
+                      className="group/process mt-1 border-t border-border-subtle/50 pt-1"
+                    >
+                      <summary className="flex cursor-pointer list-none items-center gap-1.5 py-0.5 text-[9px] text-text-tertiary select-none">
+                        <svg
+                          width="9"
+                          height="9"
+                          viewBox="0 0 10 10"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          className="transition-transform group-open/process:rotate-90"
+                        >
+                          <path d="M3 2l4 3-4 3" />
+                        </svg>
+                        <span>{t('agents.activity').replace('{count}', String(agentActivity.length))}</span>
+                        <span className="truncate text-text-tertiary/60">{t('agents.activityPrivate')}</span>
+                      </summary>
+                      <div className="mt-1 max-h-80 space-y-2 overflow-y-auto border-l border-border-subtle pl-2">
+                        {agentActivity.map((entry) => entry.kind === 'tool' ? (
+                          <div key={entry.id} className="flex items-center gap-1.5 text-[9px] text-text-tertiary">
+                            <span className="h-1 w-1 rounded-full bg-blue-400" />
+                            <span>{t('agents.activityTool')}{entry.toolName ? ` · ${entry.toolName}` : ''}</span>
+                          </div>
+                        ) : (
+                          <div key={entry.id} className="text-[10px] leading-4 text-text-muted">
+                            <MarkdownRenderer content={entry.content} />
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               </div>
             );

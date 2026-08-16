@@ -1,5 +1,5 @@
 import { bridge, type ConversationRuntimePreference } from './tauri-bridge';
-import { useProviderStore } from '../stores/providerStore';
+import { hasUsableProviderCredential, useProviderStore } from '../stores/providerStore';
 import { useSessionStore } from '../stores/sessionStore';
 import {
   isModelTier,
@@ -8,6 +8,13 @@ import {
 } from '../stores/settingsStore';
 
 type PreferenceMap = Record<string, ConversationRuntimePreference>;
+
+export interface ConversationRuntimeReadiness {
+  ready: boolean;
+  switchedToDefault: boolean;
+  defaultSummary?: string;
+  reason?: 'selection_changed' | 'defaults_incomplete' | 'default_unavailable';
+}
 
 let preferences: PreferenceMap = {};
 let loadPromise: Promise<void> | null = null;
@@ -34,6 +41,9 @@ function normalizePreference(
   return {
     providerId,
     selectedModel: normalizeModelTier(value.selectedModel),
+    auxiliaryModel: isModelTier(value.auxiliaryModel)
+      ? normalizeModelTier(value.auxiliaryModel)
+      : (useProviderStore.getState().defaultAuxiliaryModel ?? 'sonnet'),
     customModelId,
   };
 }
@@ -58,8 +68,126 @@ function captureCurrentPreference(): ConversationRuntimePreference {
   return {
     providerId,
     selectedModel: normalizeModelTier(settings.selectedModel),
+    auxiliaryModel: normalizeModelTier(settings.auxiliaryModel),
     customModelId: providerId ? null : settings.customModelId?.trim() || null,
   };
+}
+
+function captureNewConversationPreference(): ConversationRuntimePreference {
+  const providerState = useProviderStore.getState();
+  return {
+    providerId: providerState.defaultApi,
+    selectedModel: providerState.defaultMainModel ?? 'sonnet',
+    auxiliaryModel: providerState.defaultAuxiliaryModel ?? 'sonnet',
+    customModelId: null,
+  };
+}
+
+function configuredDefaultPreference(): ConversationRuntimePreference | null {
+  const providerState = useProviderStore.getState();
+  if (
+    !providerState.defaultApi
+    || !providerState.defaultMainModel
+    || !providerState.defaultAuxiliaryModel
+  ) {
+    return null;
+  }
+  return {
+    providerId: providerState.defaultApi,
+    selectedModel: providerState.defaultMainModel,
+    auxiliaryModel: providerState.defaultAuxiliaryModel,
+    customModelId: null,
+  };
+}
+
+function providerHasStoredCredential(providerId: string): boolean {
+  const provider = useProviderStore.getState().providers.find(
+    (candidate) => candidate.id === providerId,
+  );
+  return hasUsableProviderCredential(provider);
+}
+
+async function runtimeRouteReady(providerId: string | null): Promise<boolean> {
+  return Boolean(providerId && providerHasStoredCredential(providerId));
+}
+
+function defaultRuntimeSummary(preference: ConversationRuntimePreference): string {
+  const providerState = useProviderStore.getState();
+  const providerName = preference.providerId
+    ? providerState.providers.find((provider) => provider.id === preference.providerId)?.name
+    : undefined;
+  return [providerName, preference.selectedModel, preference.auxiliaryModel]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+async function applyPreferenceToConversation(
+  sessionId: string,
+  preference: ConversationRuntimePreference,
+): Promise<boolean> {
+  if (useSessionStore.getState().selectedSessionId !== sessionId) return false;
+  restoringDepth += 1;
+  try {
+    useProviderStore.getState().setActive(preference.providerId);
+    useSettingsStore.getState().setSelectedModel(preference.selectedModel);
+    useSettingsStore.getState().setAuxiliaryModel(preference.auxiliaryModel);
+    useSettingsStore.getState().setCustomModelId(preference.customModelId);
+  } finally {
+    restoringDepth -= 1;
+  }
+  await rememberConversationRuntimePreference(sessionId, preference);
+  await useProviderStore.getState().flushSave();
+  return useSessionStore.getState().selectedSessionId === sessionId;
+}
+
+/** Apply the user's explicit default API/main/subagent triple to one conversation. */
+export async function applyDefaultRuntimeToConversation(
+  sessionId: string,
+): Promise<ConversationRuntimeReadiness> {
+  const providerState = useProviderStore.getState();
+  if (!providerState.loaded) await providerState.load();
+  await ensureLoaded();
+  if (useSessionStore.getState().selectedSessionId !== sessionId) {
+    return { ready: false, switchedToDefault: false, reason: 'selection_changed' };
+  }
+
+  const defaults = configuredDefaultPreference();
+  if (!defaults) {
+    return { ready: false, switchedToDefault: false, reason: 'defaults_incomplete' };
+  }
+  if (!(await runtimeRouteReady(defaults.providerId))) {
+    return { ready: false, switchedToDefault: false, reason: 'default_unavailable' };
+  }
+  if (!(await applyPreferenceToConversation(sessionId, defaults))) {
+    return { ready: false, switchedToDefault: false, reason: 'selection_changed' };
+  }
+  return {
+    ready: true,
+    switchedToDefault: true,
+    defaultSummary: defaultRuntimeSummary(defaults),
+  };
+}
+
+/**
+ * Validate the route attached to the visible conversation before a new CLI
+ * turn starts. An unavailable legacy/native route falls back to the user's
+ * explicit default triple; no process is spawned until one route is usable.
+ */
+export async function ensureConversationRuntimeReady(
+  sessionId: string,
+): Promise<ConversationRuntimeReadiness> {
+  const providerState = useProviderStore.getState();
+  if (!providerState.loaded) await providerState.load();
+  await ensureLoaded();
+  if (useSessionStore.getState().selectedSessionId !== sessionId) {
+    return { ready: false, switchedToDefault: false, reason: 'selection_changed' };
+  }
+
+  const active = captureCurrentPreference();
+  if (await runtimeRouteReady(active.providerId)) {
+    return { ready: true, switchedToDefault: false };
+  }
+  return applyDefaultRuntimeToConversation(sessionId);
 }
 
 async function ensureLoaded(): Promise<void> {
@@ -113,7 +241,7 @@ export function rememberConversationRuntimePreference(
 /** Seed a newly-created draft once without overwriting a choice it already owns. */
 function seedConversationRuntimePreference(
   sessionId: string,
-  preference: ConversationRuntimePreference = captureCurrentPreference(),
+  preference: ConversationRuntimePreference = captureNewConversationPreference(),
 ): Promise<void> {
   const normalized = normalizePreference(preference);
   if (!normalized) return Promise.resolve();
@@ -143,7 +271,7 @@ export async function restoreConversationRuntimePreference(
 
   let preference = preferences[sessionId];
   if (!preference) {
-    preference = captureCurrentPreference();
+    preference = captureNewConversationPreference();
     preferences[sessionId] = preference;
     if (isDurableSessionId(sessionId)) {
       try {
@@ -152,33 +280,37 @@ export async function restoreConversationRuntimePreference(
         console.error('[conversation-runtime] seed save failed:', error);
       }
     }
-    return useSessionStore.getState().selectedSessionId === sessionId;
   }
 
-  const providerAvailable = !preference.providerId
-    || useProviderStore.getState().providers.some(
-      (provider) => provider.id === preference.providerId,
-    );
-  const providerId = providerAvailable ? preference.providerId : null;
+  const providerAvailable = Boolean(
+    preference.providerId && providerHasStoredCredential(preference.providerId),
+  );
   if (!providerAvailable) {
-    preference = { ...preference, providerId: null, customModelId: null };
-    preferences[sessionId] = preference;
-    if (isDurableSessionId(sessionId)) {
-      try {
-        await persistPreferences();
-      } catch (error) {
-        console.error('[conversation-runtime] provider fallback save failed:', error);
+    const configuredDefault = configuredDefaultPreference();
+    if (
+      configuredDefault?.providerId
+      && providerHasStoredCredential(configuredDefault.providerId)
+    ) {
+      preference = configuredDefault;
+      preferences[sessionId] = preference;
+      if (isDurableSessionId(sessionId)) {
+        try {
+          await persistPreferences();
+        } catch (error) {
+          console.error('[conversation-runtime] provider fallback save failed:', error);
+        }
       }
     }
   }
 
   restoringDepth += 1;
   try {
-    useProviderStore.getState().setActive(providerId);
+    useProviderStore.getState().setActive(preference.providerId);
     useSettingsStore.getState().setSelectedModel(preference.selectedModel);
-    if (!providerId && preference.customModelId) {
-      useSettingsStore.getState().setCustomModelId(preference.customModelId);
-    }
+    useSettingsStore.getState().setAuxiliaryModel(preference.auxiliaryModel);
+    useSettingsStore.getState().setCustomModelId(
+      preference.providerId ? null : preference.customModelId,
+    );
   } finally {
     restoringDepth -= 1;
   }
@@ -240,15 +372,28 @@ export function initializeConversationRuntimePreferences(): void {
       state.selectedSessionId === previous.selectedSessionId
       || !state.selectedSessionId?.startsWith('draft_')
     ) return;
-    void seedConversationRuntimePreference(
-      state.selectedSessionId,
-      captureCurrentPreference(),
-    );
+    const preference = captureNewConversationPreference();
+    const defaults = useProviderStore.getState();
+    if (defaults.defaultApi && defaults.defaultMainModel && defaults.defaultAuxiliaryModel) {
+      restoringDepth += 1;
+      try {
+        useProviderStore.getState().setActive(preference.providerId);
+        useSettingsStore.getState().setSelectedModel(preference.selectedModel);
+        useSettingsStore.getState().setAuxiliaryModel(preference.auxiliaryModel);
+        useSettingsStore.getState().setCustomModelId(null);
+      } finally {
+        restoringDepth -= 1;
+      }
+    } else {
+      useSettingsStore.getState().openSettings('provider');
+    }
+    void seedConversationRuntimePreference(state.selectedSessionId, preference);
   });
 
   useSettingsStore.subscribe((state, previous) => {
     if (
       state.selectedModel === previous.selectedModel
+      && state.auxiliaryModel === previous.auxiliaryModel
       && state.customModelId === previous.customModelId
     ) return;
     const sessionId = useSessionStore.getState().selectedSessionId;
