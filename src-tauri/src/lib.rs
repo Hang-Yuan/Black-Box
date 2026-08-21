@@ -22,6 +22,8 @@ mod provider_catalog;
 mod provider_credentials;
 mod provider_gateway;
 mod provider_protocol;
+#[allow(dead_code)]
+mod runtime_harness;
 mod session_metadata;
 mod task_handoff;
 mod time_context_hook;
