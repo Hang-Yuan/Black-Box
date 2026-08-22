@@ -5180,6 +5180,211 @@ mod session_ownership_tests {
     }
 }
 
+/// Return the timestamp of the newest user-visible conversation event.
+///
+/// Claude may append bookkeeping records such as `last-prompt` after the final
+/// message. Those writes change the JSONL mtime without changing conversation
+/// activity, so the sidebar must derive its display and sort time from the
+/// transcript itself. Scanning backwards keeps this cheap for large sessions.
+fn session_activity_timestamp_ms(path: &std::path::Path) -> Option<u64> {
+    use std::io::{Read, Seek};
+
+    const BLOCK_SIZE: u64 = 16 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut cursor = file.metadata().ok()?.len();
+    let mut reversed_line = Vec::new();
+
+    while cursor > 0 {
+        let block_start = cursor.saturating_sub(BLOCK_SIZE);
+        let block_len = usize::try_from(cursor - block_start).ok()?;
+        let mut block = vec![0_u8; block_len];
+        file.seek(std::io::SeekFrom::Start(block_start)).ok()?;
+        file.read_exact(&mut block).ok()?;
+
+        for byte in block.into_iter().rev() {
+            if byte == b'\n' {
+                if let Some(timestamp) =
+                    session_activity_timestamp_from_reversed_line(&mut reversed_line)
+                {
+                    return Some(timestamp);
+                }
+            } else if byte != b'\r' {
+                reversed_line.push(byte);
+            }
+        }
+        cursor = block_start;
+    }
+
+    session_activity_timestamp_from_reversed_line(&mut reversed_line)
+}
+
+fn session_activity_timestamp_from_reversed_line(line: &mut Vec<u8>) -> Option<u64> {
+    if line.is_empty() {
+        return None;
+    }
+
+    line.reverse();
+    let timestamp = parse_session_activity_timestamp(line);
+    line.clear();
+    timestamp
+}
+
+fn parse_session_activity_timestamp(line: &[u8]) -> Option<u64> {
+    let event: Value = serde_json::from_slice(line).ok()?;
+    if event.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || event
+            .get("sourceToolAssistantUUID")
+            .is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+
+    let event_type = event.get("type").and_then(Value::as_str);
+    let message_role = event
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str);
+    let is_conversation_event = matches!(event_type, Some("user" | "human" | "assistant"))
+        || matches!(message_role, Some("user" | "assistant"));
+    if !is_conversation_event {
+        return None;
+    }
+
+    let content = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .or_else(|| event.get("content"));
+    if !content.is_some_and(session_content_is_user_visible) {
+        return None;
+    }
+
+    let timestamp = event.get("timestamp")?.as_str()?;
+    let timestamp_ms = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()?
+        .timestamp_millis();
+    u64::try_from(timestamp_ms).ok()
+}
+
+fn session_content_is_user_visible(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(blocks) => blocks.iter().any(|block| match block {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+                Some("text") => object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty()),
+                Some("image" | "document") => true,
+                Some(_) => false,
+                None => false,
+            },
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod session_activity_timestamp_tests {
+    use super::*;
+
+    fn timestamp_ms(timestamp: &str) -> u64 {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .timestamp_millis() as u64
+    }
+
+    #[test]
+    fn trailing_bookkeeping_and_tool_records_do_not_advance_session_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let events = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-21T17:26:12.912Z",
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "done" }] }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-21T22:30:00.000Z",
+                "message": { "role": "assistant", "content": [{ "type": "tool_use", "name": "Read" }] }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-08-21T22:30:01.000Z",
+                "sourceToolAssistantUUID": "tool-call-id",
+                "message": { "role": "user", "content": [{ "type": "tool_result", "content": "ok" }] }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-21T22:30:02.000Z",
+                "isSidechain": true,
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "internal" }] }
+            }),
+            serde_json::json!({
+                "type": "last-prompt",
+                "lastPrompt": "done"
+            }),
+        ];
+        let jsonl = events
+            .into_iter()
+            .map(|event| serde_json::to_string(&event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{jsonl}\n")).unwrap();
+
+        assert_eq!(
+            session_activity_timestamp_ms(&path),
+            Some(timestamp_ms("2026-08-21T17:26:12.912Z"))
+        );
+    }
+
+    #[test]
+    fn newest_visible_user_event_advances_session_time_across_block_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let long_prompt = "x".repeat(20 * 1024);
+        let events = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-08-21T17:26:12.912Z",
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "done" }] }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-08-21T17:27:00.000Z",
+                "message": { "role": "user", "content": [{ "type": "text", "text": long_prompt }] }
+            }),
+        ];
+        let jsonl = events
+            .into_iter()
+            .map(|event| serde_json::to_string(&event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+
+        assert_eq!(
+            session_activity_timestamp_ms(&path),
+            Some(timestamp_ms("2026-08-21T17:27:00.000Z"))
+        );
+    }
+
+    #[test]
+    fn sessions_without_visible_timestamped_events_use_the_caller_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"last-prompt\",\"lastPrompt\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(session_activity_timestamp_ms(&path), None);
+    }
+}
+
 #[tauri::command]
 async fn list_sessions() -> Result<Vec<Value>, String> {
     let claude_dir = client_runtime::claude_config_dir()?.join("projects");
@@ -5207,12 +5412,20 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                                     continue;
                                 }
 
-                                // Get file metadata for timestamp
-                                let modified = std::fs::metadata(&path)
-                                    .and_then(|m| m.modified())
-                                    .ok()
-                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|d| d.as_millis() as u64)
+                                // Use the newest visible conversation event for
+                                // sidebar display and ordering. Filesystem mtime
+                                // is only a compatibility fallback for malformed
+                                // or legacy transcripts without such an event.
+                                let modified = session_activity_timestamp_ms(&path)
+                                    .or_else(|| {
+                                        std::fs::metadata(&path)
+                                            .and_then(|metadata| metadata.modified())
+                                            .ok()
+                                            .and_then(|timestamp| {
+                                                timestamp.duration_since(std::time::UNIX_EPOCH).ok()
+                                            })
+                                            .map(|duration| duration.as_millis() as u64)
+                                    })
                                     .unwrap_or(0);
 
                                 // Read first few lines to extract preview and cwd
