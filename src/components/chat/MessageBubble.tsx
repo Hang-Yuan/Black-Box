@@ -16,6 +16,7 @@ import {
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from '../../lib/presentation-sanitizer';
+import { getToolSemanticDescription } from '../../lib/tool-presentation';
 
 interface Props {
   message: ChatMessage;
@@ -599,7 +600,9 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const [expanded, setExpanded] = useState(false);
   const toolName = message.toolName || 'Tool';
   const input = message.toolInput;
-  const label = getToolLabel(toolName, t, input);
+  const semanticDescription = getToolSemanticDescription(toolName, input);
+  const toolLabel = getToolLabel(toolName, t, input);
+  const label = semanticDescription ? `${toolLabel}：${semanticDescription}` : toolLabel;
 
   // Compute diff stats for Edit tool
   const editDiff = toolName === 'Edit' ? computeEditDiff(input) : null;
@@ -893,7 +896,20 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           <span className="w-[10px] flex-shrink-0" />
         )}
         <ToolIcon name={toolName} />
-        <span className="text-xs font-medium text-text-muted">{label}</span>
+        <span
+          className={`text-xs font-medium text-text-muted
+            ${semanticDescription ? 'max-w-[320px] truncate' : ''}`}
+          title={semanticDescription || undefined}
+        >
+          {label}
+        </span>
+        {semanticDescription && (
+          <span className="flex-shrink-0 rounded border border-border-subtle/70
+            bg-bg-secondary/45 px-1 py-px text-[9px] font-mono text-text-tertiary"
+          >
+            {toolName}
+          </span>
+        )}
         {renderPreview()}
         {/* In-progress indicator: typing dots — result text is optional, completion is explicit. */}
         {!isCompleted && (

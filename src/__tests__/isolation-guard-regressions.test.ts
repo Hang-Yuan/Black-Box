@@ -66,7 +66,29 @@ describe('isolated smoke workspace guard', () => {
     );
 
     expect(wrapper).toContain('export CFFIXED_USER_HOME="$isolated_home"');
+    expect(wrapper).toContain('export BLACKBOX_DEV_PROFILE_ROOT="$isolated_home"');
+    expect(wrapper).toContain('blackbox-dev-isolated-profile-v1');
     expect(wrapper).toContain('"$isolated_home/Library/WebKit"');
+  });
+
+  it('fails every debug binary before runtime initialization without an isolated profile', () => {
+    const main = readFileSync(
+      resolve(import.meta.dirname, '../../src-tauri/src/main.rs'),
+      'utf8',
+    );
+    const backend = readFileSync(
+      resolve(import.meta.dirname, '../../src-tauri/src/debug_runtime_guard.rs'),
+      'utf8',
+    );
+
+    expect(main).toContain('blackbox_lib::enforce_debug_runtime_isolation()');
+    expect(main.indexOf('enforce_debug_runtime_isolation()')).toBeLessThan(
+      main.indexOf('let arguments:'),
+    );
+    expect(backend).toContain('required_path(&snapshot.isolation_root, "BLACKBOX_DEV_ISOLATION_ROOT")');
+    expect(backend).toContain('HOME must resolve to BLACKBOX_DEV_PROFILE_ROOT');
+    expect(backend).toContain('debug profile resolves to the production account home');
+    expect(backend).toContain('directory escapes BLACKBOX_DEV_PROFILE_ROOT');
   });
 
   it('gives every isolated smoke the same Claude binary and provider profile', () => {

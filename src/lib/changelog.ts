@@ -19,6 +19,22 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.43',
+    date: '2026-08-30',
+    highlights: {
+      zh: [
+        '侧栏会话时间改用最后一条可见会话事件，不再被后台元数据写入和文件修改时间推迟',
+        '终端工具调用优先显示“读取文件”“执行测试”等语义描述，分组摘要可直接看懂，完整 Bash 命令与结果仍可展开查看',
+        'Debug 运行时启动改为 fail-closed：缺少隔离 Profile、命中真实 HOME 或数据目录逃逸时会在加载会话前直接拒绝启动',
+      ],
+      en: [
+        'Uses the last visible conversation event for sidebar activity time so background metadata writes and file mtimes can no longer move a session forward',
+        'Shows human-readable actions such as reading files and running tests for terminal tool calls and grouped summaries while keeping exact Bash commands and results expandable',
+        'Makes Debug startup fail closed before session loading when the isolated profile is missing, HOME resolves to the production account, or runtime data escapes its profile',
+      ],
+    },
+  },
+  {
     version: '0.14.41',
     date: '2026-08-16',
     highlights: {

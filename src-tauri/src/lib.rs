@@ -2,6 +2,7 @@ mod automations;
 mod auxiliary_model_hook;
 mod client_runtime;
 mod commands;
+mod debug_runtime_guard;
 mod desktop_pet;
 pub mod env_manager;
 mod events;
@@ -55,6 +56,10 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
+
+pub fn enforce_debug_runtime_isolation() -> Result<(), String> {
+    debug_runtime_guard::enforce_process_isolation()
+}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;

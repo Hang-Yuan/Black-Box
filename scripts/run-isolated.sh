@@ -9,6 +9,7 @@ host_node_bin="${BLACKBOX_HOST_NODE_BIN:-}"
 execution_root="${BLACKBOX_EXTERNAL_EXECUTION_ROOT:-$host_home/Library/Caches/BlackBoxAgentDev}"
 isolated_workspace="$execution_root/workspace"
 isolated_automation="$execution_root/automation"
+profile_marker="$isolated_home/.blackbox-dev-isolated-profile"
 
 # Keep pnpm's content-addressed package cache as a build-tool exception, just
 # like Cargo registry/git below. Without the explicit absolute store, changing
@@ -75,6 +76,7 @@ mkdir -p \
   "$isolated_home/Library/WebKit" \
   "$isolated_workspace" \
   "$isolated_automation"
+printf '%s\n' 'blackbox-dev-isolated-profile-v1' > "$profile_marker"
 
 # The product-facing smokes start Claude through Black Box itself and can
 # discover the isolated runtime from HOME. The lower-level CLI/scheduler
@@ -223,6 +225,7 @@ export BLACKBOX_SMOKE_REPORT_HOME="$isolated_home/.blackbox"
 export BLACKBOX_SKILL_HOME="$isolated_home/.claude/skills"
 export BLACKBOX_DEV_CREDENTIAL_STORE_FILE="$isolated_home/.blackbox/provider-credentials.test.json"
 export BLACKBOX_DEV_ISOLATION_ROOT="$isolated_workspace"
+export BLACKBOX_DEV_PROFILE_ROOT="$isolated_home"
 export BLACKBOX_EXTERNAL_EXECUTION_ROOT="$execution_root"
 export BLACKBOX_SMOKE_CLAUDE_BIN="${BLACKBOX_SMOKE_CLAUDE_BIN:-$isolated_claude_bin}"
 export BLACKBOX_SMOKE_PROVIDER_FILE="${BLACKBOX_SMOKE_PROVIDER_FILE:-$isolated_home/.blackbox/providers.json}"

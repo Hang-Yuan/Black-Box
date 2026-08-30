@@ -2,7 +2,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    if let Err(error) = blackbox_lib::enforce_debug_runtime_isolation() {
+        eprintln!("{error}");
+        std::process::exit(78);
+    }
+
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(debug_assertions)]
+    if arguments.len() == 1 && arguments[0] == "--debug-isolation-probe" {
+        println!("Black Box Debug isolation contract accepted");
+        return;
+    }
     if arguments
         .first()
         .is_some_and(|value| value == "--auxiliary-model-hook")
