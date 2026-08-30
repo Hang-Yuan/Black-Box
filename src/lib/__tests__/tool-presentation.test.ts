@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildSemanticToolSummary,
+  formatToolIdentity,
   getToolBilingualDescription,
   getToolSemanticDescription,
 } from '../tool-presentation';
@@ -27,6 +28,11 @@ describe('tool presentation', () => {
     expect(getToolBilingualDescription('Bash', {
       description: 'Inspect an unfamiliar runtime shape',
     })).toBe('Inspect an unfamiliar runtime shape');
+  });
+
+  it('formats the raw tool name before its localized type', () => {
+    expect(formatToolIdentity('Bash', '终端')).toBe('Bash[终端]');
+    expect(formatToolIdentity('CustomTool', 'CustomTool')).toBe('CustomTool');
   });
 
   it('redacts common credential shapes before displaying descriptions', () => {

@@ -1,8 +1,11 @@
 import { useState, useMemo } from 'react';
 import { type ChatMessage } from '../../stores/chatStore';
-import { ToolUseMsg } from './MessageBubble';
+import { getToolLabel, ToolUseMsg } from './MessageBubble';
 import { useT } from '../../lib/i18n';
-import { buildSemanticToolSummary } from '../../lib/tool-presentation';
+import {
+  buildSemanticToolSummary,
+  formatToolIdentity,
+} from '../../lib/tool-presentation';
 
 interface Props {
   messages: ChatMessage[];
@@ -26,7 +29,10 @@ export function ToolGroup({ messages }: Props) {
 
   const [expanded, setExpanded] = useState(false);
 
-  const summary = useMemo(() => buildSemanticToolSummary(messages), [messages]);
+  const summary = useMemo(() => buildSemanticToolSummary(messages, 3, (message) => {
+    const rawName = message.toolName || 'Tool';
+    return formatToolIdentity(rawName, getToolLabel(rawName, t, message.toolInput));
+  }), [messages, t]);
   const count = messages.length;
 
   // Check if this group is inside a sub-agent (first message determines depth)

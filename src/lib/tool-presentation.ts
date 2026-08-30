@@ -3,6 +3,8 @@ export interface ToolPresentationInput {
   toolInput?: unknown;
 }
 
+export type ToolIdentityResolver = (message: ToolPresentationInput) => string;
+
 const MAX_DESCRIPTION_LENGTH = 96;
 const MAX_GROUP_DESCRIPTION_LENGTH = 48;
 
@@ -68,10 +70,17 @@ export function getToolBilingualDescription(
   return chinese ? `${description}（${chinese}）` : description;
 }
 
+export function formatToolIdentity(rawName: string, localizedName: string): string {
+  const raw = rawName.trim() || 'Tool';
+  const localized = localizedName.trim();
+  return localized && localized !== raw ? `${raw}[${localized}]` : raw;
+}
+
 /** Compact semantic group summary with a deterministic raw-tool fallback. */
 export function buildSemanticToolSummary(
   messages: ToolPresentationInput[],
   maxEntries = 3,
+  resolveToolIdentity?: ToolIdentityResolver,
 ): string {
   const counts = new Map<string, number>();
   for (const message of messages) {
@@ -80,9 +89,8 @@ export function buildSemanticToolSummary(
       message.toolInput,
       MAX_GROUP_DESCRIPTION_LENGTH,
     );
-    const label = semantic
-      ? `${message.toolName || 'Tool'}：${semantic}`
-      : message.toolName || 'Tool';
+    const toolIdentity = resolveToolIdentity?.(message) || message.toolName || 'Tool';
+    const label = semantic ? `${toolIdentity}：${semantic}` : toolIdentity;
     counts.set(label, (counts.get(label) || 0) + 1);
   }
 

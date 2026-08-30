@@ -16,7 +16,10 @@ import {
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from '../../lib/presentation-sanitizer';
-import { getToolBilingualDescription } from '../../lib/tool-presentation';
+import {
+  formatToolIdentity,
+  getToolBilingualDescription,
+} from '../../lib/tool-presentation';
 
 interface Props {
   message: ChatMessage;
@@ -576,7 +579,7 @@ function ToolIcon({ name }: { name: string }) {
   }
 }
 
-function getToolLabel(name: string, t: (key: string) => string, input?: any): string {
+export function getToolLabel(name: string, t: (key: string) => string, input?: any): string {
   switch (name) {
     case 'Bash': return t('msg.terminal');
     case 'Read': return t('msg.readFile');
@@ -602,7 +605,8 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const input = message.toolInput;
   const semanticDescription = getToolBilingualDescription(toolName, input);
   const toolLabel = getToolLabel(toolName, t, input);
-  const label = semanticDescription ? `${toolLabel}：${semanticDescription}` : toolLabel;
+  const toolIdentity = formatToolIdentity(toolName, toolLabel);
+  const label = semanticDescription ? `${toolIdentity}：${semanticDescription}` : toolIdentity;
 
   // Compute diff stats for Edit tool
   const editDiff = toolName === 'Edit' ? computeEditDiff(input) : null;
@@ -903,13 +907,6 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
         >
           {label}
         </span>
-        {semanticDescription && (
-          <span className="flex-shrink-0 rounded border border-border-subtle/70
-            bg-bg-secondary/45 px-1 py-px text-[9px] font-mono text-text-tertiary"
-          >
-            {toolName}
-          </span>
-        )}
         {renderPreview()}
         {/* In-progress indicator: typing dots — result text is optional, completion is explicit. */}
         {!isCompleted && (
