@@ -19,6 +19,18 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.46',
+    date: '2026-08-30',
+    highlights: {
+      zh: [
+        '工具行优先展示语义描述，原始执行命令缩为短预览并保留在展开详情中',
+      ],
+      en: [
+        'Prioritizes semantic tool descriptions, reducing raw commands to short previews while preserving their full expandable details',
+      ],
+    },
+  },
+  {
     version: '0.14.45',
     date: '2026-08-30',
     highlights: {

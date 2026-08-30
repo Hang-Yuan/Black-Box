@@ -617,8 +617,10 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const renderPreview = () => {
     if (toolName === 'Bash' && input?.command) {
       return (
-        <span className="text-[11px] text-text-tertiary truncate
-          font-mono max-w-[350px] bg-bg-secondary/60 px-1.5 py-0.5 rounded">
+        <span className="min-w-[72px] max-w-[160px] flex-[0_1_160px] truncate
+          text-[11px] text-text-tertiary font-mono
+          bg-bg-secondary/60 px-1.5 py-0.5 rounded"
+          title={input.command}>
           {input.command.length > 80 ? input.command.slice(0, 80) + '…' : input.command}
         </span>
       );
@@ -886,7 +888,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     <div className={depth > 0 ? 'ml-[92px] mr-[72px] pl-3 border-l-2 border-accent/15' : 'ml-[72px] mr-[72px]'}>
       <button
         onClick={() => canExpand && setExpanded(!expanded)}
-        className={`flex items-center gap-1.5 py-1 text-left group
+        className={`flex w-full min-w-0 items-center gap-1.5 py-1 text-left group
           ${canExpand ? 'cursor-pointer' : 'cursor-default'}`}
       >
         {canExpand ? (
@@ -902,7 +904,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
         <ToolIcon name={toolName} />
         <span
           className={`text-xs font-medium text-text-muted
-            ${semanticDescription ? 'max-w-[320px] truncate' : ''}`}
+            ${semanticDescription ? 'min-w-0 flex-1 truncate' : 'flex-shrink-0'}`}
           title={semanticDescription || undefined}
         >
           {label}

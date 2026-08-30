@@ -5,8 +5,8 @@ export interface ToolPresentationInput {
 
 export type ToolIdentityResolver = (message: ToolPresentationInput) => string;
 
-const MAX_DESCRIPTION_LENGTH = 96;
-const MAX_GROUP_DESCRIPTION_LENGTH = 48;
+const MAX_DESCRIPTION_LENGTH = 240;
+const MAX_GROUP_DESCRIPTION_LENGTH = 120;
 
 const VERIFIED_CHINESE_ANNOTATIONS = new Map<string, string>([
   ['inspect one brain employee config fields', '查看单个脑员工的配置字段'],

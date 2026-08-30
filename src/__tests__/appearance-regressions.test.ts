@@ -17,6 +17,7 @@ const general = readFileSync(resolve(__dirname, '../components/settings/GeneralT
 const shell = readFileSync(resolve(__dirname, '../components/layout/AppShell.tsx'), 'utf8');
 const store = readFileSync(resolve(__dirname, '../stores/settingsStore.ts'), 'utf8');
 const messageBubble = readFileSync(resolve(__dirname, '../components/chat/MessageBubble.tsx'), 'utf8');
+const toolGroup = readFileSync(resolve(__dirname, '../components/chat/ToolGroup.tsx'), 'utf8');
 const userAvatar = readFileSync(resolve(__dirname, '../components/shared/UserAvatar.tsx'), 'utf8');
 const chatPanel = readFileSync(resolve(__dirname, '../components/chat/ChatPanel.tsx'), 'utf8');
 const providerCard = readFileSync(resolve(__dirname, '../components/settings/ProviderCard.tsx'), 'utf8');
@@ -153,6 +154,13 @@ describe('appearance system regressions', () => {
     expect(expandedToolBlock).toContain('rounded-lg border');
     expect(expandedToolBlock).toContain('max-h-60 overflow-auto overscroll-contain');
     expect(expandedToolBlock).toContain('bg-bg-secondary/35');
+  });
+
+  it('gives semantic tool descriptions priority over collapsed command previews', () => {
+    expect(messageBubble).toContain("semanticDescription ? 'min-w-0 flex-1 truncate'");
+    expect(messageBubble).toContain('min-w-[72px] max-w-[160px] flex-[0_1_160px] truncate');
+    expect(messageBubble).not.toContain("semanticDescription ? 'max-w-[320px] truncate'");
+    expect(toolGroup).toContain('min-w-0 flex-1 truncate text-[11px] text-text-tertiary');
   });
 
   it('routes primary glow, drag, provider, and crash surfaces through appearance tokens', () => {

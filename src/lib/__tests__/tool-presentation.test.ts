@@ -21,6 +21,11 @@ describe('tool presentation', () => {
     })).toBe('Inspect one brain employee config fields');
   });
 
+  it('keeps long semantic descriptions available for the wider primary field', () => {
+    const description = 'Inspect the complete employee configuration, skill bindings, organization metadata, runtime policy, and delivery status for the selected brain';
+    expect(getToolSemanticDescription('Bash', { description })).toBe(description);
+  });
+
   it('appends Chinese only for exact human-reviewed descriptions', () => {
     expect(getToolBilingualDescription('Bash', {
       description: 'Inspect one brain employee config fields',
