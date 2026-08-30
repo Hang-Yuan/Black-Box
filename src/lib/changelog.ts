@@ -19,6 +19,18 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.44',
+    date: '2026-08-30',
+    highlights: {
+      zh: [
+        '工具调用标题固定显示“工具类型：英文原始描述”；仅在命中人工确认词条时追加中文括注，未知描述不猜译',
+      ],
+      en: [
+        'Formats tool titles as “tool type: original English description” and appends Chinese only for exact human-reviewed phrases, without guessing unknown text',
+      ],
+    },
+  },
+  {
     version: '0.14.43',
     date: '2026-08-30',
     highlights: {

@@ -6,6 +6,16 @@ export interface ToolPresentationInput {
 const MAX_DESCRIPTION_LENGTH = 96;
 const MAX_GROUP_DESCRIPTION_LENGTH = 48;
 
+const VERIFIED_CHINESE_ANNOTATIONS = new Map<string, string>([
+  ['inspect one brain employee config fields', '查看单个脑员工的配置字段'],
+  ['dump all nine brains config', '导出九个大脑的配置'],
+  ['dump skillsets and meta per brain', '导出每个大脑的技能集和元数据'],
+  ['list team skills and skillset details', '列出团队技能和技能集详情'],
+  ['probe skill binding and org endpoints', '检查技能绑定和组织接口'],
+  ['grep acceptance for skill endpoints', '搜索技能接口的验收条件'],
+  ['get current time', '获取当前时间'],
+]);
+
 function redactSensitiveText(value: string): string {
   return value
     .replace(/\bsk-[a-z0-9_-]{8,}\b/gi, '•••')
@@ -42,6 +52,22 @@ export function getToolSemanticDescription(
   return cleanDescription((toolInput as { description?: unknown }).description, maxLength);
 }
 
+/**
+ * Preserve the harness text as the authority and append Chinese only for an
+ * exact, human-reviewed phrase. Unknown descriptions remain untouched.
+ */
+export function getToolBilingualDescription(
+  toolName: string | undefined,
+  toolInput: unknown,
+  maxLength = MAX_DESCRIPTION_LENGTH,
+): string | null {
+  const description = getToolSemanticDescription(toolName, toolInput, maxLength);
+  if (!description) return null;
+  const key = description.toLowerCase().replace(/[.!?]+$/g, '').trim();
+  const chinese = VERIFIED_CHINESE_ANNOTATIONS.get(key);
+  return chinese ? `${description}（${chinese}）` : description;
+}
+
 /** Compact semantic group summary with a deterministic raw-tool fallback. */
 export function buildSemanticToolSummary(
   messages: ToolPresentationInput[],
@@ -49,7 +75,7 @@ export function buildSemanticToolSummary(
 ): string {
   const counts = new Map<string, number>();
   for (const message of messages) {
-    const semantic = getToolSemanticDescription(
+    const semantic = getToolBilingualDescription(
       message.toolName,
       message.toolInput,
       MAX_GROUP_DESCRIPTION_LENGTH,

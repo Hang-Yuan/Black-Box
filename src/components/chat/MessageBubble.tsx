@@ -16,7 +16,7 @@ import {
   sanitizeAssistantTextForDisplay,
   sanitizeToolResultForDisplay,
 } from '../../lib/presentation-sanitizer';
-import { getToolSemanticDescription } from '../../lib/tool-presentation';
+import { getToolBilingualDescription } from '../../lib/tool-presentation';
 
 interface Props {
   message: ChatMessage;
@@ -600,7 +600,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const [expanded, setExpanded] = useState(false);
   const toolName = message.toolName || 'Tool';
   const input = message.toolInput;
-  const semanticDescription = getToolSemanticDescription(toolName, input);
+  const semanticDescription = getToolBilingualDescription(toolName, input);
   const toolLabel = getToolLabel(toolName, t, input);
   const label = semanticDescription ? `${toolLabel}：${semanticDescription}` : toolLabel;
 

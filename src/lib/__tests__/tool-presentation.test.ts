@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildSemanticToolSummary,
+  getToolBilingualDescription,
   getToolSemanticDescription,
 } from '../tool-presentation';
 
@@ -17,6 +18,15 @@ describe('tool presentation', () => {
     expect(getToolSemanticDescription('Bash', {
       description: 'Inspect one brain employee config fields',
     })).toBe('Inspect one brain employee config fields');
+  });
+
+  it('appends Chinese only for exact human-reviewed descriptions', () => {
+    expect(getToolBilingualDescription('Bash', {
+      description: 'Inspect one brain employee config fields',
+    })).toBe('Inspect one brain employee config fields（查看单个脑员工的配置字段）');
+    expect(getToolBilingualDescription('Bash', {
+      description: 'Inspect an unfamiliar runtime shape',
+    })).toBe('Inspect an unfamiliar runtime shape');
   });
 
   it('redacts common credential shapes before displaying descriptions', () => {
