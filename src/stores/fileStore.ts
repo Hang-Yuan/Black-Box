@@ -51,6 +51,25 @@ const _pendingChanges = new Map<string, FileChangeKind>();
 let _changeFlushRaf = 0;
 let _previewLocationRequestId = 0;
 const _folderLoadPromises = new Map<string, Promise<void>>();
+const _treeReadPromises = new Map<string, Promise<FileNode[]>>();
+let _treeRequestGeneration = 0;
+
+// A tree request returns only the selected directory's immediate children.
+// Deeper folders are hydrated by loadFolderChildren when the user expands
+// them. This keeps large workspaces out of a single Tauri IPC payload.
+export const FILE_TREE_READ_DEPTH = 0;
+
+function readTreeSingleFlight(path: string): Promise<FileNode[]> {
+  const existing = _treeReadPromises.get(path);
+  if (existing) return existing;
+
+  const task = bridge.readFileTree(path, FILE_TREE_READ_DEPTH)
+    .finally(() => {
+      _treeReadPromises.delete(path);
+    });
+  _treeReadPromises.set(path, task);
+  return task;
+}
 
 interface FileState {
   tree: FileNode[];
@@ -159,6 +178,7 @@ export const useFileStore = create<FileState>()((set, get) => ({
 
   loadTree: async (path: string) => {
     if (!path) return;
+    const requestGeneration = ++_treeRequestGeneration;
     const prevRoot = get().rootPath;
     const isNewDir = path !== prevRoot;
     const expandedFolders = isNewDir
@@ -176,13 +196,13 @@ export const useFileStore = create<FileState>()((set, get) => ({
       ...(isNewDir ? { tree: [], expandedFolders, loadingFolders: new Set<string>() } : {}),
     });
     try {
-      const tree = await bridge.readFileTree(path, 8);
-      // Guard: only apply if rootPath hasn't changed during async load
-      if (get().rootPath === path) {
+      const tree = await readTreeSingleFlight(path);
+      // Guard against both directory switches and superseding refreshes.
+      if (requestGeneration === _treeRequestGeneration && get().rootPath === path) {
         set({ tree, isLoading: false, changedFiles: new Map(), directoryMissing: false });
       }
     } catch (err) {
-      if (get().rootPath === path) {
+      if (requestGeneration === _treeRequestGeneration && get().rootPath === path) {
         const missing = String(err).includes('does not exist');
         set({ isLoading: false, directoryMissing: missing });
       }
@@ -192,17 +212,20 @@ export const useFileStore = create<FileState>()((set, get) => ({
   refreshTree: async (overridePath?: string) => {
     const dir = overridePath || get().rootPath;
     if (!dir) return;
+    const requestGeneration = ++_treeRequestGeneration;
     try {
-      const tree = await bridge.readFileTree(dir, 8);
+      const tree = await readTreeSingleFlight(dir);
+      if (requestGeneration !== _treeRequestGeneration) return;
       // Sync rootPath if override was used and differs
       if (overridePath && overridePath !== get().rootPath) {
-        set({ tree, rootPath: overridePath });
+        set({ tree, rootPath: overridePath, isLoading: false, directoryMissing: false });
       } else {
-        set({ tree });
+        set({ tree, isLoading: false, directoryMissing: false });
       }
     } catch (err) {
+      if (requestGeneration !== _treeRequestGeneration) return;
       if (String(err).includes('does not exist')) {
-        set({ directoryMissing: true, tree: [] });
+        set({ directoryMissing: true, tree: [], isLoading: false });
       }
     }
   },
@@ -554,7 +577,7 @@ export const useFileStore = create<FileState>()((set, get) => ({
         // Each expansion gets another bounded window. Repeating this at later
         // boundaries supports arbitrary depth without scanning an entire large
         // workspace during startup.
-        const children = await bridge.readFileTree(path, 8);
+        const children = await readTreeSingleFlight(path);
         if (get().rootPath === rootAtStart) {
           set({ tree: hydrateFolderChildren(get().tree, path, children) });
         }

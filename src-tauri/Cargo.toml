@@ -1,6 +1,6 @@
 [package]
 name = "blackbox"
-version = "0.14.46"
+version = "0.14.47"
 description = "Black Box - A beautiful GUI for Claude Code"
 authors = ["TinyZ"]
 license = "Apache-2.0"

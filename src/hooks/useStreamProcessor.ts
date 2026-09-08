@@ -1040,6 +1040,12 @@ const FILE_MUTATING_TOOLS = new Set([
 let _fileRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 function _scheduleFileTreeRefresh() {
+  const settings = useSettingsStore.getState();
+  if (
+    settings.mainView !== 'chat'
+    || !settings.secondaryPanelOpen
+    || settings.secondaryPanelTab !== 'files'
+  ) return;
   if (_fileRefreshTimer) return; // already scheduled
   _fileRefreshTimer = setTimeout(() => {
     _fileRefreshTimer = null;

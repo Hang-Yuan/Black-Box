@@ -56,6 +56,8 @@ function App() {
   const keepDisplayAwake = useSettingsStore((s) => s.keepDisplayAwake);
   const settingsOpen = useSettingsStore((s) => s.settingsOpen);
   const mainView = useSettingsStore((s) => s.mainView);
+  const secondaryPanelOpen = useSettingsStore((s) => s.secondaryPanelOpen);
+  const secondaryPanelTab = useSettingsStore((s) => s.secondaryPanelTab);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const lastSeenVersion = useSettingsStore((s) => s.lastSeenVersion);
   const setLastSeenVersion = useSettingsStore((s) => s.setLastSeenVersion);
@@ -63,7 +65,9 @@ function App() {
   const loadTree = useFileStore((s) => s.loadTree);
   const refreshTree = useFileStore((s) => s.refreshTree);
   const markFileChanged = useFileStore((s) => s.markFileChanged);
-  const prevDirRef = useRef<string | null>(null);
+  const fileTreeActive = mainView === 'chat'
+    && secondaryPanelOpen
+    && secondaryPanelTab === 'files';
 
   const t = useT();
 
@@ -859,30 +863,25 @@ function App() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
-  // Load file tree + start watcher when working directory changes
+  // The file tree is demand-driven. A hidden Activity/Files panel must not
+  // recursively scan or watch a restored workspace in the background.
   useEffect(() => {
-    if (!workingDirectory) return;
+    if (!workingDirectory || !fileTreeActive) return;
 
-    // Unwatch previous directory
-    if (prevDirRef.current && prevDirRef.current !== workingDirectory) {
-      bridge.unwatchDirectory(prevDirRef.current).catch(() => {});
-    }
-    prevDirRef.current = workingDirectory;
-
-    // Load tree and start watching
-    loadTree(workingDirectory);
-    bridge.watchDirectory(workingDirectory).catch(console.error);
+    void loadTree(workingDirectory);
+    void bridge.watchDirectory(workingDirectory).catch(console.error);
 
     return () => {
-      bridge.unwatchDirectory(workingDirectory).catch(() => {});
+      void bridge.unwatchDirectory(workingDirectory).catch(() => {});
     };
-  }, [workingDirectory]);
+  }, [fileTreeActive, loadTree, workingDirectory]);
 
   // Listen for file change events from the watcher
   // Debounce tree refresh for created/removed events (structure changes)
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (!fileTreeActive) return;
     const unlisten = onFileChange((event) => {
       // Defense-in-depth: skip paths under noisy directories (also filtered in Rust)
       const filtered = event.paths.filter((p) =>
@@ -908,7 +907,7 @@ function App() {
       unlisten.then((fn) => fn());
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
     };
-  }, [markFileChanged, refreshTree]);
+  }, [fileTreeActive, markFileChanged, refreshTree]);
 
   return (
     <>

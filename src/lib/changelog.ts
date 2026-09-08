@@ -19,6 +19,18 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.47',
+    date: '2026-09-08',
+    highlights: {
+      zh: [
+        '大型工作区文件树改为按目录逐层加载，关闭文件面板后停止扫描与监听，避免后台文件刷新耗尽 WebContent 内存',
+      ],
+      en: [
+        'Loads large workspace trees one directory at a time and stops scanning or watching while Files is closed, preventing background refreshes from exhausting WebContent memory',
+      ],
+    },
+  },
+  {
     version: '0.14.46',
     date: '2026-08-30',
     highlights: {
