@@ -257,6 +257,9 @@ describe('automation runtime regressions', () => {
     expect(automationBackendSource).toContain('::automation-needs-attention{');
     expect(automationBackendSource).toContain('automation_completion_recovery_prompt');
     expect(automationBackendSource).toContain('automation_needs_completion_recovery');
+    expect(automationBackendSource).toContain('AUTOMATION_COMPLETION_RECOVERY_LIMIT: usize = 3');
+    expect(automationBackendSource).toContain('for attempt in 1..=AUTOMATION_COMPLETION_RECOVERY_LIMIT');
+    expect(automationBackendSource).toContain('recover_automation_completion(');
     expect(automationBackendSource).toContain('"--resume".to_string()');
     expect(automationBackendSource).toContain('::automation-failed{');
     expect(automationBackendSource).toContain('automation_reported_failure');

@@ -210,8 +210,15 @@ export interface SessionMeta {
    *  narrowly detected provider context-drop can be retried once without
    *  duplicating the user bubble. */
   activeTurnInput?: string;
-  /** Number of automatic context-drop retries for the active user turn. */
+  /** Number of automatic context-drop or empty-terminal retries for the active turn. */
   contextRecoveryAttempts?: number;
+  /** True until the root assistant produces a displayable terminal response.
+   *  Tool calls and hidden thinking keep this set so a later empty success
+   *  result cannot silently settle the turn. */
+  awaitingVisibleAssistantResponse?: boolean;
+  /** A context-pressure compact was started by empty-terminal recovery. The
+   *  next successful compact result resumes the unfinished turn automatically. */
+  emptyTerminalRecoveryAfterCompact?: boolean;
   /** Partial assistant正文 that was visible when the user clicked Stop.
    *  Claude CLI resume does not always include interrupted assistant output,
    *  so the next user turn may need this text injected once for continuity. */

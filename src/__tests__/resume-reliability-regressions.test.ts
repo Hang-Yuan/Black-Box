@@ -170,6 +170,22 @@ describe('durable resume reliability regressions', () => {
     expect(chatStore).toContain('contextRecoveryAttempts?: number');
   });
 
+  it('keeps empty successful terminal turns on the same durable session until recovery settles', () => {
+    const stream = read('hooks/useStreamProcessor.ts');
+    const input = read('components/chat/InputBar.tsx');
+    const recovery = read('lib/context-recovery.ts');
+    const chatStore = read('stores/chatStore.ts');
+    expect(stream).toContain('handleEmptyTerminalRecoveryResult({');
+    expect(stream).toContain('assistantContentHasVisibleTerminalResponse(content)');
+    expect(stream).toContain('effectiveContextInputTokens(msg.usage)');
+    expect(stream).toContain("bridge.sendStdin(stdinId, EMPTY_TERMINAL_RECOVERY_PROMPT)");
+    expect(stream).toContain("bridge.sendStdin(stdinId, '/compact')");
+    expect(input).toContain('awaitingVisibleAssistantResponse: true');
+    expect(chatStore).toContain('emptyTerminalRecoveryAfterCompact?: boolean');
+    expect(recovery).toContain('EMPTY_TERMINAL_RECOVERY_LIMIT = 3');
+    expect(recovery).toContain("| 'resume_after_compact'");
+  });
+
   it('uses graceful process settlement for internal restart paths', () => {
     const source = read('lib/sessionLifecycle.ts');
     expect(source).toContain("const stopProcess = reason === 'stop'");

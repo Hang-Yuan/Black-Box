@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assistantContentHasVisibleTerminalResponse,
+  decideEmptyTerminalRecovery,
+  effectiveContextInputTokens,
+  EMPTY_TERMINAL_RECOVERY_LIMIT,
   isGenericContextGreeting,
   isGreetingOnlyPrompt,
   shouldRetryContextDrop,
@@ -62,5 +66,85 @@ describe('context-drop recovery signature', () => {
       subtype: 'success',
       attempts: 1,
     })).toBe(false);
+  });
+
+  it('treats empty thinking and filtered placeholders as missing terminal output', () => {
+    expect(assistantContentHasVisibleTerminalResponse([
+      { type: 'thinking', thinking: '' },
+    ])).toBe(false);
+    expect(assistantContentHasVisibleTerminalResponse([
+      { type: 'text', text: 'No response requested.' },
+    ])).toBe(false);
+    expect(assistantContentHasVisibleTerminalResponse([
+      { type: 'text', text: 'Finished with a visible result.' },
+    ])).toBe(true);
+    expect(assistantContentHasVisibleTerminalResponse([
+      { type: 'tool_use', name: 'Bash' },
+    ])).toBe(false);
+    expect(assistantContentHasVisibleTerminalResponse([
+      { type: 'tool_use', name: 'AskUserQuestion' },
+    ])).toBe(true);
+  });
+
+  it('counts cached input toward context pressure', () => {
+    expect(effectiveContextInputTokens({
+      input_tokens: 8,
+      cache_creation_input_tokens: 4_622,
+      cache_read_input_tokens: 148_675,
+    })).toBe(153_305);
+  });
+
+  it('recovers empty terminal success on the same session with bounded retries', () => {
+    const base = {
+      subtype: 'success',
+      activeTurnInput: '继续当前任务',
+      awaitingVisibleAssistantResponse: true,
+      resultAddsVisibleText: false,
+      stdinAvailable: true,
+      pendingCommand: false,
+      recoveryCompactPending: false,
+      autoCompactThreshold: 160_000,
+      compactAlreadyFired: false,
+    } as const;
+    expect(decideEmptyTerminalRecovery({
+      ...base,
+      attempts: 0,
+      contextInputTokens: 80_000,
+    })).toBe('retry');
+    expect(decideEmptyTerminalRecovery({
+      ...base,
+      attempts: 0,
+      contextInputTokens: 153_305,
+    })).toBe('compact');
+    expect(decideEmptyTerminalRecovery({
+      ...base,
+      attempts: EMPTY_TERMINAL_RECOVERY_LIMIT,
+      contextInputTokens: 80_000,
+    })).toBe('fail');
+    expect(decideEmptyTerminalRecovery({
+      ...base,
+      recoveryCompactPending: true,
+    })).toBe('resume_after_compact');
+  });
+
+  it('does not replay completed, failed, command, or already visible turns', () => {
+    const base = {
+      subtype: 'success',
+      activeTurnInput: '继续',
+      awaitingVisibleAssistantResponse: true,
+      resultAddsVisibleText: false,
+      attempts: 0,
+      stdinAvailable: true,
+      pendingCommand: false,
+      recoveryCompactPending: false,
+    };
+    expect(decideEmptyTerminalRecovery({ ...base, subtype: 'error' })).toBe('none');
+    expect(decideEmptyTerminalRecovery({ ...base, activeTurnInput: undefined })).toBe('none');
+    expect(decideEmptyTerminalRecovery({ ...base, pendingCommand: true })).toBe('none');
+    expect(decideEmptyTerminalRecovery({ ...base, resultAddsVisibleText: true })).toBe('none');
+    expect(decideEmptyTerminalRecovery({
+      ...base,
+      awaitingVisibleAssistantResponse: false,
+    })).toBe('none');
   });
 });

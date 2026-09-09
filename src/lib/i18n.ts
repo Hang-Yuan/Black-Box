@@ -324,6 +324,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'error.cliExitedSilently': 'CLI 意外退出且无输出，请检查 CLI 是否已正确安装（设置 → CLI），以及 API 配置是否正确。',
     'error.userStopped': '已手动停止',
     'error.turnFailed': 'AI 响应异常中断',
+    'error.emptyTerminalExhausted': '模型连续返回空结果，自动恢复已停止，原会话仍保留。可切换到 Fable 5.1 后发送“继续”；如尚未压缩上下文，也可先执行 /compact。',
+    'error.emptyTerminalRecoveryFailed': '空结果自动恢复未能发送，原会话仍保留。请重试，或切换到 Fable 5.1 后继续。',
 
     // FilePreview
     'filePreview.htmlStaticPreview': '静态 HTML 预览（脚本已禁用）',
@@ -1795,6 +1797,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'error.cliExitedSilently': 'CLI process exited unexpectedly without output. Please check that Claude CLI is installed correctly (Settings → CLI) and that your API provider is configured.',
     'error.userStopped': 'Manually stopped',
     'error.turnFailed': 'AI response interrupted unexpectedly',
+    'error.emptyTerminalExhausted': 'The model returned empty results repeatedly, so automatic recovery stopped. The original thread is preserved. Continue with Fable 5.1, or run /compact first if the context has not been compacted.',
+    'error.emptyTerminalRecoveryFailed': 'The empty-result recovery could not be sent. The original thread is preserved. Retry, or continue with Fable 5.1.',
 
     // FilePreview
     'filePreview.htmlStaticPreview': 'Static HTML preview (scripts disabled)',

@@ -19,6 +19,18 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.49',
+    date: '2026-09-09',
+    highlights: {
+      zh: [
+        '拦截模型无可见终答却返回成功的回合，在原会话内有限续跑；上下文压力过高时先自动压缩，排程任务也会保留收据链并完成最多三次恢复',
+      ],
+      en: [
+        'Intercepts successful turns with no visible final response and retries them within the original thread; compacts first under high context pressure and gives scheduled runs up to three receipt-preserving recovery attempts',
+      ],
+    },
+  },
+  {
     version: '0.14.47',
     date: '2026-09-08',
     highlights: {

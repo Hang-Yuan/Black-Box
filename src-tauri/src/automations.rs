@@ -346,7 +346,8 @@ struct AutomationExecution {
     output: String,
     trace: Vec<AutomationTraceEvent>,
     session_id: Option<String>,
-    /// Position of the most recent root-agent assistant event in stdout.
+    /// Position of the most recent root-agent assistant event with visible text.
+    /// Thinking-only and tool-use-only events are progress, not final synthesis.
     last_main_assistant_event: Option<u64>,
     /// Position of the most recent completed background Agent notification.
     last_agent_completion_event: Option<u64>,
@@ -3126,10 +3127,16 @@ fn automation_prompt(
     )))
 }
 
-fn automation_completion_recovery_prompt(definition: &AutomationDefinition) -> String {
+const AUTOMATION_COMPLETION_RECOVERY_LIMIT: usize = 3;
+
+fn automation_completion_recovery_prompt(
+    definition: &AutomationDefinition,
+    attempt: usize,
+) -> String {
     format!(
-        "<automation_completion_recovery>\nThe scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. End with exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}.\n</automation_completion_recovery>",
+        "<automation_completion_recovery>\nRecovery attempt {attempt}/{limit}. The scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. End with exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}.\n</automation_completion_recovery>",
         id = definition.id,
+        limit = AUTOMATION_COMPLETION_RECOVERY_LIMIT,
     )
 }
 
@@ -3178,9 +3185,6 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
         match event.get("type").and_then(Value::as_str) {
             Some("assistant") => {
                 let parent_tool_use_id = event_string(&event, &["parent_tool_use_id"]);
-                if parent_tool_use_id.is_none() {
-                    last_main_assistant_event = Some(event_position);
-                }
                 let event_agent_id = event_string(&event, &["agent_id", "agentId"]);
                 let agent_depth = parent_tool_use_id
                     .as_ref()
@@ -3199,6 +3203,20 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
                     .get("message")
                     .and_then(|message| message.get("content"))
                     .and_then(Value::as_array);
+                let has_visible_text = blocks
+                    .map(|items| {
+                        items.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("text")
+                                && block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.trim().is_empty())
+                        })
+                    })
+                    .unwrap_or(false);
+                if parent_tool_use_id.is_none() && has_visible_text {
+                    last_main_assistant_event = Some(event_position);
+                }
                 for block in blocks.into_iter().flatten() {
                     if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                         continue;
@@ -3974,6 +3992,63 @@ fn merge_automation_executions(
     }
 }
 
+async fn recover_automation_completion(
+    definition: &AutomationDefinition,
+    scheduled_at: Option<i64>,
+    run_id: &str,
+    execution_cwd: &Path,
+    session_target: &AutomationSessionTarget,
+    mut execution: AutomationExecution,
+) -> Result<AutomationExecution, AutomationExecutionError> {
+    let resume_target = AutomationSessionTarget {
+        session_id: session_target.session_id.clone(),
+        arguments: vec!["--resume".to_string(), session_target.session_id.clone()],
+        creates_new_session: false,
+    };
+    for attempt in 1..=AUTOMATION_COMPLETION_RECOVERY_LIMIT {
+        if !automation_needs_completion_recovery(&execution) {
+            break;
+        }
+        let recovery_prompt = automation_completion_recovery_prompt(definition, attempt);
+        match invoke_claude(
+            definition,
+            scheduled_at,
+            run_id,
+            execution_cwd,
+            &resume_target,
+            Some(&recovery_prompt),
+        )
+        .await
+        {
+            Ok(continuation) => {
+                execution = merge_automation_executions(execution, continuation);
+            }
+            Err(mut error) => {
+                let output = if error.output.trim().is_empty() {
+                    execution.output
+                } else {
+                    format!(
+                        "{}\n\n{}",
+                        execution.output.trim_end(),
+                        error.output.trim_start()
+                    )
+                };
+                let mut trace = execution.trace;
+                trace.append(&mut error.trace);
+                return Err(AutomationExecutionError {
+                    message: format!(
+                        "Scheduled task completion recovery failed on attempt {attempt}: {}",
+                        error.message
+                    ),
+                    trace,
+                    output,
+                });
+            }
+        }
+    }
+    Ok(execution)
+}
+
 fn record_successful_retry(
     connection: &Connection,
     original_run_id: &str,
@@ -4230,56 +4305,16 @@ async fn execute_automation(
                                 )
                                 .await;
                                 match first_execution {
-                                    Ok(execution)
-                                        if definition.kind == "cron"
-                                            && automation_needs_completion_recovery(&execution) =>
-                                    {
-                                        let recovery_prompt =
-                                            automation_completion_recovery_prompt(&definition);
-                                        let resume_target = AutomationSessionTarget {
-                                            session_id: session_target.session_id.clone(),
-                                            arguments: vec![
-                                                "--resume".to_string(),
-                                                session_target.session_id.clone(),
-                                            ],
-                                            creates_new_session: false,
-                                        };
-                                        match invoke_claude(
+                                    Ok(execution) if definition.kind == "cron" => {
+                                        recover_automation_completion(
                                             &definition,
                                             scheduled_at,
                                             &run_id,
                                             &directory.execution_cwd,
-                                            &resume_target,
-                                            Some(&recovery_prompt),
+                                            &session_target,
+                                            execution,
                                         )
                                         .await
-                                        {
-                                            Ok(continuation) => Ok(merge_automation_executions(
-                                                execution,
-                                                continuation,
-                                            )),
-                                            Err(mut error) => {
-                                                let output = if error.output.trim().is_empty() {
-                                                    execution.output
-                                                } else {
-                                                    format!(
-                                                        "{}\n\n{}",
-                                                        execution.output.trim_end(),
-                                                        error.output.trim_start()
-                                                    )
-                                                };
-                                                let mut trace = execution.trace;
-                                                trace.append(&mut error.trace);
-                                                Err(AutomationExecutionError {
-                                                    message: format!(
-                                                        "Scheduled task completion recovery failed: {}",
-                                                        error.message
-                                                    ),
-                                                    trace,
-                                                    output,
-                                                })
-                                            }
-                                        }
                                     }
                                     other => other,
                                 }
@@ -6806,7 +6841,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_runs_resume_once_when_terminal_synthesis_is_missing() {
+    fn scheduled_runs_use_bounded_same_session_completion_recovery() {
         let incomplete = AutomationExecution {
             output: "Background extraction finished; waiting for results.".to_string(),
             trace: vec![tool_result(1, "Completed")],
@@ -6822,13 +6857,49 @@ mod tests {
         };
         assert!(!automation_needs_completion_recovery(&explicit_failure));
 
-        let prompt = automation_completion_recovery_prompt(&AutomationDefinition {
-            id: "daily-review-dream".to_string(),
-            ..Default::default()
-        });
+        let prompt = automation_completion_recovery_prompt(
+            &AutomationDefinition {
+                id: "daily-review-dream".to_string(),
+                ..Default::default()
+            },
+            1,
+        );
         assert!(prompt.contains("Resume the SAME durable session"));
         assert!(prompt.contains("do not end with progress narration"));
         assert!(prompt.contains("::automation-failed"));
+        assert!(prompt.contains("Recovery attempt 1/3"));
+        assert_eq!(AUTOMATION_COMPLETION_RECOVERY_LIMIT, 3);
+    }
+
+    #[test]
+    fn repeated_empty_recovery_stays_incomplete_until_a_final_directive_arrives() {
+        let initial = AutomationExecution {
+            output: "Work is still in progress.\n::inbox-item{title=\"Early\" summary=\"Agent work still running\"}".to_string(),
+            trace: vec![tool_result(1, "Completed")],
+            session_id: Some("session-1".to_string()),
+            last_main_assistant_event: Some(2),
+            last_agent_completion_event: Some(3),
+        };
+        let empty = AutomationExecution {
+            output: String::new(),
+            trace: vec![],
+            session_id: Some("session-1".to_string()),
+            last_main_assistant_event: None,
+            last_agent_completion_event: None,
+        };
+        let still_incomplete = merge_automation_executions(initial, empty);
+        assert!(automation_needs_completion_recovery(&still_incomplete));
+
+        let final_result = AutomationExecution {
+            output: "Finished.\n::inbox-item{title=\"Done\" summary=\"Closed\"}".to_string(),
+            trace: vec![],
+            session_id: Some("session-1".to_string()),
+            last_main_assistant_event: Some(1),
+            last_agent_completion_event: None,
+        };
+        let completed = merge_automation_executions(still_incomplete, final_result);
+        assert!(!automation_needs_completion_recovery(&completed));
+        assert!(automation_reported_failure(&completed, true).is_none());
     }
 
     #[test]
@@ -7003,10 +7074,32 @@ mod tests {
                 && event.summary == "Completed"
                 && event.agent_type.as_deref() == Some("plugin:worker")
         }));
-        assert!(
-            execution.last_agent_completion_event.unwrap()
-                > execution.last_main_assistant_event.unwrap()
+        assert!(execution.last_main_assistant_event.is_none());
+        assert!(execution.last_agent_completion_event.is_some());
+    }
+
+    #[test]
+    fn stream_execution_does_not_accept_empty_thinking_as_final_synthesis() {
+        let stdout = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Early result"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"agent-1","name":"Agent","input":{"prompt":"work"}}]}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"task_started","task_id":"task-1","tool_use_id":"agent-1"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"agent-1","status":"completed"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Early result\n::inbox-item{title=\"Early\" summary=\"Agent work still running\"}"}"#,
+            "\n",
         );
+        let execution = parse_stream_execution(stdout).unwrap();
+        assert!(
+            execution.last_main_assistant_event.unwrap()
+                < execution.last_agent_completion_event.unwrap()
+        );
+        assert!(automation_needs_completion_recovery(&execution));
     }
 
     #[test]

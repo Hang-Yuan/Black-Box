@@ -844,6 +844,8 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       pendingTurnAttachments: undefined,
       activeTurnInput: undefined,
       contextRecoveryAttempts: undefined,
+      awaitingVisibleAssistantResponse: undefined,
+      emptyTerminalRecoveryAfterCompact: undefined,
       interruptedAssistantText,
     });
 

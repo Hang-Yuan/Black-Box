@@ -1129,6 +1129,8 @@ export function InputBar() {
       goalRequestActive?: boolean;
       activeTurnInput?: string;
       contextRecoveryAttempts?: number;
+      awaitingVisibleAssistantResponse?: boolean;
+      emptyTerminalRecoveryAfterCompact?: boolean;
     };
     if (silentRestartRef.current) {
       silentRestartRef.current = false;
@@ -1138,6 +1140,8 @@ export function InputBar() {
         pendingTurnAttachments: undefined,
         activeTurnInput: undefined,
         contextRecoveryAttempts: undefined,
+        awaitingVisibleAssistantResponse: undefined,
+        emptyTerminalRecoveryAfterCompact: undefined,
       };
     } else {
       const pendingTurnMessageId = generateMessageId();
@@ -1156,6 +1160,8 @@ export function InputBar() {
         goalRequestActive: submittedViaGoal,
         activeTurnInput: submittedUserText,
         contextRecoveryAttempts: 0,
+        awaitingVisibleAssistantResponse: true,
+        emptyTerminalRecoveryAfterCompact: false,
       };
     }
 
@@ -1184,6 +1190,8 @@ export function InputBar() {
           pendingTurnAttachments: undefined,
           activeTurnInput: undefined,
           contextRecoveryAttempts: undefined,
+          awaitingVisibleAssistantResponse: undefined,
+          emptyTerminalRecoveryAfterCompact: undefined,
         });
         if (savedFiles.length > 0) setFiles(savedFiles);
         return;
@@ -1217,6 +1225,8 @@ export function InputBar() {
           pendingTurnAttachments: undefined,
           activeTurnInput: undefined,
           contextRecoveryAttempts: undefined,
+          awaitingVisibleAssistantResponse: undefined,
+          emptyTerminalRecoveryAfterCompact: undefined,
         });
         if (savedFiles.length > 0) setFiles(savedFiles);
         return;
@@ -1581,6 +1591,8 @@ export function InputBar() {
         pendingTurnAttachments: undefined,
         activeTurnInput: undefined,
         contextRecoveryAttempts: undefined,
+        awaitingVisibleAssistantResponse: undefined,
+        emptyTerminalRecoveryAfterCompact: undefined,
       });
       if (savedFiles.length > 0) setFiles(savedFiles);
     }

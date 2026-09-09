@@ -1,3 +1,8 @@
+import {
+  isCliPlaceholder,
+  sanitizeAssistantTextForDisplay,
+} from './presentation-sanitizer';
+
 export interface ContextDropUsage {
   input_tokens?: number;
   output_tokens?: number;
@@ -11,6 +16,35 @@ export interface ContextDropRecoveryCandidate {
   usage?: ContextDropUsage;
   subtype?: string;
   attempts?: number;
+}
+
+export const EMPTY_TERMINAL_RECOVERY_LIMIT = 3;
+export const EMPTY_TERMINAL_RECOVERY_PROMPT = [
+  'Continue the unfinished task from the current durable session.',
+  'The previous turn returned without a user-visible final response.',
+  'Do not repeat completed work. Inspect the latest tool results and durable receipts,',
+  'finish the pending steps, and end with a concise user-visible result.',
+].join(' ');
+
+export type EmptyTerminalRecoveryAction =
+  | 'none'
+  | 'retry'
+  | 'compact'
+  | 'resume_after_compact'
+  | 'fail';
+
+export interface EmptyTerminalRecoveryCandidate {
+  subtype?: string;
+  activeTurnInput?: string;
+  awaitingVisibleAssistantResponse?: boolean;
+  resultAddsVisibleText?: boolean;
+  attempts?: number;
+  stdinAvailable?: boolean;
+  pendingCommand?: boolean;
+  recoveryCompactPending?: boolean;
+  contextInputTokens?: number;
+  autoCompactThreshold?: number;
+  compactAlreadyFired?: boolean;
 }
 
 const GENERIC_GREETING_RESPONSES = new Set([
@@ -38,6 +72,81 @@ export function isGenericContextGreeting(value: string | undefined): boolean {
 export function isGreetingOnlyPrompt(value: string | undefined): boolean {
   if (!value) return true;
   return GREETING_ONLY_PROMPTS.test(value.trim());
+}
+
+/**
+ * A terminal turn is trustworthy only after the root assistant produced text
+ * that survives presentation sanitization, or an interactive question that is
+ * itself the user-visible response. Thinking and ordinary tool calls are
+ * progress evidence, but they do not close the user's turn.
+ */
+export function assistantContentHasVisibleTerminalResponse(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => {
+    if (!block || typeof block !== 'object') return true;
+    const candidate = block as { type?: unknown; text?: unknown; name?: unknown };
+    if (candidate.type === 'text') {
+      if (typeof candidate.text !== 'string' || isCliPlaceholder(candidate.text)) return false;
+      return sanitizeAssistantTextForDisplay(candidate.text).trim().length > 0;
+    }
+    if (candidate.type === 'tool_use') {
+      return candidate.name === 'AskUserQuestion';
+    }
+    if (candidate.type === 'thinking' || candidate.type === 'redacted_thinking') {
+      return false;
+    }
+    // Unknown future block types fail closed: do not risk replaying a turn that
+    // may already have produced a visible or interactive result.
+    return true;
+  });
+}
+
+/** Anthropic reports cached and uncached input separately; all three occupy context. */
+export function effectiveContextInputTokens(usage: ContextDropUsage | undefined): number {
+  return [
+    usage?.input_tokens,
+    usage?.cache_creation_input_tokens,
+    usage?.cache_read_input_tokens,
+  ].reduce((sum: number, value) => (
+    sum + (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0)
+  ), 0);
+}
+
+/**
+ * Decide one bounded recovery step for a successful CLI result that did not
+ * close the user's turn with visible output.
+ */
+export function decideEmptyTerminalRecovery(
+  candidate: EmptyTerminalRecoveryCandidate,
+): EmptyTerminalRecoveryAction {
+  if (candidate.recoveryCompactPending) {
+    return candidate.subtype === 'success' && candidate.stdinAvailable
+      ? 'resume_after_compact'
+      : 'none';
+  }
+  if (
+    candidate.subtype !== 'success'
+    || !candidate.activeTurnInput?.trim()
+    || !candidate.awaitingVisibleAssistantResponse
+    || candidate.resultAddsVisibleText
+    || candidate.pendingCommand
+  ) {
+    return 'none';
+  }
+  const attempts = candidate.attempts ?? 0;
+  if (!candidate.stdinAvailable || attempts >= EMPTY_TERMINAL_RECOVERY_LIMIT) {
+    return 'fail';
+  }
+  const compactThreshold = candidate.autoCompactThreshold ?? 0;
+  const recoveryCompactThreshold = Math.floor(compactThreshold * 0.9);
+  if (
+    !candidate.compactAlreadyFired
+    && compactThreshold > 0
+    && (candidate.contextInputTokens ?? 0) >= recoveryCompactThreshold
+  ) {
+    return 'compact';
+  }
+  return 'retry';
 }
 
 /**

@@ -28,6 +28,10 @@ import { bridge } from '../lib/tauri-bridge';
 import { spawnConfigHash, getAutoCompactThreshold } from '../lib/api-provider';
 import { buildApiRetryStatus } from '../lib/api-retry';
 import {
+  assistantContentHasVisibleTerminalResponse,
+  decideEmptyTerminalRecovery,
+  effectiveContextInputTokens,
+  EMPTY_TERMINAL_RECOVERY_PROMPT,
   isGenericContextGreeting,
   isGreetingOnlyPrompt,
   shouldRetryContextDrop,
@@ -326,6 +330,153 @@ export function markPendingCommandSlow(tabId: string, commandId: string, statusT
   return true;
 }
 
+interface EmptyTerminalRecoveryResultArgs {
+  tabId: string;
+  stdinId: string | undefined;
+  subtype: string | undefined;
+  resultDisplayText: string;
+  usage: any;
+}
+
+/**
+ * Keep a successful CLI result from silently settling an unfinished turn.
+ * Recovery stays on the same stdin/durable session, is bounded, and compacts
+ * once before retrying when cached + uncached input is close to the window.
+ */
+function handleEmptyTerminalRecoveryResult({
+  tabId,
+  stdinId,
+  subtype,
+  resultDisplayText,
+  usage,
+}: EmptyTerminalRecoveryResultArgs): boolean {
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  const meta = tab?.sessionMeta ?? {};
+  const safeResult = resultDisplayText.trim();
+  const resultAddsVisibleText = Boolean(
+    safeResult
+    && !isCliPlaceholder(safeResult)
+    && !(tab?.messages ?? []).some(
+      (message) => message.role === 'assistant'
+        && message.type === 'text'
+        && message.content === safeResult,
+    ),
+  );
+  const action = decideEmptyTerminalRecovery({
+    subtype,
+    activeTurnInput: meta.activeTurnInput,
+    awaitingVisibleAssistantResponse: meta.awaitingVisibleAssistantResponse,
+    resultAddsVisibleText,
+    attempts: meta.contextRecoveryAttempts,
+    stdinAvailable: Boolean(stdinId),
+    pendingCommand: Boolean(meta.pendingCommandMsgId),
+    recoveryCompactPending: meta.emptyTerminalRecoveryAfterCompact,
+    contextInputTokens: effectiveContextInputTokens(usage),
+    autoCompactThreshold: getAutoCompactThreshold(meta.spawnedModel),
+    compactAlreadyFired: hasAutoCompactFired(tabId),
+  });
+  if (action === 'none') return false;
+
+  const failRecovery = (messageKey: 'error.emptyTerminalExhausted' | 'error.emptyTerminalRecoveryFailed') => {
+    completePendingCommand(tabId, { output: t(messageKey) });
+    store.setSessionStatus(tabId, 'error');
+    store.setActivityStatus(tabId, { phase: 'error' });
+    store.setSessionMeta(tabId, {
+      turnStartTime: undefined,
+      lastProgressAt: undefined,
+      apiRetry: undefined,
+      activeTurnInput: undefined,
+      contextRecoveryAttempts: undefined,
+      awaitingVisibleAssistantResponse: undefined,
+      emptyTerminalRecoveryAfterCompact: undefined,
+    });
+    store.addMessage(tabId, {
+      id: generateMessageId(),
+      role: 'system',
+      type: 'text',
+      content: t(messageKey),
+      commandType: 'error',
+      timestamp: Date.now(),
+    });
+  };
+
+  if (action === 'fail' || !stdinId) {
+    console.error('[BLACKBOX] Empty terminal response recovery exhausted', { tabId });
+    failRecovery('error.emptyTerminalExhausted');
+    return true;
+  }
+
+  const attempts = meta.contextRecoveryAttempts ?? 0;
+  const startedAt = Date.now();
+  if (action === 'compact') {
+    const compactMsgId = generateMessageId();
+    markAutoCompactFired(tabId);
+    store.addMessage(tabId, {
+      id: compactMsgId,
+      role: 'system',
+      type: 'text',
+      content: t('chat.autoCompacting'),
+      commandType: 'processing',
+      commandData: { command: '/compact', automatic: true, recovery: true },
+      commandStartTime: startedAt,
+      commandCompleted: false,
+      timestamp: startedAt,
+    });
+    store.setSessionMeta(tabId, {
+      pendingCommandMsgId: compactMsgId,
+      contextRecoveryAttempts: attempts + 1,
+      awaitingVisibleAssistantResponse: true,
+      emptyTerminalRecoveryAfterCompact: true,
+      turnStartTime: startedAt,
+      lastProgressAt: startedAt,
+      inputTokens: 0,
+      outputTokens: 0,
+      apiRetry: undefined,
+    });
+    store.setSessionStatus(tabId, 'running');
+    store.setActivityStatus(tabId, { phase: 'thinking' });
+    console.warn('[BLACKBOX] Empty terminal response near context limit; compacting before recovery', {
+      tabId,
+      contextInputTokens: effectiveContextInputTokens(usage),
+    });
+    bridge.sendStdin(stdinId, '/compact').catch((error) => {
+      console.error('[BLACKBOX] Empty terminal recovery compact failed:', error);
+      failRecovery('error.emptyTerminalRecoveryFailed');
+    });
+    setTimeout(() => {
+      if (store.getTab(tabId)?.sessionMeta.pendingCommandMsgId === compactMsgId) {
+        markPendingCommandSlow(tabId, compactMsgId, t('chat.compactStillRunning'));
+      }
+    }, 15_000);
+    return true;
+  }
+
+  completePendingCommand(tabId);
+  store.setSessionMeta(tabId, {
+    contextRecoveryAttempts: action === 'retry' ? attempts + 1 : attempts,
+    awaitingVisibleAssistantResponse: true,
+    emptyTerminalRecoveryAfterCompact: false,
+    turnStartTime: startedAt,
+    lastProgressAt: startedAt,
+    inputTokens: 0,
+    outputTokens: 0,
+    apiRetry: undefined,
+  });
+  store.setSessionStatus(tabId, 'running');
+  store.setActivityStatus(tabId, { phase: 'thinking' });
+  console.warn('[BLACKBOX] Empty terminal response detected; resuming durable session', {
+    tabId,
+    attempt: action === 'retry' ? attempts + 1 : attempts,
+    afterCompact: action === 'resume_after_compact',
+  });
+  bridge.sendStdin(stdinId, EMPTY_TERMINAL_RECOVERY_PROMPT).catch((error) => {
+    console.error('[BLACKBOX] Empty terminal recovery retry failed:', error);
+    failRecovery('error.emptyTerminalRecoveryFailed');
+  });
+  return true;
+}
+
 interface DrainPendingQueueOptions {
   tabId: string;
   stdinId: string | undefined;
@@ -452,6 +603,8 @@ export function drainPendingQueueAfterSettlement({
     pendingTurnInput: queuedText,
     activeTurnInput: queuedText,
     contextRecoveryAttempts: 0,
+    awaitingVisibleAssistantResponse: true,
+    emptyTerminalRecoveryAfterCompact: false,
     turnAcceptedForResume: false,
     turnStartTime: Date.now(),
     lastProgressAt: Date.now(),
@@ -471,6 +624,8 @@ export function drainPendingQueueAfterSettlement({
       pendingReadyMessage: undefined,
       activeTurnInput: undefined,
       contextRecoveryAttempts: undefined,
+      awaitingVisibleAssistantResponse: undefined,
+      emptyTerminalRecoveryAfterCompact: undefined,
     });
     store.setSessionStatus(tabId, 'error');
   });
@@ -547,6 +702,8 @@ function markStdinReady(tabId: string, stdinId: string | undefined, model: strin
             pendingTurnAttachments: undefined,
             activeTurnInput: undefined,
             contextRecoveryAttempts: undefined,
+            awaitingVisibleAssistantResponse: undefined,
+            emptyTerminalRecoveryAfterCompact: undefined,
             turnStartTime: undefined,
             lastProgressAt: undefined,
             apiRetry: undefined,
@@ -1483,6 +1640,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           // The lead conversation waits for the main agent's synthesis.
           break;
         }
+        store.setSessionMeta(tabId, {
+          awaitingVisibleAssistantResponse:
+            !assistantContentHasVisibleTerminalResponse(content),
+        });
         const bgBufferedThinking = bgStdinId
           ? streamController.peekBufferedThinking(bgStdinId)
           : undefined;
@@ -1722,6 +1883,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
         const userContent = msg.message?.content;
         if (Array.isArray(userContent)) {
+          if (
+            !isForwardedSubagentEvent(msg)
+            && userContent.some((block: any) => block.type === 'tool_result')
+          ) {
+            store.setSessionMeta(tabId, { awaitingVisibleAssistantResponse: true });
+          }
           for (const block of userContent) {
             if (block.type === 'tool_result') {
               const resultText = Array.isArray(block.content)
@@ -1750,6 +1917,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'tool_result': {
+        if (!isForwardedSubagentEvent(msg)) {
+          store.setSessionMeta(tabId, { awaitingVisibleAssistantResponse: true });
+        }
         const resultContent = Array.isArray(msg.content)
           ? msg.content.map((b: any) => typeof b.text === 'string' ? b.text : typeof b.content === 'string' ? b.content : '').join('')
           : typeof msg.content === 'string' ? msg.content : msg.output || '';
@@ -1836,6 +2006,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               apiRetry: undefined,
               activeTurnInput: undefined,
               contextRecoveryAttempts: undefined,
+              awaitingVisibleAssistantResponse: undefined,
+              emptyTerminalRecoveryAfterCompact: undefined,
             });
           }
           useSessionStore.getState().fetchSessions();
@@ -1878,6 +2050,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           store.setActivityStatus(tabId, { phase: 'thinking' });
           store.setSessionMeta(tabId, {
             contextRecoveryAttempts: (bgRecoveryMeta?.contextRecoveryAttempts ?? 0) + 1,
+            awaitingVisibleAssistantResponse: true,
+            emptyTerminalRecoveryAfterCompact: false,
             turnStartTime: retryStartedAt,
             lastProgressAt: retryStartedAt,
             inputTokens: 0,
@@ -1892,6 +2066,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             store.setSessionMeta(tabId, {
               activeTurnInput: undefined,
               contextRecoveryAttempts: undefined,
+              awaitingVisibleAssistantResponse: undefined,
+              emptyTerminalRecoveryAfterCompact: undefined,
             });
             store.setSessionStatus(tabId, 'error');
             store.addMessage(tabId, {
@@ -1903,6 +2079,16 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               timestamp: Date.now(),
             });
           });
+          break;
+        }
+
+        if (handleEmptyTerminalRecoveryResult({
+          tabId,
+          stdinId: bgResultStdinId,
+          subtype: msg.subtype,
+          resultDisplayText: bgResultDisplayText,
+          usage: msg.usage,
+        })) {
           break;
         }
 
@@ -1943,6 +2129,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             apiRetry: undefined,
             activeTurnInput: undefined,
             contextRecoveryAttempts: undefined,
+            awaitingVisibleAssistantResponse: undefined,
+            emptyTerminalRecoveryAfterCompact: undefined,
           });
         }
         if (bgResultDisplayText && !isCliPlaceholder(bgResultDisplayText)) {
@@ -1966,7 +2154,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         let bgAutoCompactTriggered = false;
         {
           const bgCompactTab = store.getTab(tabId);
-          const bgResultInputTokens = msg.usage?.input_tokens || 0;
+          const bgResultInputTokens = effectiveContextInputTokens(msg.usage);
           const bgCompactStdinId = bgCompactTab?.sessionMeta.stdinId;
           const bgCompactThreshold = getAutoCompactThreshold(bgCompactTab?.sessionMeta.spawnedModel);
           if (bgResultInputTokens > bgCompactThreshold && !hasAutoCompactFired(tabId) && bgCompactStdinId && msg.subtype === 'success') {
@@ -2765,6 +2953,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           break;
         }
 
+        setSessionMeta({
+          awaitingVisibleAssistantResponse:
+            !assistantContentHasVisibleTerminalResponse(content),
+        });
+
         // With --include-partial-messages, intermediate assistant messages arrive
         // frequently. We must NOT aggressively wipe streaming text state when the
         // message only contains a thinking block (no text block yet).
@@ -3114,6 +3307,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
         const userContent = msg.message?.content;
         if (Array.isArray(userContent)) {
+          if (
+            !isForwardedSubagentEvent(msg)
+            && userContent.some((block: any) => block.type === 'tool_result')
+          ) {
+            setSessionMeta({ awaitingVisibleAssistantResponse: true });
+          }
           for (const block of userContent) {
             if (block.type === 'tool_result') {
               const resultText = Array.isArray(block.content)
@@ -3185,6 +3384,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           agentActions.updatePhase(agentId, 'thinking');
           break;
         }
+        setSessionMeta({ awaitingVisibleAssistantResponse: true });
 
         const toolUseId = msg.tool_use_id;
         // Auto-refresh file tree when file-mutating tools complete
@@ -3300,6 +3500,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               apiRetry: undefined,
               activeTurnInput: undefined,
               contextRecoveryAttempts: undefined,
+              awaitingVisibleAssistantResponse: undefined,
+              emptyTerminalRecoveryAfterCompact: undefined,
             });
           }
           agentActions.completeAll('error');
@@ -3360,6 +3562,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               modelSwitchPendingText: undefined,
               activeTurnInput: undefined,
               contextRecoveryAttempts: undefined,
+              awaitingVisibleAssistantResponse: undefined,
+              emptyTerminalRecoveryAfterCompact: undefined,
             });
             const currentDraft = useChatStore.getState().getTab(tabId)?.inputDraft.trim() || '';
             useChatStore.getState().setInputDraft(
@@ -3458,6 +3662,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           setActivityStatus({ phase: 'thinking' });
           setSessionMeta({
             contextRecoveryAttempts: (recoveryMeta?.contextRecoveryAttempts ?? 0) + 1,
+            awaitingVisibleAssistantResponse: true,
+            emptyTerminalRecoveryAfterCompact: false,
             turnStartTime: retryStartedAt,
             lastProgressAt: retryStartedAt,
             inputTokens: 0,
@@ -3476,6 +3682,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             setSessionMeta({
               activeTurnInput: undefined,
               contextRecoveryAttempts: undefined,
+              awaitingVisibleAssistantResponse: undefined,
+              emptyTerminalRecoveryAfterCompact: undefined,
             });
             setSessionStatus('error');
             setActivityStatus({ phase: 'error' });
@@ -3488,6 +3696,16 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               timestamp: Date.now(),
             });
           });
+          break;
+        }
+
+        if (handleEmptyTerminalRecoveryResult({
+          tabId,
+          stdinId: msgStdinId,
+          subtype: msg.subtype,
+          resultDisplayText,
+          usage: msg.usage,
+        })) {
           break;
         }
 
@@ -3594,6 +3812,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             apiRetry: undefined,
             activeTurnInput: undefined,
             contextRecoveryAttempts: undefined,
+            awaitingVisibleAssistantResponse: undefined,
+            emptyTerminalRecoveryAfterCompact: undefined,
           });
         }
         agentActions.completeAll(
@@ -3642,7 +3862,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // automatically send /compact to prevent context overflow on the next turn.
         // Fires at most once per session to avoid infinite loops.
         // Threshold is model-aware: 160K for 200K models, 800K for 1M models.
-        const resultInputTokens = msg.usage?.input_tokens || 0;
+        const resultInputTokens = effectiveContextInputTokens(msg.usage);
         const compactStdinId = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
         const fgCompactThreshold = getAutoCompactThreshold(useChatStore.getState().getTab(tabId)?.sessionMeta.spawnedModel);
         if (resultInputTokens > fgCompactThreshold && !hasAutoCompactFired(tabId) && compactStdinId && msg.subtype === 'success') {
@@ -3821,6 +4041,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             apiRetry: undefined,
             activeTurnInput: undefined,
             contextRecoveryAttempts: undefined,
+            awaitingVisibleAssistantResponse: undefined,
+            emptyTerminalRecoveryAfterCompact: undefined,
           });
         }
 
