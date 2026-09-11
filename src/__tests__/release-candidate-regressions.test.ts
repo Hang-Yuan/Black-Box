@@ -38,7 +38,7 @@ describe('release candidate safety regressions', () => {
   it('keeps the unified feature release version consistent across every authority', () => {
     const cargoVersion = rustManifest.match(/^version = "([^"]+)"/m)?.[1];
     const lockVersion = cargoLock.match(/\[\[package\]\]\nname = "blackbox"\nversion = "([^"]+)"/)?.[1];
-    expect(packageJson.version).toBe('0.14.50');
+    expect(packageJson.version).toBe('0.14.51');
     expect(tauriConfig.version).toBe(packageJson.version);
     expect(cargoVersion).toBe(packageJson.version);
     expect(lockVersion).toBe(packageJson.version);

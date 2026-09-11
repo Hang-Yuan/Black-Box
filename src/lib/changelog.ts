@@ -19,6 +19,18 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.51',
+    date: '2026-09-11',
+    highlights: {
+      zh: [
+        '保持 macOS 后台与被遮挡窗口的 WebView 活跃，避免 WebKit 挂起并释放渲染图层后出现整窗黑屏',
+      ],
+      en: [
+        'Keeps the macOS WebView active while its window is backgrounded or occluded, preventing full-window black screens after WebKit suspends and discards render layers',
+      ],
+    },
+  },
+  {
     version: '0.14.50',
     date: '2026-09-11',
     highlights: {

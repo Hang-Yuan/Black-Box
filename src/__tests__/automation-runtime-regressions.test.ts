@@ -137,6 +137,12 @@ describe('automation runtime regressions', () => {
     expect(tauriDevConfig.identifier).toBe('com.blackbox.app.dev');
   });
 
+  it('keeps the macOS WebView alive while the window is occluded', () => {
+    for (const config of [tauriConfig, tauriDevConfig]) {
+      expect(config.app.windows[0].backgroundThrottling).toBe('disabled');
+    }
+  });
+
   it('distinguishes closing the window from explicitly quitting the app', () => {
     expect(i18nSource).toContain('关闭窗口后 Black Box 继续在后台调度');
     expect(i18nSource).toContain('Closing the window keeps Black Box scheduling in the background');
