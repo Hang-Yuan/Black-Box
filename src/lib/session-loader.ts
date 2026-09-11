@@ -383,6 +383,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
               role: 'assistant',
               type: 'text',
               content: displayText,
+              isFinalResponse: msg.message?.stop_reason === 'end_turn',
               timestamp: normalizeSessionTimestamp(msg.timestamp),
             };
             const existingTextIndex = messages.findIndex((message) => message.id === textId);

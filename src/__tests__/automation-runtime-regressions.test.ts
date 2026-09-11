@@ -213,7 +213,7 @@ describe('automation runtime regressions', () => {
     expect(automationUiSource).toContain("case 'NEEDS_ATTENTION':");
     expect(automationUiSource).toContain('isUnreadAutomationResult(run)');
     expect(i18nSource).toContain("'automations.status.succeeded': '已完成'");
-    expect(i18nSource).toContain("'automations.status.needsAttention': '需处理'");
+    expect(i18nSource).toContain("'automations.status.needsAttention': '已完成 · 待裁决'");
   });
 
   it('keeps recent-run status, unread state, and timestamp in aligned non-wrapping slots', () => {
@@ -231,7 +231,7 @@ describe('automation runtime regressions', () => {
     expect(rustEntrySource).toContain('automations::retry_automation_run');
     expect(automationUiSource).toContain('bridge.retryAutomationRun(runId)');
     expect(automationUiSource).toContain("case 'RECOVERED':");
-    expect(i18nSource).toContain("'automations.status.recovered': '已恢复'");
+    expect(i18nSource).toContain("'automations.status.recovered': '已完成 · 已恢复'");
   });
 
   it('reconciles committed completion receipts without rerunning finished work', () => {
@@ -239,6 +239,9 @@ describe('automation runtime regressions', () => {
     expect(automationBackendSource).toContain('probe_completion_receipt');
     expect(automationBackendSource).toContain('reconcile_failed_completion_probes');
     expect(automationBackendSource).toContain('completion-receipt:');
+    expect(automationBackendSource).toContain('base_directory == "automation_data"');
+    expect(automationBackendSource).toContain('json_matches_reference');
+    expect(automationBackendSource).toContain('required_absent_relative_paths');
     expect(automationBackendSource).toContain("status='RECOVERED'");
     expect(i18nSource).toContain('后续完成凭证已确认');
   });
@@ -263,6 +266,7 @@ describe('automation runtime regressions', () => {
     expect(automationBackendSource).toContain('"--resume".to_string()');
     expect(automationBackendSource).toContain('::automation-failed{');
     expect(automationBackendSource).toContain('automation_reported_failure');
+    expect(automationBackendSource).toContain('Never return a directive by itself');
   });
 
   it('keeps private profile names and paths out of public product sources', () => {
@@ -383,6 +387,8 @@ describe('automation runtime regressions', () => {
     expect(automationSessionMonitorSource).toContain('bridge.listActiveAutomationSessions()');
     expect(automationSessionMonitorSource).toContain('bridge.loadSession(session.path)');
     expect(automationSessionMonitorSource).toContain('parseSessionMessages(rawMessages)');
+    expect(automationSessionMonitorSource).toContain('terminalSettles');
+    expect(automationSessionMonitorSource).toContain('terminalChatStatus(finished.status)');
     expect(chatPanelSource).toContain('data-testid="automation-session-banner"');
     expect(chatPanelSource).toContain("t('automations.chatRunning')");
     expect(inputBarSource).toContain('activeBySession.has(tabId)');
@@ -391,7 +397,7 @@ describe('automation runtime regressions', () => {
   });
 
   it('fails closed when a cron omits its terminal receipt or skips final Agent synthesis', () => {
-    expect(automationBackendSource).toContain('Scheduled task ended without the required final result directive');
+    expect(automationBackendSource).toContain('Scheduled task ended without the required user-facing report and final result directive');
     expect(automationBackendSource).toContain("the run ended without a final synthesis");
     expect(automationBackendSource).toContain('last_main_assistant_event');
     expect(automationBackendSource).toContain('last_agent_completion_event');

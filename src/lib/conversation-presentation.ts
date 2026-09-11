@@ -47,9 +47,12 @@ export function buildConversationDisplayItems(
       .slice(segmentStart, segmentEnd)
       .filter(({ msg }) => msg.role === 'assistant' && msg.type === 'text');
     const isCurrentSegment = segmentEnd === visible.length;
-    const progressEntries = isCurrentSegment && activeTurn
-      ? textEntries
-      : textEntries.slice(0, -1);
+    const hasNativeFinalBoundary = textEntries.some(({ msg }) => msg.isFinalResponse);
+    const progressEntries = hasNativeFinalBoundary
+      ? textEntries.filter(({ msg }) => !msg.isFinalResponse)
+      : isCurrentSegment && activeTurn
+        ? textEntries
+        : textEntries.slice(0, -1);
 
     if (progressEntries.length >= 2) {
       const firstId = progressEntries[0].msg.id;

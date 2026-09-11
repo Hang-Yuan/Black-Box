@@ -61,6 +61,9 @@ export interface ChatMessage {
   toolResultContent?: string;      // tool result content merged from tool_result stream events
   toolCompleted?: boolean;         // tool finished even if it produced no visible result text
   isPartial?: boolean;
+  /** Native provider terminal boundary for a user-facing lead response.
+   *  Progress grouping must never fold a message carrying this receipt. */
+  isFinalResponse?: boolean;
   timestamp: number;
   // Interactive message fields
   permissionTool?: string;         // tool requesting permission

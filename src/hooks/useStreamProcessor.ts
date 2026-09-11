@@ -1697,7 +1697,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             store.addMessage(tabId, {
               id: textId,
               role: 'assistant', type: 'text',
-              content: displayText, subAgentDepth: bgAgentDepth, timestamp: Date.now(),
+              content: displayText,
+              isFinalResponse: msg.message?.stop_reason === 'end_turn',
+              subAgentDepth: bgAgentDepth,
+              timestamp: Date.now(),
             });
             updateCachedAgentPhase(tabId, bgAgentId, 'writing');
           } else if (block.type === 'tool_use') {
@@ -2144,7 +2147,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             store.addMessage(tabId, {
               id: msg.uuid || generateMessageId(),
               role: 'assistant', type: 'text',
-              content: bgResultDisplayText, timestamp: Date.now(),
+              content: bgResultDisplayText,
+              isFinalResponse: true,
+              timestamp: Date.now(),
             });
           }
         }
@@ -3048,6 +3053,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               role: 'assistant',
               type: 'text',
               content: displayText,
+              isFinalResponse: msg.message?.stop_reason === 'end_turn',
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
             });
@@ -3753,6 +3759,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               role: 'assistant',
               type: 'text',
               content: resultDisplayText,
+              isFinalResponse: true,
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
             });

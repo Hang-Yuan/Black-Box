@@ -70,6 +70,22 @@ describe('conversation presentation', () => {
     expect(group && group.kind === 'process_group' ? group.active : false).toBe(true);
   });
 
+  it('keeps a native terminal report visible even before runtime status settles', () => {
+    const items = buildConversationDisplayItems([
+      message('p1', 'assistant', 'text', 'Checking receipts.'),
+      message('p2', 'assistant', 'text', 'Writing the audit log.'),
+      message('final', 'assistant', 'text', 'The transaction committed.', {
+        isFinalResponse: true,
+      }),
+    ], 'running');
+
+    expect(items.map((item) => item.kind === 'message' ? item.msg.id : item.kind)).toEqual([
+      'process_group',
+      'final',
+    ]);
+    expect(items.find((item) => item.kind === 'message' && item.msg.id === 'final')).toBeTruthy();
+  });
+
   it('keeps lead progress and mechanical tool calls in separate expandable groups', () => {
     const items = buildConversationDisplayItems([
       message('u1', 'user', 'text', 'Investigate'),

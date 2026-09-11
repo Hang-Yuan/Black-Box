@@ -523,6 +523,29 @@ describe('session-loader tool result recovery', () => {
       expect.objectContaining({ kind: 'tool', toolName: 'Read' }),
     ]);
   });
+
+  it('preserves a native end-turn report boundary and hides its scheduler directive', () => {
+    const loaded = parseSessionMessages([{
+      type: 'assistant',
+      timestamp: 10,
+      message: {
+        id: 'scheduled-final',
+        stop_reason: 'end_turn',
+        content: [{
+          type: 'text',
+          text: 'The durable transaction committed.\n::automation-needs-attention{title="Review" summary="Choose one option"}',
+        }],
+      },
+    }]);
+
+    expect(loaded.messages).toEqual([
+      expect.objectContaining({
+        id: 'scheduled-final_text_0',
+        content: 'The durable transaction committed.',
+        isFinalResponse: true,
+      }),
+    ]);
+  });
 });
 
 describe('background assistant finalization', () => {

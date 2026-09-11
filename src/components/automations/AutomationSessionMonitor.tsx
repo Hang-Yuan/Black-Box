@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { bridge } from '../../lib/tauri-bridge';
+import { bridge, type ActiveAutomationSession } from '../../lib/tauri-bridge';
 import { parseSessionMessages } from '../../lib/session-loader';
 import { useAgentStore } from '../../stores/agentStore';
 import { useAutomationSessionStore } from '../../stores/automationSessionStore';
@@ -7,6 +7,7 @@ import { useChatStore, type ChatMessage } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 
 const POLL_INTERVAL_MS = 1_250;
+const TERMINAL_SETTLE_POLLS = 6;
 
 function messageSignature(messages: readonly ChatMessage[]): string {
   const last = messages[messages.length - 1];
@@ -26,8 +27,13 @@ function sameMessage(left: ChatMessage, right: ChatMessage): boolean {
     && left.role === right.role
     && left.content === right.content
     && left.toolResultContent === right.toolResultContent
+    && left.isFinalResponse === right.isFinalResponse
     && left.resolved === right.resolved
     && left.interactionState === right.interactionState;
+}
+
+function terminalChatStatus(status: string): 'completed' | 'error' {
+  return ['FAILED', 'CANCELLED'].includes(status.toUpperCase()) ? 'error' : 'completed';
 }
 
 async function syncSelectedAutomationTranscript(
@@ -89,7 +95,12 @@ export function AutomationSessionMonitor() {
   useEffect(() => {
     let cancelled = false;
     let polling = false;
-    let previousActiveSessions = new Set<string>();
+    let previousActiveSessions = new Map<string, ActiveAutomationSession>();
+    const terminalSettles = new Map<string, {
+      run: ActiveAutomationSession;
+      pollsRemaining: number;
+      statusApplied: boolean;
+    }>();
     const signatures = new Map<string, string>();
 
     const poll = async () => {
@@ -98,16 +109,46 @@ export function AutomationSessionMonitor() {
       try {
         const active = await bridge.listActiveAutomationSessions();
         if (cancelled) return;
-        const activeSessionIds = new Set(active.map((item) => item.sessionId));
+        const activeBySession = new Map(active.map((item) => [item.sessionId, item]));
+        const activeSessionIds = new Set(activeBySession.keys());
         useAutomationSessionStore.getState().replaceActive(active);
+
+        for (const [sessionId, previous] of previousActiveSessions) {
+          if (!activeSessionIds.has(sessionId) && !terminalSettles.has(sessionId)) {
+            terminalSettles.set(sessionId, {
+              run: previous,
+              pollsRemaining: TERMINAL_SETTLE_POLLS,
+              statusApplied: false,
+            });
+          }
+        }
+        for (const sessionId of activeSessionIds) terminalSettles.delete(sessionId);
 
         const selectedSessionId = useSessionStore.getState().selectedSessionId;
         if (selectedSessionId
           && (activeSessionIds.has(selectedSessionId)
-            || previousActiveSessions.has(selectedSessionId))) {
+            || previousActiveSessions.has(selectedSessionId)
+            || terminalSettles.has(selectedSessionId))) {
           await syncSelectedAutomationTranscript(selectedSessionId, signatures);
+
+          const settling = terminalSettles.get(selectedSessionId);
+          if (settling && !settling.statusApplied) {
+            const runs = await bridge.listAutomationRuns(settling.run.automationId, 20);
+            const finished = runs.find((run) => run.runId === settling.run.runId);
+            if (finished && finished.status !== 'RUNNING') {
+              useChatStore.getState().setSessionStatus(
+                selectedSessionId,
+                terminalChatStatus(finished.status),
+              );
+              settling.statusApplied = true;
+            }
+          }
         }
-        previousActiveSessions = activeSessionIds;
+        for (const [sessionId, settling] of terminalSettles) {
+          settling.pollsRemaining -= 1;
+          if (settling.pollsRemaining <= 0) terminalSettles.delete(sessionId);
+        }
+        previousActiveSessions = activeBySession;
       } catch {
         // Preserve the last trustworthy activity snapshot. A transient SQLite
         // or filesystem read failure must not hide an in-flight scheduled run.

@@ -19,6 +19,20 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.50',
+    date: '2026-09-11',
+    highlights: {
+      zh: [
+        '排程终答使用原生 end_turn 边界保持可见，并在后台进程结束后继续同步收尾；任务中心自动展开最新汇报，区分“已完成 · 待裁决”和真实失败',
+        '完成探针可核对 Black Box 私有数据目录中的 commit、manifest 与释放锁，已补完的历史失败会自动恢复为完成状态',
+      ],
+      en: [
+        'Keeps scheduled final reports visible through native end-turn boundaries and a bounded post-run transcript sync; Scheduled opens the latest report and distinguishes completed decisions from failures',
+        'Verifies commit, manifest, and released-lock evidence in Black Box private data before reconciling completed historical failures',
+      ],
+    },
+  },
+  {
     version: '0.14.49',
     date: '2026-09-09',
     highlights: {

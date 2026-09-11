@@ -600,8 +600,13 @@ export interface AutomationDefinition {
    * transport or completion-synthesis tail failed. */
   completion_probe: {
     relative_path: string;
+    base_directory: 'project' | 'automation_data';
     scheduled_date_offset_days: number;
     json_equals: Record<string, string>;
+    reference_relative_path: string | null;
+    json_matches_reference: string[];
+    required_absent_relative_paths: string[];
+    recovered_title: string | null;
   } | null;
   created_at: number;
   updated_at: number;

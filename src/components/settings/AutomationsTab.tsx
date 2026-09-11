@@ -1012,8 +1012,13 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
       </div>
 
       <div>
-        <div className="mb-2 flex items-center justify-between gap-3">
-          <h4 className="text-[13px] font-semibold text-text-primary">{t('automations.recentRuns')}</h4>
+        <div className="mb-2 flex items-start justify-between gap-3">
+          <div>
+            <h4 className="text-[13px] font-semibold text-text-primary">{t('automations.recentRuns')}</h4>
+            <p className="mt-0.5 text-[10px] leading-4 text-text-tertiary">
+              {t('automations.recentRunsHint')}
+            </p>
+          </div>
           {unreadRunCount > 0 && (
             <button type="button" onClick={() => { void markAllRunsRead(); }}
               className="rounded-md px-2 py-1 text-[10px] text-accent hover:bg-accent/10">
@@ -1023,8 +1028,14 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
         </div>
         <div className="space-y-2">
           {recentRuns.length === 0 && <div className="text-[12px] text-text-muted">{t('automations.noRuns')}</div>}
-          {recentRuns.map((run) => (
+          {recentRuns.map((run, index) => (
             <details key={run.runId} className="rounded-lg border border-border-subtle bg-bg-card px-3 py-2"
+              ref={(element) => {
+                if (element && index === 0 && run.status !== 'RUNNING' && !element.dataset.autoOpened) {
+                  element.open = true;
+                  element.dataset.autoOpened = 'true';
+                }
+              }}
               onToggle={(event) => {
                 if (!(event.currentTarget as HTMLDetailsElement).open) return;
                 if (!run.readAt) bridge.markAutomationRunRead(run.runId).then(load);

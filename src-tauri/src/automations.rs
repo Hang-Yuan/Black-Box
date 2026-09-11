@@ -49,13 +49,34 @@ pub struct AutomationTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutomationCompletionProbe {
-    /// JSON receipt relative to the automation's project directory. `{date}`
-    /// expands from the scheduled local date plus `scheduled_date_offset_days`.
+    /// JSON receipt relative to either the automation project or Black Box's
+    /// private data directory. `{date}` expands from the scheduled local date
+    /// plus `scheduled_date_offset_days`.
     pub relative_path: String,
+    #[serde(default = "default_completion_probe_base_directory")]
+    pub base_directory: String,
     #[serde(default)]
     pub scheduled_date_offset_days: i64,
     #[serde(default)]
     pub json_equals: BTreeMap<String, String>,
+    /// Optional JSON file whose named fields must equal the same fields in the
+    /// completion receipt. This binds a receipt to the current durable bundle.
+    #[serde(default)]
+    pub reference_relative_path: Option<String>,
+    #[serde(default)]
+    pub json_matches_reference: Vec<String>,
+    /// Recovery remains closed while any of these paths exist. Dream uses this
+    /// to require transaction-lock release after writing its commit receipt.
+    #[serde(default)]
+    pub required_absent_relative_paths: Vec<String>,
+    /// Optional title template for a recovered run. Supports `{name}` and
+    /// `{date}`; absent templates preserve the historical task-name title.
+    #[serde(default)]
+    pub recovered_title: Option<String>,
+}
+
+fn default_completion_probe_base_directory() -> String {
+    "project".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1296,15 +1317,35 @@ fn validate_completion_probe(definition: &AutomationDefinition) -> Result<(), St
     if definition.kind != "cron" {
         return Err("completionProbe is only supported for cron automations".to_string());
     }
-    if probe.relative_path.trim() != probe.relative_path
-        || probe.relative_path.is_empty()
-        || !safe_relative_path(Path::new(
-            &probe.relative_path.replace("{date}", "2000-01-01"),
-        ))
-    {
-        return Err(
-            "completionProbe.relativePath must be a safe path relative to the project".to_string(),
-        );
+    if !matches!(probe.base_directory.as_str(), "project" | "automation_data") {
+        return Err("completionProbe.baseDirectory must be project or automation_data".to_string());
+    }
+    let validate_path = |field: &str, raw: &str| -> Result<(), String> {
+        let rendered = raw.replace("{date}", "2000-01-01");
+        if raw.trim() != raw || raw.is_empty() || !safe_relative_path(Path::new(&rendered)) {
+            return Err(format!(
+                "completionProbe.{field} must be a safe relative path"
+            ));
+        }
+        if probe.base_directory == "automation_data"
+            && !definition.data_write_subdirectories.iter().any(|allowed| {
+                let allowed = Path::new(allowed);
+                let rendered = Path::new(&rendered);
+                rendered == allowed || rendered.starts_with(allowed)
+            })
+        {
+            return Err(format!(
+                "completionProbe.{field} must stay within dataWriteSubdirectories"
+            ));
+        }
+        Ok(())
+    };
+    validate_path("relativePath", &probe.relative_path)?;
+    if let Some(reference) = probe.reference_relative_path.as_deref() {
+        validate_path("referenceRelativePath", reference)?;
+    }
+    for path in &probe.required_absent_relative_paths {
+        validate_path("requiredAbsentRelativePaths", path)?;
     }
     if !(-366..=366).contains(&probe.scheduled_date_offset_days) {
         return Err(
@@ -1318,6 +1359,27 @@ fn validate_completion_probe(definition: &AutomationDefinition) -> Result<(), St
             .any(|(key, expected)| key.trim() != key || key.is_empty() || expected.is_empty())
     {
         return Err("completionProbe.jsonEquals must contain non-empty fields".to_string());
+    }
+    if probe.reference_relative_path.is_none() && !probe.json_matches_reference.is_empty() {
+        return Err(
+            "completionProbe.jsonMatchesReference requires referenceRelativePath".to_string(),
+        );
+    }
+    if probe
+        .json_matches_reference
+        .iter()
+        .any(|field| field.trim() != field || field.is_empty())
+    {
+        return Err(
+            "completionProbe.jsonMatchesReference must contain non-empty fields".to_string(),
+        );
+    }
+    if probe
+        .recovered_title
+        .as_deref()
+        .is_some_and(|title| title.trim() != title || title.is_empty())
+    {
+        return Err("completionProbe.recoveredTitle must be non-empty".to_string());
     }
     Ok(())
 }
@@ -3106,7 +3168,7 @@ fn automation_prompt(
     } else {
         String::new()
     };
-    let result_contract = "\n<automation_result_contract>If every required step completes and no user action is required, end with ::inbox-item{title=\"short title\" summary=\"short factual summary\"} on its own final line. If every required step completes but an explicit user decision or follow-up action is required, end with ::automation-needs-attention{title=\"short title\" summary=\"short factual next action\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, end with ::automation-failed{summary=\"short factual reason\"} on its own final line and do not emit a success or needs-attention directive.</automation_result_contract>";
+    let result_contract = "\n<automation_result_contract>Before the control directive, write a self-contained user-facing completion report that states what happened, the durable outcome, and any decision or follow-up required. Never return a directive by itself. If every required step completes and no user action is required, end with ::inbox-item{title=\"short title\" summary=\"short factual summary\"} on its own final line. If every required step completes but an explicit user decision or follow-up action is required, end with ::automation-needs-attention{title=\"short title\" summary=\"short factual next action\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, end with ::automation-failed{summary=\"short factual reason\"} on its own final line and do not emit a success or needs-attention directive.</automation_result_contract>";
     Ok(prepend_native_skill_invocation(native_skill_invocation, format!(
         "Automation: {name}\nAutomation ID: {id}\nAutomation memory: {memory}\nScheduled at: {scheduled}\n\n{prompt}\n\n{memory_block}{team_contract}{result_contract}",
         name = definition.name,
@@ -3134,7 +3196,7 @@ fn automation_completion_recovery_prompt(
     attempt: usize,
 ) -> String {
     format!(
-        "<automation_completion_recovery>\nRecovery attempt {attempt}/{limit}. The scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. End with exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}.\n</automation_completion_recovery>",
+        "<automation_completion_recovery>\nRecovery attempt {attempt}/{limit}. The scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. Write a self-contained user-facing completion report before exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}. Never return a directive by itself.\n</automation_completion_recovery>",
         id = definition.id,
         limit = AUTOMATION_COMPLETION_RECOVERY_LIMIT,
     )
@@ -3884,6 +3946,11 @@ fn final_automation_directive_start(output: &str, marker: &str) -> Option<usize>
         .then_some(start)
 }
 
+fn has_user_facing_report_before_directive(output: &str, marker: &str) -> bool {
+    final_automation_directive_start(output, marker)
+        .is_some_and(|start| !output[..start].trim().is_empty())
+}
+
 fn automation_reported_failure(
     execution: &AutomationExecution,
     require_terminal_directive: bool,
@@ -3892,9 +3959,11 @@ fn automation_reported_failure(
         return Some(reason);
     }
     let has_terminal_directive =
-        final_automation_directive_start(&execution.output, "::inbox-item{").is_some()
-            || final_automation_directive_start(&execution.output, "::automation-needs-attention{")
-                .is_some();
+        has_user_facing_report_before_directive(&execution.output, "::inbox-item{")
+            || has_user_facing_report_before_directive(
+                &execution.output,
+                "::automation-needs-attention{",
+            );
     if execution
         .last_agent_completion_event
         .is_some_and(|completion| {
@@ -3913,7 +3982,8 @@ fn automation_reported_failure(
     }
     if require_terminal_directive {
         return Some(
-            "Scheduled task ended without the required final result directive".to_string(),
+            "Scheduled task ended without the required user-facing report and final result directive"
+                .to_string(),
         );
     }
     let terminal_tool_failed = execution
@@ -3945,9 +4015,11 @@ fn automation_needs_completion_recovery(execution: &AutomationExecution) -> bool
                     .is_none_or(|main| main < completion)
             });
     let has_terminal_directive =
-        final_automation_directive_start(&execution.output, "::inbox-item{").is_some()
-            || final_automation_directive_start(&execution.output, "::automation-needs-attention{")
-                .is_some();
+        has_user_facing_report_before_directive(&execution.output, "::inbox-item{")
+            || has_user_facing_report_before_directive(
+                &execution.output,
+                "::automation-needs-attention{",
+            );
     background_finished_after_main || !has_terminal_directive
 }
 
@@ -4086,11 +4158,82 @@ fn completion_probe_value_matches(actual: &Value, expected: &str) -> bool {
         .unwrap_or_else(|| actual.to_string() == expected)
 }
 
-fn probe_completion_receipt(
+fn completion_probe_root(
+    definition: &AutomationDefinition,
+    probe: &AutomationCompletionProbe,
+    data_directory: &Path,
+) -> Result<PathBuf, String> {
+    let root = if probe.base_directory == "automation_data" {
+        data_directory.to_path_buf()
+    } else {
+        PathBuf::from(project_directory(definition)?)
+    };
+    fs::canonicalize(&root).map_err(|error| {
+        format!(
+            "Cannot resolve completion probe {} directory: {error}",
+            probe.base_directory
+        )
+    })
+}
+
+fn read_completion_probe_json(
+    root: &Path,
+    rendered_relative: &str,
+    started_at: i64,
+) -> Result<Option<Value>, String> {
+    let relative = Path::new(rendered_relative);
+    if !safe_relative_path(relative) {
+        return Err("Completion probe path escaped its base directory".to_string());
+    }
+    let candidate = root.join(relative);
+    if !candidate.is_file() {
+        return Ok(None);
+    }
+    let resolved = fs::canonicalize(&candidate)
+        .map_err(|error| format!("Cannot resolve completion probe file: {error}"))?;
+    if !resolved.starts_with(root) {
+        return Err("Completion probe file escaped its base directory".to_string());
+    }
+    let metadata = fs::metadata(&resolved)
+        .map_err(|error| format!("Cannot inspect completion probe file: {error}"))?;
+    if metadata.len() > 1024 * 1024 {
+        return Err("Completion probe file exceeds the 1 MiB safety limit".to_string());
+    }
+    let modified_at = metadata
+        .modified()
+        .map_err(|error| format!("Cannot read completion probe timestamp: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Completion probe timestamp predates the Unix epoch".to_string())?
+        .as_millis() as i64;
+    if modified_at.saturating_add(5_000) < started_at {
+        return Ok(None);
+    }
+    let bytes = fs::read(&resolved)
+        .map_err(|error| format!("Cannot read completion probe JSON: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("Cannot parse completion probe JSON: {error}"))
+}
+
+fn completion_probe_recovered_title(
+    definition: &AutomationDefinition,
+    probe: &AutomationCompletionProbe,
+    date: &str,
+) -> String {
+    probe
+        .recovered_title
+        .as_deref()
+        .unwrap_or(&definition.name)
+        .replace("{name}", &definition.name)
+        .replace("{date}", date)
+}
+
+fn probe_completion_receipt_at(
     definition: &AutomationDefinition,
     scheduled_at: i64,
     started_at: i64,
-) -> Result<Option<String>, String> {
+    data_directory: &Path,
+) -> Result<Option<(String, String)>, String> {
     let Some(probe) = &definition.completion_probe else {
         return Ok(None);
     };
@@ -4099,41 +4242,10 @@ fn probe_completion_receipt(
         scheduled.date_naive() + ChronoDuration::days(probe.scheduled_date_offset_days);
     let date = receipt_date.format("%Y-%m-%d").to_string();
     let rendered_relative = probe.relative_path.replace("{date}", &date);
-    let relative = Path::new(&rendered_relative);
-    if !safe_relative_path(relative) {
-        return Err("Completion receipt path escaped the project directory".to_string());
-    }
-    let project = fs::canonicalize(project_directory(definition)?)
-        .map_err(|error| format!("Cannot resolve completion receipt project: {error}"))?;
-    let candidate = project.join(relative);
-    if !candidate.is_file() {
+    let root = completion_probe_root(definition, probe, data_directory)?;
+    let Some(json) = read_completion_probe_json(&root, &rendered_relative, started_at)? else {
         return Ok(None);
-    }
-    let receipt = fs::canonicalize(&candidate)
-        .map_err(|error| format!("Cannot resolve completion receipt: {error}"))?;
-    if !receipt.starts_with(&project) {
-        return Err("Completion receipt escaped the project directory".to_string());
-    }
-    let metadata = fs::metadata(&receipt)
-        .map_err(|error| format!("Cannot inspect completion receipt: {error}"))?;
-    if metadata.len() > 1024 * 1024 {
-        return Err("Completion receipt exceeds the 1 MiB safety limit".to_string());
-    }
-    let modified_at = metadata
-        .modified()
-        .map_err(|error| format!("Cannot read completion receipt timestamp: {error}"))?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "Completion receipt timestamp predates the Unix epoch".to_string())?
-        .as_millis() as i64;
-    // A date-specific receipt must still have been written by this run. This
-    // prevents an old committed receipt from masking a new transport failure.
-    if modified_at.saturating_add(5_000) < started_at {
-        return Ok(None);
-    }
-    let bytes =
-        fs::read(&receipt).map_err(|error| format!("Cannot read completion receipt: {error}"))?;
-    let json: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Cannot parse completion receipt JSON: {error}"))?;
+    };
     for (field, expected_template) in &probe.json_equals {
         let expected = expected_template.replace("{date}", &date);
         let Some(actual) = json.get(field) else {
@@ -4143,7 +4255,50 @@ fn probe_completion_receipt(
             return Ok(None);
         }
     }
-    Ok(Some(format!("completion-receipt:{rendered_relative}")))
+    let mut evidence = format!("completion-receipt:{rendered_relative}");
+    if let Some(reference_template) = probe.reference_relative_path.as_deref() {
+        let reference_relative = reference_template.replace("{date}", &date);
+        let Some(reference) = read_completion_probe_json(&root, &reference_relative, started_at)?
+        else {
+            return Ok(None);
+        };
+        for field in &probe.json_matches_reference {
+            if json.get(field).is_none() || json.get(field) != reference.get(field) {
+                return Ok(None);
+            }
+        }
+        evidence.push_str(&format!(";reference:{reference_relative}"));
+    }
+    for path_template in &probe.required_absent_relative_paths {
+        let rendered = path_template.replace("{date}", &date);
+        let relative = Path::new(&rendered);
+        if !safe_relative_path(relative) {
+            return Err("Completion terminal path escaped its base directory".to_string());
+        }
+        let candidate = root.join(relative);
+        if candidate.exists() {
+            let resolved = fs::canonicalize(&candidate)
+                .map_err(|error| format!("Cannot resolve completion terminal path: {error}"))?;
+            if !resolved.starts_with(&root) {
+                return Err("Completion terminal path escaped its base directory".to_string());
+            }
+            return Ok(None);
+        }
+        evidence.push_str(&format!(";absent:{rendered}"));
+    }
+    Ok(Some((
+        evidence,
+        completion_probe_recovered_title(definition, probe, &date),
+    )))
+}
+
+fn probe_completion_receipt(
+    definition: &AutomationDefinition,
+    scheduled_at: i64,
+    started_at: i64,
+) -> Result<Option<(String, String)>, String> {
+    let data_directory = automation_data_dir()?;
+    probe_completion_receipt_at(definition, scheduled_at, started_at, &data_directory)
 }
 
 fn recover_run_from_completion_probe(
@@ -4154,13 +4309,15 @@ fn recover_run_from_completion_probe(
     started_at: i64,
     recovered_at: i64,
 ) -> Result<bool, String> {
-    let Some(evidence) = probe_completion_receipt(definition, scheduled_at, started_at)? else {
+    let Some((evidence, recovered_title)) =
+        probe_completion_receipt(definition, scheduled_at, started_at)?
+    else {
         return Ok(false);
     };
     let updated = connection
         .execute(
             "UPDATE automation_runs SET status='RECOVERED',read_at=NULL,title=?2,recovered_at=?3,recovery_evidence=?4 WHERE run_id=?1 AND status='FAILED' AND retry_of_run_id IS NULL",
-            params![run_id, definition.name, recovered_at, evidence],
+            params![run_id, recovered_title, recovered_at, evidence],
         )
         .map_err(|error| format!("Cannot reconcile automation completion receipt: {error}"))?;
     if updated == 1 {
@@ -4169,7 +4326,7 @@ fn recover_run_from_completion_probe(
                 "UPDATE inbox_items SET title=?2,description=?3,read_at=NULL WHERE run_id=?1",
                 params![
                     run_id,
-                    definition.name,
+                    recovered_title,
                     "Durable completion receipt verified; original runtime failure preserved",
                 ],
             )
@@ -6236,11 +6393,45 @@ mod tests {
             cwds: vec![project.to_string_lossy().to_string()],
             completion_probe: Some(AutomationCompletionProbe {
                 relative_path: "receipts/{date}.json".to_string(),
+                base_directory: "project".to_string(),
                 scheduled_date_offset_days: -1,
                 json_equals: BTreeMap::from([
                     ("logical_date".to_string(), "{date}".to_string()),
                     ("status".to_string(), "COMMITTED".to_string()),
                 ]),
+                reference_relative_path: None,
+                json_matches_reference: vec![],
+                required_absent_relative_paths: vec![],
+                recovered_title: Some("{name} {date} 完成".to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn durable_bundle_probe_definition(project: &Path) -> AutomationDefinition {
+        AutomationDefinition {
+            id: "daily-review-dream".to_string(),
+            name: "daily-dream".to_string(),
+            target: Some(AutomationTarget {
+                target_type: "project".to_string(),
+                project_id: project.to_string_lossy().to_string(),
+            }),
+            cwds: vec![project.to_string_lossy().to_string()],
+            data_write_subdirectories: vec!["dream-runs".to_string()],
+            completion_probe: Some(AutomationCompletionProbe {
+                relative_path: "dream-runs/{date}/commit_receipt.json".to_string(),
+                base_directory: "automation_data".to_string(),
+                scheduled_date_offset_days: -1,
+                json_equals: BTreeMap::from([
+                    ("logical_date".to_string(), "{date}".to_string()),
+                    ("status".to_string(), "COMMITTED".to_string()),
+                ]),
+                reference_relative_path: Some("dream-runs/{date}/manifest.json".to_string()),
+                json_matches_reference: vec!["logical_date".to_string(), "run_id".to_string()],
+                required_absent_relative_paths: vec![
+                    "dream-runs/_locks/{date}.lock.json".to_string()
+                ],
+                recovered_title: Some("{name} {date} 完成".to_string()),
             }),
             ..Default::default()
         }
@@ -6265,7 +6456,7 @@ mod tests {
             probe_completion_receipt(&receipt_probe_definition(project.path()), scheduled_at, 0)
                 .unwrap();
         assert_eq!(
-            evidence.as_deref(),
+            evidence.as_ref().map(|(evidence, _)| evidence.as_str()),
             Some("completion-receipt:receipts/2026-08-15.json")
         );
         let stale = probe_completion_receipt(
@@ -6275,6 +6466,75 @@ mod tests {
         )
         .unwrap();
         assert!(stale.is_none());
+    }
+
+    #[test]
+    fn completion_probe_requires_matching_bundle_and_released_lock() {
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let bundle = data.path().join("dream-runs/2026-08-15");
+        let locks = data.path().join("dream-runs/_locks");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(&locks).unwrap();
+        fs::write(
+            bundle.join("commit_receipt.json"),
+            br#"{"logical_date":"2026-08-15","status":"COMMITTED","run_id":"dream-run-1"}"#,
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("manifest.json"),
+            br#"{"logical_date":"2026-08-15","run_id":"dream-run-1"}"#,
+        )
+        .unwrap();
+        let definition = durable_bundle_probe_definition(project.path());
+        validate_completion_probe(&definition).unwrap();
+        let scheduled_at = Local
+            .with_ymd_and_hms(2026, 8, 16, 6, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        let completed =
+            probe_completion_receipt_at(&definition, scheduled_at, 0, data.path()).unwrap();
+        assert_eq!(
+            completed.as_ref().map(|(_, title)| title.as_str()),
+            Some("daily-dream 2026-08-15 完成")
+        );
+        assert!(completed
+            .as_ref()
+            .is_some_and(|(evidence, _)| evidence.contains("manifest.json")));
+
+        fs::write(
+            locks.join("2026-08-15.lock.json"),
+            br#"{"holder":"schedule:run-1"}"#,
+        )
+        .unwrap();
+        assert!(
+            probe_completion_receipt_at(&definition, scheduled_at, 0, data.path())
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(locks.join("2026-08-15.lock.json")).unwrap();
+
+        fs::write(
+            bundle.join("manifest.json"),
+            br#"{"logical_date":"2026-08-15","run_id":"other-run"}"#,
+        )
+        .unwrap();
+        assert!(
+            probe_completion_receipt_at(&definition, scheduled_at, 0, data.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn automation_data_completion_probe_cannot_read_outside_write_scope() {
+        let project = tempfile::tempdir().unwrap();
+        let mut definition = durable_bundle_probe_definition(project.path());
+        definition.completion_probe.as_mut().unwrap().relative_path =
+            "automations.sqlite".to_string();
+        assert!(validate_completion_probe(&definition).is_err());
     }
 
     #[test]
@@ -6344,7 +6604,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.0, "RECOVERED");
-        assert_eq!(result.1, "daily-dream");
+        assert_eq!(result.1, "daily-dream 2026-08-15 完成");
         assert!(result.2.is_some());
         assert_eq!(
             result.3.as_deref(),
@@ -6713,6 +6973,8 @@ mod tests {
         assert!(prompt.starts_with("Automation:"));
         assert!(prompt.contains("Inspect the latest build."));
         assert!(prompt.contains("<automation_result_contract>"));
+        assert!(prompt.contains("self-contained user-facing completion report"));
+        assert!(prompt.contains("Never return a directive by itself"));
         assert!(prompt.contains("::automation-needs-attention{title="));
         assert!(prompt.contains("::automation-failed{summary="));
     }
@@ -6767,6 +7029,24 @@ mod tests {
             last_agent_completion_event: None,
         };
         assert!(automation_reported_failure(&execution, true).is_none());
+    }
+
+    #[test]
+    fn terminal_success_directive_requires_a_user_facing_report() {
+        for output in [
+            "::inbox-item{title=\"Done\" summary=\"Committed\"}",
+            "::automation-needs-attention{title=\"Review\" summary=\"Choose one option\"}",
+        ] {
+            let execution = AutomationExecution {
+                output: output.to_string(),
+                trace: vec![],
+                session_id: None,
+                last_main_assistant_event: Some(1),
+                last_agent_completion_event: None,
+            };
+            assert!(automation_needs_completion_recovery(&execution));
+            assert!(automation_reported_failure(&execution, true).is_some());
+        }
     }
 
     #[test]
@@ -6866,6 +7146,8 @@ mod tests {
         );
         assert!(prompt.contains("Resume the SAME durable session"));
         assert!(prompt.contains("do not end with progress narration"));
+        assert!(prompt.contains("self-contained user-facing completion report"));
+        assert!(prompt.contains("Never return a directive by itself"));
         assert!(prompt.contains("::automation-failed"));
         assert!(prompt.contains("Recovery attempt 1/3"));
         assert_eq!(AUTOMATION_COMPLETION_RECOVERY_LIMIT, 3);

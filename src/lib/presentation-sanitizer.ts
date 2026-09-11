@@ -1,3 +1,5 @@
+import { stripFinalInboxDirective } from './automation-output';
+
 /** Claude CLI state-machine placeholders that never belong in user-visible prose. */
 export const CLI_INTERNAL_PLACEHOLDERS: readonly string[] = [
   'No response requested.',
@@ -48,6 +50,7 @@ export function sanitizeAssistantTextForDisplay(value: unknown): string {
     .replace(/\/private\/tmp\/claude-[^\s<>'"`]+/gi, '[internal agent output hidden]')
     .replace(/\n{3,}/g, '\n\n');
 
+  text = stripFinalInboxDirective(text);
   return isCliPlaceholder(text) ? '' : text;
 }
 
