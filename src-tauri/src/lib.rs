@@ -695,6 +695,29 @@ fn login_shell_anthropic_env() -> &'static HashMap<String, String> {
     })
 }
 
+/// Windows GUI processes receive user-level environment variables directly
+/// from Explorer, so there is no login shell to query. Keep the same accessor
+/// available on Windows and snapshot the inherited ANTHROPIC_/CLAUDE_CODE_
+/// variables for native-model discovery.
+#[cfg(target_os = "windows")]
+fn login_shell_anthropic_env() -> &'static HashMap<String, String> {
+    static CACHE: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::env::vars()
+            .filter(|(key, value)| {
+                !value.trim().is_empty()
+                    && (key.starts_with("ANTHROPIC_") || key.starts_with("CLAUDE_CODE_"))
+                    && !matches!(
+                        key.as_str(),
+                        "CLAUDE_CODE_ENABLE_SDK"
+                            | "CLAUDE_CODE_MAX_OUTPUT"
+                            | "CLAUDE_CODE_AUTO_COMPACT"
+                    )
+            })
+            .collect()
+    })
+}
+
 /// Check whether a URL's host looks internal/private (not needing a proxy).
 fn is_internal_host(url: &str) -> bool {
     let host = url

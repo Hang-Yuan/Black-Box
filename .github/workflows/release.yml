@@ -6,21 +6,58 @@ on:
       - 'v*'
 
 jobs:
-  release:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-22.04
     permissions:
-      contents: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run regression tests
+        run: pnpm exec vitest run
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Audit release candidate
+        run: pnpm audit:candidate
+
+  release:
+    needs: validate
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
             args: '--target aarch64-apple-darwin'
+            artifact: macos-arm64
           - platform: macos-latest
             args: '--target x86_64-apple-darwin'
+            artifact: macos-x64
           - platform: ubuntu-22.04
             args: ''
+            artifact: linux-x64
           - platform: windows-latest
             args: ''
+            artifact: windows-x64
 
     runs-on: ${{ matrix.platform }}
 
@@ -35,13 +72,9 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           if [[ "$TAG" == *"-alpha"* ]]; then
             echo "edition=alpha" >> $GITHUB_OUTPUT
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-            echo "release_name=Black Box Preview $TAG" >> $GITHUB_OUTPUT
             echo "extra_args=--config editions/alpha/tauri.alpha.conf.json" >> $GITHUB_OUTPUT
           else
             echo "edition=stable" >> $GITHUB_OUTPUT
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-            echo "release_name=Black Box $TAG" >> $GITHUB_OUTPUT
             echo "extra_args=" >> $GITHUB_OUTPUT
           fi
 
@@ -77,22 +110,24 @@ jobs:
       - name: Build the app
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EDITION: ${{ steps.edition.outputs.edition }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: ${{ steps.edition.outputs.release_name }}
-          releaseBody: |
-            Download the installer for your platform from the assets below.
-            请从下方 Assets 下载对应平台的安装包。
-
-            macOS packages are ad-hoc signed and not notarized; Windows packages are currently unsigned. The operating system may ask for manual confirmation before opening the app.
-            macOS 安装包目前采用 ad-hoc 签名且未经 notarization；Windows 安装包目前未签名。首次打开时，系统可能要求手动确认。
-          releaseDraft: true
-          prerelease: ${{ steps.edition.outputs.prerelease == 'true' }}
+          includeUpdaterJson: false
           args: ${{ matrix.args }} ${{ steps.edition.outputs.extra_args }}
+
+      - name: Retain platform installers for final verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: |
+            src-tauri/target/**/release/bundle/**/*.dmg
+            src-tauri/target/**/release/bundle/**/*.deb
+            src-tauri/target/**/release/bundle/**/*.rpm
+            src-tauri/target/**/release/bundle/**/*.AppImage
+            src-tauri/target/**/release/bundle/**/*.msi
+            src-tauri/target/**/release/bundle/**/*.exe
+          if-no-files-found: error
+          retention-days: 7
 
   finalize:
     name: Verify assets and publish release
@@ -102,20 +137,80 @@ jobs:
       contents: write
 
     steps:
-      - name: Download uploaded installers
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Download platform installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-downloads
+          merge-multiple: true
+
+      - name: Flatten and verify the platform set
+        shell: bash
         run: |
           mkdir release-assets
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          while IFS= read -r -d '' asset; do
+            name="$(basename "$asset")"
+            if [[ -e "release-assets/$name" ]]; then
+              echo "Duplicate release asset name: $name" >&2
+              exit 1
+            fi
+            cp "$asset" "release-assets/$name"
+          done < <(find release-downloads -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.msi' -o -name '*.exe' \) -print0)
+
+          require_count() {
+            pattern="$1"
+            minimum="$2"
+            count="$(find release-assets -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')"
+            if (( count < minimum )); then
+              echo "Expected at least $minimum asset(s) matching $pattern; found $count" >&2
+              exit 1
+            fi
+          }
+
+          require_count '*.dmg' 2
+          require_count '*.deb' 1
+          require_count '*.rpm' 1
+          require_count '*.AppImage' 1
+          require_count '*.msi' 1
+          require_count '*.exe' 1
+
+          find release-assets -maxdepth 1 -type f -print | sort
 
       - name: Generate SHA-256 checksums
         working-directory: release-assets
         run: sha256sum -- * > SHA256SUMS
 
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: |
+            Download the installer for your platform from the assets below. SHA-256 checksums are provided in `SHA256SUMS`.
+            请从下方 Assets 下载对应平台的安装包；`SHA256SUMS` 提供 SHA-256 校验值。
+
+            macOS packages are ad-hoc signed and not notarized; Windows packages are currently unsigned. The operating system may ask for manual confirmation before opening the app.
+            macOS 安装包目前采用 ad-hoc 签名且未经 notarization；Windows 安装包目前未签名。首次打开时，系统可能要求手动确认。
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-alpha* ]]; then
+            release_title="Black Box Preview $GITHUB_REF_NAME"
+            prerelease_flag="--prerelease"
+          else
+            release_title="Black Box $GITHUB_REF_NAME"
+            prerelease_flag="--prerelease=false"
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$release_title" --notes "$RELEASE_NOTES" $prerelease_flag
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "$release_title" --notes "$RELEASE_NOTES" $prerelease_flag
+          fi
+
       - name: Upload checksums and publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          gh release upload "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          if [[ "$GITHUB_REF_NAME" == *-alpha* ]]; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

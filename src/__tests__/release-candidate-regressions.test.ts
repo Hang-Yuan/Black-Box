@@ -50,10 +50,25 @@ describe('release candidate safety regressions', () => {
     expect(packageJson.packageManager).toBe('pnpm@9.15.9');
     expect(releaseWorkflow).toContain('version: 9.15.9');
     expect(releaseWorkflow).toContain('pnpm install --frozen-lockfile');
+    expect(releaseWorkflow).toContain('name: Validate release source');
+    expect(releaseWorkflow).toContain('needs: validate');
+    expect(releaseWorkflow).toContain('pnpm exec vitest run');
+    expect(releaseWorkflow).toContain('pnpm audit:candidate');
     expect(releaseWorkflow).not.toContain('APPLE_CERTIFICATE:');
+    expect(releaseWorkflow).not.toContain('tagName: ${{ github.ref_name }}');
+    expect(releaseWorkflow).toContain('uses: actions/upload-artifact@v4');
+    expect(releaseWorkflow).toContain('uses: actions/download-artifact@v4');
+    expect(releaseWorkflow).toContain("require_count '*.dmg' 2");
+    expect(releaseWorkflow).toContain("require_count '*.exe' 1");
     expect(releaseWorkflow).toContain('needs: release');
     expect(releaseWorkflow).toContain('sha256sum -- * > SHA256SUMS');
+    expect(releaseWorkflow).toContain('gh release create');
     expect(releaseWorkflow).toContain('--draft=false --latest');
+  });
+
+  it('keeps native custom model discovery available on Windows', () => {
+    expect(rustEntry).toContain('#[cfg(target_os = "windows")]\nfn login_shell_anthropic_env()');
+    expect(rustEntry).toContain('std::env::vars()');
   });
 
   it('keeps the local macOS release path offline and owner-safe', () => {
