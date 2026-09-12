@@ -58,6 +58,7 @@ describe('release candidate safety regressions', () => {
     expect(releaseWorkflow).not.toContain('tagName: ${{ github.ref_name }}');
     expect(releaseWorkflow).toContain('uses: actions/upload-artifact@v4');
     expect(releaseWorkflow).toContain('uses: actions/download-artifact@v4');
+    expect(releaseWorkflow).toContain('normalized_name="${name// /.}"');
     expect(releaseWorkflow).toContain("require_count '*.dmg' 2");
     expect(releaseWorkflow).toContain("require_count '*.exe' 1");
     expect(releaseWorkflow).toContain('needs: release');

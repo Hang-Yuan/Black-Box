@@ -150,11 +150,12 @@ jobs:
           mkdir release-assets
           while IFS= read -r -d '' asset; do
             name="$(basename "$asset")"
-            if [[ -e "release-assets/$name" ]]; then
-              echo "Duplicate release asset name: $name" >&2
+            normalized_name="${name// /.}"
+            if [[ -e "release-assets/$normalized_name" ]]; then
+              echo "Duplicate release asset name after normalization: $normalized_name" >&2
               exit 1
             fi
-            cp "$asset" "release-assets/$name"
+            cp "$asset" "release-assets/$normalized_name"
           done < <(find release-downloads -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.msi' -o -name '*.exe' \) -print0)
 
           require_count() {
