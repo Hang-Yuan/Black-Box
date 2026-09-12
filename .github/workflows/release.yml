@@ -72,7 +72,7 @@ jobs:
           workspaces: './src-tauri -> target'
 
       - name: Install frontend dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Build the app
         uses: tauri-apps/tauri-action@v0
@@ -81,16 +81,41 @@ jobs:
           EDITION: ${{ steps.edition.outputs.edition }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: ${{ steps.edition.outputs.release_name }}
-          releaseBody: 'See the assets to download and install this version.'
+          releaseBody: |
+            Download the installer for your platform from the assets below.
+            请从下方 Assets 下载对应平台的安装包。
+
+            macOS packages are ad-hoc signed and not notarized; Windows packages are currently unsigned. The operating system may ask for manual confirmation before opening the app.
+            macOS 安装包目前采用 ad-hoc 签名且未经 notarization；Windows 安装包目前未签名。首次打开时，系统可能要求手动确认。
           releaseDraft: true
           prerelease: ${{ steps.edition.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }} ${{ steps.edition.outputs.extra_args }}
+
+  finalize:
+    name: Verify assets and publish release
+    needs: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download uploaded installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release-assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum -- * > SHA256SUMS
+
+      - name: Upload checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

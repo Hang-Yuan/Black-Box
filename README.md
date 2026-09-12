@@ -17,6 +17,12 @@ A desktop GUI client for Claude Code CLI.
 
 Black Box wraps the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) in a native desktop app — file explorer, session management, streaming chat, and structured permission control in one window.
 
+## Download
+
+Installers for macOS (Apple Silicon and Intel), Windows, and Linux are available on the [latest release](https://github.com/Hang-Yuan/Black-Box/releases/latest) page. Every formal release includes SHA-256 checksums.
+
+> macOS packages are currently ad-hoc signed and not notarized; Windows packages are currently unsigned. Your operating system may ask for manual confirmation before opening the app.
+
 ## Build from Source
 
 ### Prerequisites

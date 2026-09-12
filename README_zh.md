@@ -17,6 +17,12 @@ Claude Code CLI 桌面客户端。
 
 Black Box 将 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 封装为原生桌面应用 — 文件浏览、会话管理、流式对话、结构化权限控制集于一窗。
 
+## 下载
+
+macOS（Apple Silicon 与 Intel）、Windows 和 Linux 安装包可从[最新 Release](https://github.com/Hang-Yuan/Black-Box/releases/latest)页面下载。每个正式版本均附带 SHA-256 校验文件。
+
+> macOS 安装包目前采用 ad-hoc 签名且未经 notarization；Windows 安装包目前未签名。首次打开时，操作系统可能要求手动确认。
+
 ## 从源码构建
 
 ### 前置条件

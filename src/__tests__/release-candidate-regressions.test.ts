@@ -15,6 +15,7 @@ const cargoLock = readFileSync(resolve(root, 'src-tauri/Cargo.lock'), 'utf-8');
 const changelog = readFileSync(resolve(root, 'src/lib/changelog.ts'), 'utf-8');
 const macBuildScript = readFileSync(resolve(root, 'scripts/build-macos-local.sh'), 'utf-8');
 const candidateAudit = readFileSync(resolve(root, 'scripts/candidate-audit.mjs'), 'utf-8');
+const releaseWorkflow = readFileSync(resolve(root, '.github/workflows/release.yml'), 'utf-8');
 
 describe('release candidate safety regressions', () => {
   it('disables app self-update until this fork owns a signed release channel', () => {
@@ -43,6 +44,16 @@ describe('release candidate safety regressions', () => {
     expect(cargoVersion).toBe(packageJson.version);
     expect(lockVersion).toBe(packageJson.version);
     expect(changelog).toContain("version: '0.14.49'");
+  });
+
+  it('publishes reproducible multi-platform releases with checksums', () => {
+    expect(packageJson.packageManager).toBe('pnpm@9.15.9');
+    expect(releaseWorkflow).toContain('version: 9.15.9');
+    expect(releaseWorkflow).toContain('pnpm install --frozen-lockfile');
+    expect(releaseWorkflow).not.toContain('APPLE_CERTIFICATE:');
+    expect(releaseWorkflow).toContain('needs: release');
+    expect(releaseWorkflow).toContain('sha256sum -- * > SHA256SUMS');
+    expect(releaseWorkflow).toContain('--draft=false --latest');
   });
 
   it('keeps the local macOS release path offline and owner-safe', () => {
