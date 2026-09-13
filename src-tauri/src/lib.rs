@@ -4,6 +4,7 @@ mod client_runtime;
 mod app_update;
 mod commands;
 mod conversation_projection;
+mod conversation_handoff;
 mod debug_runtime_guard;
 mod desktop_pet;
 pub mod env_manager;
@@ -12762,6 +12763,7 @@ pub fn run() {
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
         .manage(CliMaintenanceState::default())
+        .manage(conversation_handoff::HandoffState::default())
         .manage(app_update::AppUpdateState::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PowerAssertionState::default())
@@ -13107,6 +13109,9 @@ pub fn run() {
             load_plans,
             save_plans,
             generate_session_title,
+            conversation_handoff::generate_conversation_handoff,
+            conversation_handoff::cancel_conversation_handoff,
+            conversation_handoff::validate_conversation_handoff,
             load_providers,
             save_providers,
             clear_provider_credential,

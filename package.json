@@ -1,7 +1,7 @@
 {
   "name": "blackbox",
   "private": true,
-  "version": "0.14.54",
+  "version": "0.14.55",
   "packageManager": "pnpm@9.15.9",
   "type": "module",
   "scripts": {
@@ -31,6 +31,7 @@
     "test:loop-lifecycle-smoke": "bash scripts/run-isolated.sh node scripts/loop-lifecycle-smoke.mjs",
     "test:scheduled-activity-smoke": "bash scripts/run-isolated.sh node scripts/scheduled-activity-smoke.mjs",
     "test:provider-persistence-smoke": "bash scripts/run-isolated.sh node scripts/provider-persistence-smoke.mjs",
+    "test:conversation-handoff-smoke": "bash scripts/run-isolated.sh node scripts/conversation-handoff-smoke.mjs",
     "audit:candidate": "node scripts/candidate-audit.mjs",
     "audit:source-release": "node scripts/candidate-audit.mjs --source-release --check",
     "build": "tsc && vite build",

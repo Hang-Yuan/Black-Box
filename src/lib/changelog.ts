@@ -19,6 +19,23 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.55', date: '2026-09-13',
+    highlights: {
+      zh: [
+        '长会话续接由原会话模型整理有长度预算的任务摘要，先预览目标、已完成、待决定事项与证据入口，再创建续接草稿',
+        '校验引用与原始记录，保留原会话和草稿；生成可取消，记录变化时要求重新生成',
+        '续接保留任务组、递增名称以及 API、主模型和子模型；待用户决定时先提出问题并等待',
+        '上下文提示显示当前用量与估计占比，较高占用时再提示压缩或续接',
+      ],
+      en: [
+        'Long-session continuation prepares a bounded task-state summary with the source model and previews completed work, pending decisions and references before creating a draft',
+        'Validates references and source history, preserves the original conversation and draft, supports cancellation and requires regeneration after source changes',
+        'Retains the task group, incremented title, API route, main model and subagent model; asks pending user decisions before continuing work',
+        'Context indicators show measured usage and estimated occupancy, with compaction or continuation advice at higher usage',
+      ],
+    },
+  },
+  {
     version: '0.14.54', date: '2026-09-13',
     highlights: {
       zh: [

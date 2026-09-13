@@ -1258,6 +1258,11 @@ export const bridge = {
     invoke<void>('save_review_comments', { data }),
 
   // AI title generation (spawns separate CLI process, no channel interference)
+  generateConversationHandoff: (requestId: string, sourceId: string, model: string, providerId: string | null, locale: string) =>
+    invoke<import('./conversation-handoff').GeneratedHandoff>('generate_conversation_handoff', { requestId, sourceId, model, providerId, locale }),
+  cancelConversationHandoff: (requestId: string) => invoke<void>('cancel_conversation_handoff', { requestId }),
+  validateConversationHandoff: (sourceId: string, sourceDigest: string) =>
+    invoke<void>('validate_conversation_handoff', { sourceId, sourceDigest }),
   generateSessionTitle: (userMessage: string, assistantMessage: string, providerId?: string) =>
     invoke<string | null>('generate_session_title', { userMessage, assistantMessage, providerId: providerId || null }),
 

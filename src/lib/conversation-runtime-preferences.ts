@@ -256,6 +256,14 @@ function seedConversationRuntimePreference(
   return mutationQueue;
 }
 
+/** Prepare the continuation's route before selection applies draft defaults. */
+export async function inheritContinuationRuntimePreference(sourceId: string, draftId: string): Promise<void> {
+  await mutationQueue;
+  await ensureLoaded();
+  if (useSessionStore.getState().selectedSessionId !== sourceId) throw new Error('HANDOFF_SOURCE_CHANGED');
+  preferences[draftId] = { ...(preferences[sourceId] ?? captureCurrentPreference()) };
+}
+
 /**
  * Restore a thread before its cached or disk transcript becomes interactive.
  * A first-seen conversation is seeded from the current global choice.
@@ -372,15 +380,16 @@ export function initializeConversationRuntimePreferences(): void {
       state.selectedSessionId === previous.selectedSessionId
       || !state.selectedSessionId?.startsWith('draft_')
     ) return;
-    const preference = captureNewConversationPreference();
+    const inherited = preferences[state.selectedSessionId];
+    const preference = inherited ?? captureNewConversationPreference();
     const defaults = useProviderStore.getState();
-    if (defaults.defaultApi && defaults.defaultMainModel && defaults.defaultAuxiliaryModel) {
+    if (inherited || (defaults.defaultApi && defaults.defaultMainModel && defaults.defaultAuxiliaryModel)) {
       restoringDepth += 1;
       try {
         useProviderStore.getState().setActive(preference.providerId);
         useSettingsStore.getState().setSelectedModel(preference.selectedModel);
         useSettingsStore.getState().setAuxiliaryModel(preference.auxiliaryModel);
-        useSettingsStore.getState().setCustomModelId(null);
+        useSettingsStore.getState().setCustomModelId(preference.customModelId);
       } finally {
         restoringDepth -= 1;
       }

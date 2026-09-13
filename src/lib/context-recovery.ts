@@ -112,6 +112,14 @@ export function effectiveContextInputTokens(usage: ContextDropUsage | undefined)
   ), 0);
 }
 
+/** Report occupancy separately from advice; 60% is not "nearly full". */
+export function projectContextPressure(inputTokens: number, contextWindow: number) {
+  const used = Number.isFinite(inputTokens) ? Math.max(0, inputTokens) : 0;
+  const window = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 200_000;
+  const ratio = used / window;
+  return { used, window, percent: Math.round(ratio * 100), visible: ratio >= 0.6, high: ratio >= 0.8 };
+}
+
 /**
  * Decide one bounded recovery step for a successful CLI result that did not
  * close the user's turn with visible output.

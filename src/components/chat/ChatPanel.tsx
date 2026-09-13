@@ -1,5 +1,5 @@
-import { buildConversationHandoff } from '../../lib/conversation-handoff';
-import { classifySessionSilence } from '../../lib/context-recovery';
+import { ConversationHandoff } from './ConversationHandoff';
+import { classifySessionSilence, projectContextPressure } from '../../lib/context-recovery';
 import { captureConversationViewport, restoreConversationViewport, type ConversationViewportSnapshot } from '../../lib/conversation-viewport';
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
@@ -734,7 +734,7 @@ function formatApiRetryText(retry: ApiRetryStatus, t: (key: string) => string): 
 /** Activity indicator with elapsed time and token count */
 function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   activityStatus: { phase: string; toolName?: string };
-  sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; contextInputTokens?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus; recoveryPhase?: string; contextRemaining?: number };
+  sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; contextInputTokens?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus; recoveryPhase?: string; contextRemaining?: number; spawnedModel?: string; model?: string };
   sessionStatus?: string;
 }) {
   const t = useT();
@@ -769,16 +769,16 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
     ? tokens ? `(${elapsed} · ↓ ${tokens})` : `(${elapsed})`
     : null;
 
-  // Context pressure warning: threshold depends on model context window size
-  // 1M models → warn at 600K; others at 120K (60% of 200K).
+  // Show measured occupancy at 60%; reserve compaction advice for high usage.
   const _selectedModel = useSettingsStore((s) => s.selectedModel);
   const _customModelId = useSettingsStore((s) => s.customModelId);
   const selectedModelResolution = resolveModelOrError(_selectedModel);
-  const resolvedModel = _customModelId ?? (selectedModelResolution.ok ? selectedModelResolution.model : '');
+  const resolvedModel = sessionMeta.spawnedModel || sessionMeta.model || _customModelId || (selectedModelResolution.ok ? selectedModelResolution.model : '');
   const is1MContextModel = isOneMillionModel(resolvedModel);
   const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
   const inputTokens = sessionMeta.contextInputTokens || 0;
-  const contextWarning = !isStopping && inputTokens > contextWindow * 0.6;
+  const contextPressure = projectContextPressure(inputTokens, contextWindow);
+  const contextWarning = !isStopping && contextPressure.visible;
 
   // Stall detection: 120s of silence (no stream activity), not total elapsed time.
   const stallWarning = !isStopping
@@ -812,12 +812,13 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
         </span>
       )}
       {contextWarning && !stallWarning && (
-        <span className="text-xs text-amber-500 ml-2 flex items-center gap-1"
-              title={t('chat.tokenWarning')}>
+        <span className={`text-xs ml-2 flex items-center gap-1 ${contextPressure.high ? 'text-amber-500' : 'text-text-muted'}`}
+              title={t('chat.contextEstimate')}>
           <svg className="w-3.5 h-3.5 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
             <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.168 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
           </svg>
-          {t('chat.tokenWarning')}
+          {t('chat.contextUsage').replace('{used}', formatTokens(inputTokens)).replace('{total}', formatTokens(contextWindow)).replace('{percent}', String(contextPressure.percent))}
+          {contextPressure.high && ` · ${t('chat.tokenWarning')}`}
         </span>
       )}
     </div>
@@ -1496,20 +1497,9 @@ export function ChatPanel() {
         </div>
       )}
 
-      {workingDirectory && messages.length >= 4 && (messages.length >= 100 || (sessionMeta.contextInputTokens ?? 0) >= 120_000) && (
-        <div className="mx-4 mb-2 flex items-center justify-between gap-3 rounded-md border border-border-subtle px-3 py-2 text-xs text-text-muted">
-          <span>{t('chat.longSessionHandoffHint')}</span>
-          <button className="shrink-0 text-accent disabled:opacity-40" disabled={isSessionBusy(sessionStatus)} onClick={() => {
-            if (!selectedSessionId || isSessionBusy(sessionStatus)) return;
-            const draft = buildConversationHandoff(messages, selectedSessionId);
-            useChatStore.getState().saveToCache(selectedSessionId);
-            const id = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            useChatStore.getState().ensureTab(id);
-            useChatStore.getState().setInputDraft(id, draft);
-            useSessionStore.getState().addContinuationDraft(id, workingDirectory, selectedSessionId, t('conv.newChat'));
-            useAgentStore.getState().clearAgents();
-          }}>{t('chat.longSessionHandoff')}</button>
-        </div>
+      {workingDirectory && selectedSessionId && messages.length >= 4 && (messages.length >= 100 || (sessionMeta.contextInputTokens ?? 0) >= 120_000) && (
+        <ConversationHandoff key={selectedSessionId} sourceId={selectedSessionId}
+          model={sessionMeta.spawnedModel || sessionMeta.model || (selectedModelResolution.ok ? selectedModelResolution.model : '')} />
       )}
       {/* Input — only show when a project folder is selected and exists */}
       {workingDirectory && !directoryMissing && <InputBar />}

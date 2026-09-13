@@ -28,6 +28,7 @@ import {
   ensureConversationRuntimeReady,
   forgetConversationRuntimePreference,
   initializeConversationRuntimePreferences,
+  inheritContinuationRuntimePreference,
   moveConversationRuntimePreference,
   restoreConversationRuntimePreference,
 } from '../conversation-runtime-preferences';
@@ -111,6 +112,25 @@ describe('conversation runtime preferences', () => {
         customModelId: null,
       },
     });
+  });
+
+  it('inherits a continuation route before selection and promotion without copying system defaults', async () => {
+    useProviderStore.setState({ defaultApi: 'relay', defaultMainModel: 'opus', defaultAuxiliaryModel: 'sonnet' });
+    selectThread('source');
+    useProviderStore.setState({ activeProviderId: 'relay' });
+    useSettingsStore.getState().setSelectedModel('haiku');
+    useSettingsStore.getState().setAuxiliaryModel('haiku');
+    await inheritContinuationRuntimePreference('source', 'draft_next');
+    selectThread('draft_next');
+    expect(useSettingsStore.getState().selectedModel).toBe('haiku');
+    expect(useSettingsStore.getState().auxiliaryModel).toBe('haiku');
+    expect(useProviderStore.getState().activeProviderId).toBe('relay');
+    await moveConversationRuntimePreference('draft_next', 'continued');
+    expect(mocks.persistedPreferences).toMatchObject({ continued: { selectedModel: 'haiku', auxiliaryModel: 'haiku', providerId: 'relay' } });
+    expect(useProviderStore.getState().defaultMainModel).toBe('opus');
+    selectThread('draft_unrelated');
+    expect(useSettingsStore.getState().selectedModel).toBe('opus');
+    await expect(inheritContinuationRuntimePreference('source', 'draft_stale')).rejects.toThrow('HANDOFF_SOURCE_CHANGED');
   });
 
   it('restores each conversation after switching away and back', async () => {
