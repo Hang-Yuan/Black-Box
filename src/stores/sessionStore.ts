@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { bridge, SessionListItem, ContentSearchResult } from '../lib/tauri-bridge';
 import { useGroupStore } from './groupStore';
+import { nextConversationTitle } from '../lib/conversation-handoff';
 
 // --- Orphan drain callback ---
 // useStreamProcessor exports drainOrphanBuffer(), but sessionStore can't import
@@ -85,6 +86,8 @@ interface SessionState {
   setSelectedSession: (id: string | null) => void;
   /** Insert a temporary "draft" session at the top of the list */
   addDraftSession: (id: string, projectPath: string) => void;
+  /** Create a continuation in its source task group with the next numbered title. */
+  addContinuationDraft: (id: string, projectPath: string, sourceId: string, fallbackTitle: string) => void;
   /** Update an existing draft session's project path (e.g. after folder selection) */
   updateDraftProject: (id: string, projectPath: string) => void;
   /** Update the authoritative cwd shown for any task after a Local/Worktree handoff. */
@@ -184,6 +187,18 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       selectedSessionId: id,
     };
   }),
+
+  addContinuationDraft: (id, projectPath, sourceId, fallbackTitle) => {
+    const source = get().sessions.find((session) => session.id === sourceId);
+    const title = (source ? get().getDisplayName(source) : get().customPreviews[sourceId])
+      ?.trim() || fallbackTitle;
+    const group = useGroupStore.getState().getGroupOfSession(sourceId);
+    // Register metadata before selecting the draft so its first sidebar render
+    // already has the right name and location. promoteDraft migrates both.
+    get().setCustomPreview(id, nextConversationTitle(title));
+    if (group) useGroupStore.getState().addToGroup(id, group.id);
+    get().addDraftSession(id, projectPath);
+  },
 
   updateDraftProject: (id, projectPath) => set((state) => ({
     sessions: state.sessions.map((s) =>

@@ -59,6 +59,7 @@ describe('CLI session identity adoption', () => {
 
   it('atomically moves every draft-scoped authority to the durable CLI UUID', () => {
     useSessionStore.getState().addDraftSession(draftId, '/tmp/project');
+    useSessionStore.getState().setCustomPreview(draftId, 'Project 2');
     useSessionStore.getState().registerStdinTab(stdinId, draftId);
     useChatStore.getState().ensureTab(draftId);
     useChatStore.getState().setSessionMeta(draftId, { stdinId });
@@ -108,6 +109,8 @@ describe('CLI session identity adoption', () => {
     expect(sessions.sessions.find((session) => session.id === realId)?.cliResumeId).toBe(realId);
     expect(sessions.sessions.some((session) => session.id === draftId)).toBe(false);
     expect(localStorage.getItem('blackbox_last_session')).toBe(realId);
+    expect(sessions.customPreviews[realId]).toBe('Project 2');
+    expect(sessions.customPreviews[draftId]).toBeUndefined();
 
     expect(useChatStore.getState().getTab(draftId)).toBeUndefined();
     expect(useChatStore.getState().getTab(realId)?.messages[0]?.content).toBe('keep me');

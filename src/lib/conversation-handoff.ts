@@ -1,5 +1,13 @@
 import type { ChatMessage } from '../stores/chatStore';
 
+/** Treat an unnumbered conversation as part 1; increment only its final digits. */
+export function nextConversationTitle(title: string): string {
+  const name = title.trim();
+  const suffix = name.match(/[0-9]+$/);
+  if (!suffix) return `${name}2`;
+  return `${name.slice(0, suffix.index)}${BigInt(suffix[0]) + BigInt(1)}`;
+}
+
 /** A bounded, visible handoff can be inspected before sending a fresh session. */
 export function buildConversationHandoff(messages: readonly ChatMessage[], sourceId: string) {
   const publicMessages = messages.filter((message) => message.type === 'text'

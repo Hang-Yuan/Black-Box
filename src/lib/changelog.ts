@@ -19,6 +19,19 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.54', date: '2026-09-13',
+    highlights: {
+      zh: [
+        '新会话续接继承原任务组，并自动递增对话名尾号：无尾号时加 2，已有尾号时加 1',
+        '续接草稿首次显示即带名称与分组，发送成为正式会话后继续保留',
+      ],
+      en: [
+        'Fresh-session continuation stays in its source task group and increments the title suffix, starting at 2 for unnumbered titles',
+        'Continuation drafts show their name and group immediately and retain both after the CLI creates the durable session',
+      ],
+    },
+  },
+  {
     version: '0.14.53', date: '2026-09-13',
     highlights: {
       zh: [

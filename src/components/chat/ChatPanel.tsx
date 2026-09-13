@@ -1504,9 +1504,9 @@ export function ChatPanel() {
             const draft = buildConversationHandoff(messages, selectedSessionId);
             useChatStore.getState().saveToCache(selectedSessionId);
             const id = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            useSessionStore.getState().addDraftSession(id, workingDirectory);
             useChatStore.getState().ensureTab(id);
             useChatStore.getState().setInputDraft(id, draft);
+            useSessionStore.getState().addContinuationDraft(id, workingDirectory, selectedSessionId, t('conv.newChat'));
             useAgentStore.getState().clearAgents();
           }}>{t('chat.longSessionHandoff')}</button>
         </div>
