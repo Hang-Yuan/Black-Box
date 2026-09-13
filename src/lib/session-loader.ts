@@ -1,3 +1,4 @@
+import { effectiveContextInputTokens } from './context-recovery';
 import type { ChatMessage } from '../stores/chatStore';
 import { generateMessageId } from '../stores/chatStore';
 import type { AgentActivityEntry, AgentKind, AgentPhase } from '../stores/agentStore';
@@ -36,6 +37,8 @@ export interface LoadedSession {
   messages: ChatMessage[];
   agents: AgentData[];
   mainAgentStartTime: number;
+  contextInputTokens?: number;
+  contextOutputTokens?: number;
 }
 
 /** Claude JSONL timestamps may be epoch numbers or ISO strings. Chat UI needs epoch ms. */
@@ -63,16 +66,6 @@ function isSystemText(text: string): boolean {
     || t.startsWith('Human:')                          // raw conversation format leaks
     || t.includes('<system-reminder>')                 // embedded system reminders
     || t.includes('</system-reminder>');
-}
-
-function mergeLoadedThinkingContent(current: string, incoming: string): string {
-  const base = current.trim();
-  const next = incoming.trim();
-  if (!base) return next;
-  if (!next || next === base) return base;
-  if (next.startsWith(base)) return next;
-  if (base.startsWith(next)) return base;
-  return `${base}\n\n${next}`;
 }
 
 /** Parse raw JSONL messages into structured session data */
@@ -387,41 +380,16 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
               timestamp: normalizeSessionTimestamp(msg.timestamp),
             };
             const existingTextIndex = messages.findIndex((message) => message.id === textId);
-            if (existingTextIndex >= 0) messages[existingTextIndex] = textMessage;
-            else messages.push(textMessage);
-          } else if (block.type === 'thinking') {
-            // Subagent detail belongs in the Process panel. Main-agent
-            // provider thinking remains available in the conversation as the
-            // same compact, default-collapsed row used by the live stream.
-            if (forwardedSubagentEvent) continue;
-            const thinkingContent = typeof block.thinking === 'string'
-              ? block.thinking.trim()
-              : '';
-            if (!thinkingContent) continue;
-            const thinkingId = logicalMessageId
-              ? `${logicalMessageId}__thinking_committed`
-              : generateMessageId();
-            const existingThinkingIndex = messages.findIndex(
-              (message) => message.id === thinkingId && message.type === 'thinking',
-            );
-            if (existingThinkingIndex >= 0) {
-              const existingThinking = messages[existingThinkingIndex];
-              messages[existingThinkingIndex] = {
-                ...existingThinking,
-                content: mergeLoadedThinkingContent(
-                  existingThinking.content,
-                  thinkingContent,
-                ),
+            if (existingTextIndex >= 0) {
+              const existing = messages[existingTextIndex];
+              messages[existingTextIndex] = {
+                ...textMessage,
+                content: existing.isFinalResponse && existing.content.startsWith(textMessage.content)
+                  ? existing.content : textMessage.content,
+                timestamp: existing.timestamp,
+                isFinalResponse: existing.isFinalResponse || textMessage.isFinalResponse,
               };
-            } else {
-              messages.push({
-                id: thinkingId,
-                role: 'assistant',
-                type: 'thinking',
-                content: thinkingContent,
-                timestamp: normalizeSessionTimestamp(msg.timestamp),
-              });
-            }
+            } else messages.push(textMessage);
           } else if (block.type === 'tool_use') {
             // Rebuild agent tree from Agent/Task tool_use blocks
             if (block.name === 'Task' || block.name === 'Agent') {
@@ -520,5 +488,12 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     }
   }
 
-  return { messages, agents, mainAgentStartTime: sessionStartTime };
+  const boundaryFromEnd = [...rawMessages].reverse().findIndex((record) => record.type === 'system' && record.subtype === 'compact_boundary');
+  const boundary = boundaryFromEnd < 0 ? -1 : rawMessages.length - boundaryFromEnd - 1;
+  const lastUsage = rawMessages.slice(boundary + 1).reverse().find((record) => record.type === 'assistant'
+    && !record.parent_tool_use_id && record.message?.usage)?.message.usage;
+  return { messages, agents, mainAgentStartTime: sessionStartTime,
+    contextInputTokens: lastUsage ? effectiveContextInputTokens(lastUsage) : undefined,
+    contextOutputTokens: lastUsage?.output_tokens };
+
 }

@@ -58,8 +58,8 @@ describe('first-class native Workflow regressions', () => {
     expect(composerContract).toContain("kind: 'workflow-auto'");
     expect(nativeWorkflow).toContain('export function buildAutoWorkflowCommand');
     expect(nativeWorkflow).toContain('Interpret the user task semantically');
-    expect(chat).not.toContain('disabled={isSessionBusy(sessionStatus)}');
-    expect(chat).not.toContain('if (!selectedSessionId || isSessionBusy(sessionStatus)) return;');
+    const workflowControl = chat.slice(chat.indexOf('<WorkflowControl'), chat.indexOf('/>', chat.indexOf('<WorkflowControl')));
+    expect(workflowControl).not.toContain('disabled=');
     expect(input).toContain('{selectedSessionId && composerModeTab.taskMode && !floatingCard && (');
     expect(input).not.toContain('taskComposer.taskMode && !isSessionBusy');
   });

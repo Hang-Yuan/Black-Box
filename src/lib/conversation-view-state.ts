@@ -1,6 +1,8 @@
+import type { ConversationViewportSnapshot } from './conversation-viewport';
 export interface ScrollPosition {
   top: number;
   atBottom: boolean;
+  viewport?: ConversationViewportSnapshot;
 }
 
 export interface ConversationPanelState {
@@ -24,10 +26,18 @@ function fileTreePositionKey(sessionId: string, rootPath: string): string {
 
 export function saveChatScrollPosition(sessionId: string, position: ScrollPosition): void {
   chatPositions.set(sessionId, position);
+  try {
+    sessionStorage.setItem(`blackbox:reading:${sessionId}`, JSON.stringify(position));
+  } catch { /* Storage pressure must not break scrolling. */ }
 }
 
 export function loadChatScrollPosition(sessionId: string): ScrollPosition | null {
-  return chatPositions.get(sessionId) ?? null;
+  if (chatPositions.has(sessionId)) return chatPositions.get(sessionId)!;
+  try {
+    const value = JSON.parse(sessionStorage.getItem(`blackbox:reading:${sessionId}`) ?? 'null');
+    if (value && Number.isFinite(value.top) && typeof value.atBottom === 'boolean') return value;
+  } catch { /* Ignore obsolete view state. */ }
+  return null;
 }
 
 export function saveFileScrollPosition(

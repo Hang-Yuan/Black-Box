@@ -66,6 +66,8 @@ export function FileUploadChips({ files, onRemove, isProcessing }: FileUploadChi
             {formatSize(file.size)}
           </span>
 
+          {file.detailPaths?.length ? <span className="text-[10px] text-accent">+{file.detailPaths.length} 细节 / details</span> : null}
+          {file.detailWarning && <span title={file.detailWarning} className="text-warning">⚠</span>}
           {/* Remove button */}
           <button
             onClick={() => onRemove(file.id)}

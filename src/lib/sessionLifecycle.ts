@@ -27,7 +27,6 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useProviderStore } from '../stores/providerStore';
 import { streamController } from '../stream/instance';
 import {
-  getEffectiveThinking,
   type CliPermissionMode,
   type SessionMode,
   type ThinkingLevel,
@@ -762,20 +761,8 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       finalizedAt: Date.now(),
     });
 
-    // 2. Preserve interrupted assistant output. Thinking remains a compact,
-    // collapsed row and is suppressed only when this session explicitly runs
-    // with thinking disabled.
-    const pThinking = tab.partialThinking ?? '';
+    // 2. Preserve interrupted visible assistant output.
     const pText = tab.partialText ?? '';
-    if (pThinking.trim().length > 0 && getEffectiveThinking(tab.sessionMeta) !== 'off') {
-      store.addMessage(tabId, {
-        id: generateInterruptedId('thinking'),
-        role: 'assistant',
-        type: 'thinking',
-        content: pThinking,
-        timestamp: Date.now(),
-      });
-    }
     if (pText.trim().length > 0) {
       store.addMessage(tabId, {
         id: generateInterruptedId('text'),
@@ -804,7 +791,7 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
     const isExplicitStop = teardownReason === 'stop';
     const interruptedAssistantText = isExplicitStop && pText.trim().length > 0 ? pText : undefined;
     const combinedDraftParts = [
-      isExplicitStop ? pendingTurnInput : '',
+      tab.sessionMeta.preflightPrompt || (isExplicitStop ? pendingTurnInput : ''),
       tab.inputDraft ?? '',
       pending.length > 0 ? pending.map((p) => p.text).join('\n\n') : '',
     ].filter((part) => typeof part === 'string' && part.trim().length > 0);
@@ -846,6 +833,8 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       contextRecoveryAttempts: undefined,
       awaitingVisibleAssistantResponse: undefined,
       emptyTerminalRecoveryAfterCompact: undefined,
+      preflightPrompt: undefined,
+      recoveryPhase: undefined,
       interruptedAssistantText,
     });
 
@@ -895,4 +884,41 @@ export function hasAutoCompactFired(tabId: string): boolean {
 /** Clear auto-compact tracking for a tab (called on teardown). */
 export function clearAutoCompact(tabId: string): void {
   autoCompactFiredMap.delete(tabId);
+}
+
+/** Read-only liveness observations never terminate a merely slow process. */
+export function startSessionHealthObserver(): () => void {
+  const missing = new Map<string, number>();
+  let disposed = false;
+  let pending = false;
+  const inspect = async () => {
+    if (pending || disposed) return;
+    pending = true;
+    try {
+      const active = new Set(await bridge.listActiveProcesses());
+      if (disposed) return;
+      const now = Date.now();
+      for (const [tabId, tab] of useChatStore.getState().tabs) {
+        const stdinId = tab.sessionMeta.stdinId;
+        if (!stdinId || !isSessionBusy(tab.sessionStatus) || tab.sessionMeta.teardownReason) continue;
+        if (active.has(stdinId)) { missing.delete(stdinId); continue; }
+        const since = missing.get(stdinId);
+        if (since === undefined) { missing.set(stdinId, now); continue; }
+        if (now - since < 15_000) continue;
+        // Two independent native snapshots agree that ownership has ended.
+        // Reuse normal exit finalization; never spawn a concurrent recovery.
+        const input = tab.sessionMeta.preflightPrompt || tab.sessionMeta.pendingTurnInput;
+        handleProcessExitFinalize(stdinId, true);
+        const store = useChatStore.getState();
+        if (input && !store.getTab(tabId)?.inputDraft) store.setInputDraft(tabId, input);
+        store.addMessage(tabId, { id: generateInterruptedId('text'), role: 'system', type: 'text',
+          content: 'CLI 进程已退出；会话与未发送输入已保留，可继续原任务。 / The CLI process exited. Conversation and unsent input are preserved; continue this task to resume.',
+          timestamp: now });
+        missing.delete(stdinId);
+      }
+    } catch { /* A failed liveness query never counts as a dead process. */ }
+    finally { pending = false; }
+  };
+  const timer = setInterval(() => { void inspect(); }, 15_000);
+  return () => { disposed = true; clearInterval(timer); };
 }

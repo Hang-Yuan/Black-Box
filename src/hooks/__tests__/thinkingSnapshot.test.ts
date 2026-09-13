@@ -90,7 +90,7 @@ describe('thinking snapshot coalescing', () => {
     });
   });
 
-  it('commits thinking once as a stable collapsed-history row', () => {
+  it('discards thinking before public text even when the provider uses reasoning', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-1');
     store.updatePartialThinking('tab-1', 'The user asked. Answer directly.');
@@ -116,14 +116,9 @@ describe('thinking snapshot coalescing', () => {
     });
 
     const tab = useChatStore.getState().getTab('tab-1');
-    expect(firstCommit).toBe(true);
-    expect(secondCommit).toBe(true);
-    expect(tab?.messages.filter((message) => message.type === 'thinking')).toEqual([
-      expect.objectContaining({
-        id: 'msg-final__thinking_committed',
-        content: 'The user asked. Answer directly.',
-      }),
-    ]);
+    expect(firstCommit).toBe(false);
+    expect(secondCommit).toBe(false);
+    expect(tab?.messages.filter((message) => message.type === 'thinking')).toEqual([]);
     expect(tab?.partialThinking).toBe('');
   });
 
@@ -162,7 +157,7 @@ describe('thinking snapshot coalescing', () => {
     expect(tab?.messages.filter((message) => message.type === 'thinking')).toHaveLength(0);
   });
 
-  it('clears stale streaming text for AskUserQuestion without dropping thinking', () => {
+  it('clears stale streaming text for AskUserQuestion without retaining provider thinking', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-question');
     store.updatePartialMessage('tab-question', 'raw question wording');
@@ -172,11 +167,11 @@ describe('thinking snapshot coalescing', () => {
 
     const tab = useChatStore.getState().getTab('tab-question');
     expect(tab?.partialText).toBe('');
-    expect(tab?.partialThinking).toBe('thinking before question');
-    expect(tab?.isStreaming).toBe(true);
+    expect(tab?.partialThinking).toBe('');
+    expect(tab?.isStreaming).toBe(false);
   });
 
-  it('preserves pure thinking-only assistant snapshots as live thinking without duplicating later tail deltas', () => {
+  it('discards private thinking-only snapshots and later tail deltas', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-live-thinking');
     store.updatePartialThinking('tab-live-thinking', 'The user asked ');
@@ -191,13 +186,13 @@ describe('thinking snapshot coalescing', () => {
     __streamThinkingTesting.appendLiveThinkingDelta('tab-live-thinking', 'directly.');
 
     const tab = useChatStore.getState().getTab('tab-live-thinking');
-    expect(preserved).toBe(true);
+    expect(preserved).toBe(false);
     expect(tab?.messages.filter((message) => message.type === 'thinking')).toHaveLength(0);
-    expect(tab?.partialThinking).toBe('The user asked directly.');
+    expect(tab?.partialThinking).toBe('');
     expect(tab?.isStreaming).toBe(true);
   });
 
-  it('keeps raw thinking appends exact for normal adjacent deltas', () => {
+  it('keeps only activity metadata for private thinking deltas', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-overlap');
 
@@ -205,10 +200,10 @@ describe('thinking snapshot coalescing', () => {
     store.updatePartialThinking('tab-overlap', 'enter');
     store.updatePartialThinking('tab-overlap', 'r');
 
-    expect(useChatStore.getState().getTab('tab-overlap')?.partialThinking).toBe('reenterr');
+    expect(useChatStore.getState().getTab('tab-overlap')?.partialThinking).toBe('');
   });
 
-  it('commits streamed thinking at a result-only turn boundary', () => {
+  it('discards streamed thinking at a result-only turn boundary', () => {
     const store = useChatStore.getState();
     store.ensureTab('tab-result');
     store.updatePartialThinking('tab-result', 'result-only thinking');
@@ -220,13 +215,8 @@ describe('thinking snapshot coalescing', () => {
     });
 
     const tab = useChatStore.getState().getTab('tab-result');
-    expect(committed).toBe(true);
-    expect(tab?.messages.filter((message) => message.type === 'thinking')).toEqual([
-      expect.objectContaining({
-        id: 'result-msg__thinking_committed',
-        content: 'result-only thinking',
-      }),
-    ]);
+    expect(committed).toBe(false);
+    expect(tab?.messages.filter((message) => message.type === 'thinking')).toEqual([]);
     expect(tab?.partialThinking).toBe('');
   });
 });

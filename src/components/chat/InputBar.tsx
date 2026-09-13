@@ -1,3 +1,5 @@
+import { planContextBudget } from '../../lib/context-recovery';
+import { getAutoCompactThreshold } from '../../lib/api-provider';
 import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react';
 import { useChatStore, useActiveTab, getActiveTabState, generateMessageId, isSessionBusy, registerLiveComposerSnapshotProvider } from '../../stores/chatStore';
 import { useSettingsStore, MODEL_OPTIONS, mapSessionModeToPermissionMode, setSessionModeLocal, type ThinkingLevel } from '../../stores/settingsStore';
@@ -1005,7 +1007,7 @@ export function InputBar() {
 
     // Append file paths if there are attachments
     if (files.length > 0) {
-      const filePaths = files.map((f) => f.path).join('\n');
+      const filePaths = files.map((f) => [f.path, ...(f.detailPaths?.length ? ['Read the original for layout. For small text, read only the relevant original-resolution detail crops (source x/y coordinates in filenames):', ...f.detailPaths] : [])].join('\n')).join('\n');
       text = `${text}\n\n${t('input.attachedFiles')}\n${filePaths}`;
     }
 
@@ -1262,7 +1264,23 @@ export function InputBar() {
         setActivityStatus(tabId, { phase: 'thinking' });
       };
 
+      const contextBudget = planContextBudget((getActiveTabState().sessionMeta.contextInputTokens ?? 0) + (getActiveTabState().sessionMeta.contextOutputTokens ?? 0),
+        text, getAutoCompactThreshold(getActiveTabState().sessionMeta.spawnedModel));
+      const prepareOutboundPrompt = () => {
+        if (!contextBudget.compact) return text;
+        if (!getActiveTabState().sessionMeta.preflightPrompt) {
+          const compactId = generateMessageId();
+          addMessage(tabId, { id: compactId, role: 'system', type: 'text',
+            content: t('chat.autoCompacting'), commandType: 'processing',
+            commandData: { command: '/compact', automatic: true, preflight: true },
+            commandCompleted: false, commandStartTime: Date.now(), timestamp: Date.now() });
+          setSessionMeta(tabId, { preflightPrompt: text, pendingCommandMsgId: compactId, recoveryPhase: 'compacting' });
+        }
+        setActivityStatus(tabId, { phase: 'thinking' });
+        return '/compact';
+      };
       markTurnPending();
+      setSessionMeta(tabId, { contextRemaining: contextBudget.remaining, recoveryPhase: 'first_event' });
       lastStderrRef.current = ''; // Clear stale stderr before new turn/startup wait
 
       // Use stdinId (desk-generated) for stdin communication, not CLI's own sessionId.
@@ -1347,7 +1365,7 @@ export function InputBar() {
                 // arrive and complete the normal ready transition.
                 try {
                   const stdinModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
-                  await bridge.sendStdin(stdinId, text);
+                  await bridge.sendStdin(stdinId, prepareOutboundPrompt());
                   sentViaStdin = true;
                   if (!getActiveTabState().sessionMeta.spawnedModel) {
                     setSessionMeta(tabId, { spawnedModel: stdinModel });
@@ -1368,7 +1386,7 @@ export function InputBar() {
                 try {
                   const stdinModel = resolveModelForProvider(useSettingsStore.getState().selectedModel);
                   markTurnThinking();
-                  await bridge.sendStdin(stdinId, text);
+                  await bridge.sendStdin(stdinId, prepareOutboundPrompt());
                   sentViaStdin = true;
                   // Defensive: ensure spawnedModel is always recorded after first successful stdin send
                   if (!getActiveTabState().sessionMeta.spawnedModel) {
@@ -1513,7 +1531,7 @@ export function InputBar() {
             // stdin message and expands them after its own init handshake.
             // Waiting for system:init first deadlocks because this CLI emits
             // init only after it receives the first message.
-            prompt: text,
+            prompt: prepareOutboundPrompt(),
             cwd,
             model: spawnConfig.model,
             auxiliary_model: spawnConfig.auxiliaryModel,

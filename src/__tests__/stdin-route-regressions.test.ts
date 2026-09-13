@@ -55,7 +55,7 @@ describe('stdin route regressions', () => {
 
   it('sends the first pre-warm prompt before system:init to avoid the Claude 2.1.220 deadlock', () => {
     expect(inputBarSource).toContain('Claude Code 2.1.220 no longer emits system:init');
-    expect(inputBarSource).toContain('await bridge.sendStdin(stdinId, text);');
+    expect(inputBarSource).toContain('await bridge.sendStdin(stdinId, prepareOutboundPrompt());');
     expect(inputBarSource).not.toContain('holding first message until system:init');
   });
 

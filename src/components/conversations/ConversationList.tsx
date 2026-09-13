@@ -333,15 +333,12 @@ export function ConversationList() {
       .then(() => {
         if (cancelled) return;
         const currentSelected = useSessionStore.getState().selectedSessionId;
-        if (!currentSelected) {
-          const lastId = useSessionStore.getState().getLastSessionId();
-          if (lastId) {
-            const sessions = useSessionStore.getState().sessions;
-            const match = sessions.find((s) => s.id === lastId);
-            if (match) {
-              handleLoadSession(match);
-            }
-          }
+        const restoreId = currentSelected
+          ? (useChatStore.getState().getTab(currentSelected)?.sessionMeta.restoreNeedsHistory ? currentSelected : null)
+          : useSessionStore.getState().getLastSessionId();
+        if (restoreId) {
+          const match = useSessionStore.getState().sessions.find((session) => session.id === restoreId);
+          if (match) handleLoadSession(match);
         }
         interval = setInterval(fetchSessions, 30000);
       })
@@ -493,7 +490,7 @@ export function ConversationList() {
     const { path: sessionPath, id: sessionId, project: projectOrDir } = session;
     const currentTabId = selectedId;
     useSettingsStore.getState().setMainView('chat');
-    if (currentTabId === sessionId) return;
+    if (currentTabId === sessionId && !useChatStore.getState().getTab(sessionId)?.sessionMeta.restoreNeedsHistory) return;
 
     // Save current to cache
     if (currentTabId) {
@@ -568,7 +565,7 @@ export function ConversationList() {
       ) {
         return;
       }
-      const { messages, agents } = parseSessionMessages(rawMessages);
+      const { messages, agents, contextInputTokens, contextOutputTokens } = parseSessionMessages(rawMessages);
       setSessionMeta(sessionId, {
         // A durable disk transcript remains a valid resume target even when
         // its only visible assistant output is a tool card or its compact
@@ -576,6 +573,7 @@ export function ConversationList() {
         turnAcceptedForResume: messages.some(
           (message) => message.role === 'user' || message.role === 'assistant',
         ),
+        contextInputTokens, contextOutputTokens,
         hydratingFromDisk: false,
         hydrationGeneration: undefined,
       });
@@ -807,7 +805,7 @@ export function ConversationList() {
     let draftId: string | null = null;
     try {
       const rawMessages = await bridge.loadSession(session.path);
-      const { messages, agents } = parseSessionMessages(rawMessages);
+      const { messages, agents, contextInputTokens, contextOutputTokens } = parseSessionMessages(rawMessages);
       const currentTabId = useSessionStore.getState().selectedSessionId;
       if (currentTabId) {
         useChatStore.getState().saveToCache(currentTabId);
@@ -830,6 +828,7 @@ export function ConversationList() {
       }
       chat.setSessionStatus(draftId, 'completed');
       chat.setSessionMeta(draftId, {
+        contextInputTokens, contextOutputTokens,
         forkSourceId: parentThreadId,
         sessionId: undefined,
         stdinId: undefined,

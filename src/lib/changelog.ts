@@ -19,6 +19,27 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.53', date: '2026-09-13',
+    highlights: {
+      zh: [
+        '统一会话执行状态与终态回执；后台工作继续运行时保持运行指示，迟到终答保留在所属回复中',
+        '发送前计入缓存上下文并预留响应空间，支持压缩后续接、进程失活恢复提示及长会话续接草稿',
+        '打开文件、切换文件、拖动面板与刷新会话时保持阅读位置；超长代码按独立文件打开、换行、复制与下载',
+        '高分辨率图片保留原图，并生成带来源坐标的细节裁图以辅助读取小字',
+        '新增关于与更新：签名校验、下载进度、空闲安装、草稿恢复及已签名版本回滚',
+        '历史排程支持授权恢复后追平当天任务，执行完成与治理待裁分别展示；thinking 从产品缓存、导出和搜索投影中排除',
+      ],
+      en: [
+        'Unifies execution status and terminal receipts while preserving background work and late final answers',
+        'Accounts for cached context before sending, compacts and resumes, detects exited processes, and prepares fresh-session handoff drafts',
+        'Preserves reading positions across file panels and reloads; opens long code as independent files with wrapping, copy, and save',
+        'Retains original screenshots and adds source-coordinate detail crops for small text',
+        'Adds signed app updates, download progress, idle installation, draft recovery, and rollback to a previously signed version',
+        'Adds authorized historical recovery followed by current-day catch-up; keeps governance decisions separate and private thinking out of product projections',
+      ],
+    },
+  },
+  {
     version: '0.14.51',
     date: '2026-09-11',
     highlights: {

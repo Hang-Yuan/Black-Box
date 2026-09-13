@@ -7,6 +7,19 @@ import { APP_NAME } from './edition';
 
 const messages: Record<Locale, Record<string, string>> = {
   zh: {
+    'automations.recoveryGovernance': '执行收据已通过；治理事项仍待裁决',
+    'automations.recoveryAuthorized': "恢复授权",
+    'automations.recoveryChain': "历史补账 → 当日追平",
+    'automations.recoveryBackfill': "历史补账中",
+    'automations.recoveryCatchup': "当日追平中",
+    'automations.recoveryVerdict': "等待处理；后续执行已暂停",
+    'automations.recoveryComplete': "已完成",
+    'automations.recoveryFailed': "恢复未完成，需处理",
+    'automations.recoveryAuthorize': "授权恢复并追平今天",
+
+    'chat.longSessionHandoff': '新会话续接',
+    'chat.longSessionHandoffHint': '长会话可生成续接草稿，保留原会话供回看。',
+    'settings.tab.about': '关于与更新',
     // Common
     'common.cancel': '取消',
     'common.confirm': '确认',
@@ -457,6 +470,9 @@ const messages: Record<Locale, Record<string, string>> = {
     'chat.tokenWarning': '上下文即将满载，建议 /compact',
     'chat.autoCompacting': '上下文接近上限，自动压缩中...',
     'chat.compactStillRunning': '压缩仍在进行；为防止上下文损坏，完成前不会把会话标为空闲。',
+    'chat.autoCompacted': '压缩完成，继续发送',
+    'chat.slowDetailed': '响应较慢，进程状态仍在检查',
+    'chat.stalledDetailed': '已超过 5 分钟无进展，可能停滞；可停止后继续原会话',
     'chat.stallWarning': '会话仍在运行中，复杂会话可能需要较长时间。若界面持续无任何变化，可停止后重试',
     'chat.apiRetryRateLimit': 'API 限流，正在重试{attempt}...',
     'chat.apiRetryGeneric': '请求失败，正在重试{attempt}...',
@@ -1481,6 +1497,19 @@ const messages: Record<Locale, Record<string, string>> = {
   },
 
   en: {
+    'automations.recoveryGovernance': 'Execution receipt verified; governance decision pending',
+    'automations.recoveryAuthorized': "Recovery authorized",
+    'automations.recoveryChain': "Historical recovery → current-day catch-up",
+    'automations.recoveryBackfill': "Backfilling",
+    'automations.recoveryCatchup': "Catching up",
+    'automations.recoveryVerdict': "Needs a decision; continuation paused",
+    'automations.recoveryComplete': "Complete",
+    'automations.recoveryFailed': "Recovery incomplete; needs attention",
+    'automations.recoveryAuthorize': "Authorize recovery & catch up today",
+
+    'chat.longSessionHandoff': 'Continue in a new conversation',
+    'chat.longSessionHandoffHint': 'Prepare a handoff draft while retaining this conversation.',
+    'settings.tab.about': 'About & updates',
     // Common
     'common.cancel': 'Cancel',
     'common.confirm': 'Confirm',
@@ -1931,6 +1960,9 @@ const messages: Record<Locale, Record<string, string>> = {
     'chat.tokenWarning': 'Context nearly full — try /compact',
     'chat.autoCompacting': 'Context near limit, auto-compacting...',
     'chat.compactStillRunning': 'Compaction is still running. The task stays busy until the CLI confirms completion.',
+    'chat.autoCompacted': 'Compacted; continuing your message',
+    'chat.slowDetailed': 'Slow response; checking process state',
+    'chat.stalledDetailed': 'No progress for 5 minutes; possibly stalled. Stop, then continue this session.',
     'chat.stallWarning': 'Session still running — complex sessions may take a while. If no activity appears, try stopping and retrying',
     'chat.apiRetryRateLimit': 'API rate limited, retrying{attempt}...',
     'chat.apiRetryGeneric': 'Request failed, retrying{attempt}...',

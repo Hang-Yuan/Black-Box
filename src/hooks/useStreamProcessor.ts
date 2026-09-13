@@ -1,7 +1,8 @@
+import { projectExecutionEvent } from '../lib/execution-state';
 import { useCallback, useRef, type MutableRefObject } from 'react';
 import { APP_NAME } from '../lib/edition';
 import { useChatStore, generateMessageId, type ChatMessage } from '../stores/chatStore';
-import { useSettingsStore, getEffectiveMode, getEffectiveThinking } from '../stores/settingsStore';
+import { useSettingsStore, getEffectiveMode } from '../stores/settingsStore';
 import { useSessionStore, setOrphanDrainCallback } from '../stores/sessionStore';
 import {
   useAgentStore,
@@ -272,6 +273,24 @@ export const __orphanTesting = {
 // orphaned buffers without creating a circular import dependency.
 setOrphanDrainCallback(drainOrphanBuffer);
 
+/** A late final may enrich its owned message, without touching a newer stream. */
+export function applyLateAssistantSupplement(tabId: string, msg: any): void {
+  if (msg.parent_tool_use_id) return;
+  const store = useChatStore.getState();
+  const messageId = msg.message?.id || msg.uuid;
+  if (!messageId) return;
+  for (const [index, block] of (msg.message?.content ?? []).entries()) {
+    if (block.type !== 'text') continue;
+    const content = sanitizeAssistantTextForDisplay(block.text ?? '');
+    if (!content.trim() || isCliPlaceholder(block.text)) continue;
+    const id = `${messageId}_text_${index}`;
+    const existing = store.getTab(tabId)?.messages.find((item) => item.id === id);
+    if (existing?.isFinalResponse && existing.content.startsWith(content)) continue;
+    store.addMessage(tabId, { id, role: 'assistant', type: 'text', content,
+      isFinalResponse: msg.message?.stop_reason === 'end_turn', timestamp: existing?.timestamp ?? Date.now() });
+  }
+}
+
 function captureCliSessionIdentity(tabId: string, msg: any, stdinId?: string): string {
   const cliSessionId = msg.session_id || msg.sessionId;
   if (typeof cliSessionId !== 'string' || !cliSessionId.trim()) return tabId;
@@ -343,6 +362,28 @@ interface EmptyTerminalRecoveryResultArgs {
  * Recovery stays on the same stdin/durable session, is bounded, and compacts
  * once before retrying when cached + uncached input is close to the window.
  */
+function handlePreflightCompactResult(tabId: string, msg: any): boolean {
+  if (msg.parent_tool_use_id) return false;
+  const store = useChatStore.getState();
+  const meta = store.getTab(tabId)?.sessionMeta;
+  if (!meta?.preflightPrompt) return false;
+  const prompt = meta.preflightPrompt;
+  const stdinId = msg.__stdinId ?? meta.stdinId;
+  completePendingCommand(tabId, { output: msg.subtype === 'success' ? t('chat.autoCompacted') : String(msg.result ?? 'Compact failed') });
+  store.setSessionMeta(tabId, { preflightPrompt: undefined, recoveryPhase: 'resuming', inputTokens: 0, contextInputTokens: 0, contextOutputTokens: 0, lastProgressAt: Date.now() });
+  const fail = (error: unknown) => {
+    const draft = store.getTab(tabId)?.inputDraft ?? '';
+    store.setInputDraft(tabId, [prompt, draft].filter(Boolean).join('\n\n'));
+    store.setSessionMeta(tabId, { recoveryPhase: undefined });
+    store.setSessionStatus(tabId, 'error');
+    store.addMessage(tabId, { id: generateMessageId(), role: 'system', type: 'text', content: String(error), timestamp: Date.now() });
+  };
+  if (msg.subtype !== 'success' || !stdinId) { fail(msg.result ?? 'Compact failed; input restored'); return true; }
+  store.setSessionStatus(tabId, 'running');
+  bridge.sendStdin(stdinId, prompt).catch(fail);
+  return true;
+}
+
 function handleEmptyTerminalRecoveryResult({
   tabId,
   stdinId,
@@ -654,7 +695,7 @@ function markStdinReady(tabId: string, stdinId: string | undefined, model: strin
 
   if (shouldStartTurn) {
     store.setActivityStatus(tabId, {
-      phase: shouldRenderThinkingForTab(tabId) ? 'thinking' : 'writing',
+      phase: 'thinking',
     });
   }
 
@@ -889,9 +930,10 @@ function backgroundAgentNode(
   };
 }
 
-function shouldRenderThinkingForTab(tabId: string) {
-  const tab = useChatStore.getState().getTab(tabId);
-  return getEffectiveThinking(tab?.sessionMeta) !== 'off';
+function shouldRenderThinkingForTab(_tabId: string) {
+  // The provider setting still controls reasoning effort; product surfaces
+  // expose phase and duration only, never the private reasoning text.
+  return false;
 }
 
 function clearLivePartialThinking(tabId: string, stdinId?: string) {
@@ -1323,8 +1365,33 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
     const now = Date.now();
     const last = lastProgressWriteRef.current[tabId] ?? 0;
     const tab = useChatStore.getState().getTab(tabId);
+    const execution = projectExecutionEvent(tab?.sessionMeta ?? {}, msg);
+    if (execution.duplicate) return false;
+    useChatStore.getState().setSessionMeta(tabId, execution.next);
+    if (!execution.progress && msg.type === 'assistant' && msg.__executionId) {
+      applyLateAssistantSupplement(tabId, msg);
+      return false;
+    }
+    if (execution.progress && tab && !tab.sessionMeta.teardownReason && tab.sessionStatus !== 'stopping') {
+      if (tab.sessionStatus !== 'running') useChatStore.getState().setSessionStatus(tabId, 'running');
+    }
+    if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
+      useChatStore.getState().setSessionMeta(tabId, { contextInputTokens: 0, contextOutputTokens: 0 });
+    }
+    if (execution.progress && !msg.parent_tool_use_id) {
+      const event = msg.type === 'stream_event' ? msg.event : msg;
+      const usage = (event?.type === 'message_start' || msg.type === 'assistant') ? (event?.message ?? msg.message)?.usage : undefined;
+      if (usage) useChatStore.getState().setSessionMeta(tabId, {
+        contextInputTokens: effectiveContextInputTokens(usage), contextOutputTokens: usage.output_tokens ?? 0,
+      });
+      if (event?.type === 'message_delta' && event.usage?.output_tokens != null) {
+        useChatStore.getState().setSessionMeta(tabId, { contextOutputTokens: event.usage.output_tokens });
+      }
+    }
+    // Terminal receipts and late final supplements do not count as new work.
+    if (!execution.progress && msg.type !== 'system') return true;
     const shouldClearApiRetry = shouldClearApiRetryForEvent(msg);
-    if (isHighFrequencyDelta && now - last < 250 && !(shouldClearApiRetry && tab?.sessionMeta.apiRetry)) return;
+    if (isHighFrequencyDelta && now - last < 250 && !(shouldClearApiRetry && tab?.sessionMeta.apiRetry)) return true;
     lastProgressWriteRef.current[tabId] = now;
     const shouldClearTurnMeta = msg.type !== 'system'
       && msg.type !== 'process_exit'
@@ -1333,7 +1400,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
     useChatStore.getState().setSessionMeta(tabId, {
       lastProgressAt: now,
-      ...(hasResumeEvidence ? { turnAcceptedForResume: true } : {}),
+      ...(hasResumeEvidence ? { turnAcceptedForResume: true, recoveryPhase: tab?.sessionMeta.preflightPrompt ? 'compacting' : undefined } : {}),
       ...(shouldClearApiRetry ? { apiRetry: undefined } : {}),
       ...(shouldClearTurnMeta
         ? {
@@ -1344,6 +1411,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
         : {}),
     });
+    return true;
   }, []);
 
   /**
@@ -1361,7 +1429,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
     }
 
     // Update progress for stall detection without writing Zustand state for every token.
-    markStreamProgress(tabId, msg);
+    if (!markStreamProgress(tabId, msg)) return;
     useWorkflowStore.getState().applyStreamEvent(tabId, msg);
 
     switch (msg.type) {
@@ -1963,6 +2031,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
+        if (handlePreflightCompactResult(tabId, msg)) return;
         if (msg.parent_tool_use_id) {
           const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
           const bgResultAgentId = resolveAgentId(msg.parent_tool_use_id, bgAgents);
@@ -2159,7 +2228,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         let bgAutoCompactTriggered = false;
         {
           const bgCompactTab = store.getTab(tabId);
-          const bgResultInputTokens = effectiveContextInputTokens(msg.usage);
+          const bgResultInputTokens = (bgCompactTab?.sessionMeta.contextInputTokens ?? effectiveContextInputTokens(msg.usage)) + (bgCompactTab?.sessionMeta.contextOutputTokens ?? 0);
           const bgCompactStdinId = bgCompactTab?.sessionMeta.stdinId;
           const bgCompactThreshold = getAutoCompactThreshold(bgCompactTab?.sessionMeta.spawnedModel);
           if (bgResultInputTokens > bgCompactThreshold && !hasAutoCompactFired(tabId) && bgCompactStdinId && msg.subtype === 'success') {
@@ -2504,7 +2573,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
     }
 
     // Update progress for stall detection without writing Zustand state for every token.
-    markStreamProgress(tabId, msg);
+    if (!markStreamProgress(tabId, msg)) return;
     useWorkflowStore.getState().applyStreamEvent(tabId, msg);
 
     if (msg.type === 'blackbox_control_request_cancelled') {
@@ -2736,8 +2805,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               agentActions.updatePhase(agentId, 'writing');
             }
           } else {
-            setActivityStatus({ phase: shouldRenderThinkingForTab(tabId) ? 'thinking' : 'writing' });
-            agentActions.updatePhase(agentId, shouldRenderThinkingForTab(tabId) ? 'thinking' : 'writing');
+            setActivityStatus({ phase: 'thinking' });
+            agentActions.updatePhase(agentId, 'thinking');
           }
         }
 
@@ -3456,6 +3525,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
 
       case 'result': {
+        if (handlePreflightCompactResult(tabId, msg)) return;
         // Capture stopping state BEFORE any status updates — needed for drain guard later
         const fgResultTab = useChatStore.getState().getTab(tabId);
         const fgWasStopping = fgResultTab?.sessionStatus === 'stopping';
@@ -3869,7 +3939,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // automatically send /compact to prevent context overflow on the next turn.
         // Fires at most once per session to avoid infinite loops.
         // Threshold is model-aware: 160K for 200K models, 800K for 1M models.
-        const resultInputTokens = effectiveContextInputTokens(msg.usage);
+        const contextMeta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+        const resultInputTokens = (contextMeta?.contextInputTokens ?? effectiveContextInputTokens(msg.usage)) + (contextMeta?.contextOutputTokens ?? 0);
         const compactStdinId = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
         const fgCompactThreshold = getAutoCompactThreshold(useChatStore.getState().getTab(tabId)?.sessionMeta.spawnedModel);
         if (resultInputTokens > fgCompactThreshold && !hasAutoCompactFired(tabId) && compactStdinId && msg.subtype === 'success') {

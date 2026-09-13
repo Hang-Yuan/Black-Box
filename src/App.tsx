@@ -1,3 +1,4 @@
+import { restoreUpdateDrafts } from './stores/appUpdateStore';
 import { useEffect, useRef, useState } from 'react';
 import { AppShell } from './components/layout/AppShell';
 import { Sidebar } from './components/layout/Sidebar';
@@ -33,6 +34,7 @@ import { parseSessionMessages } from './lib/session-loader';
 import {
   settleOrphanedBackendProcesses,
   startWarmBackendProcessReaper,
+  startSessionHealthObserver,
   teardownTabBackendProcesses,
   teardownSession,
   waitForStdinCleared,
@@ -48,6 +50,7 @@ import {
 import './App.css';
 
 function App() {
+  useEffect(() => { restoreUpdateDrafts(); return startSessionHealthObserver(); }, []);
   const theme = useSettingsStore((s) => s.theme);
   const colorTheme = useSettingsStore((s) => s.colorTheme);
   const surfaceTheme = useSettingsStore((s) => s.surfaceTheme);
@@ -135,6 +138,7 @@ function App() {
     }
 
     (window as any).__blackbox_test = {
+      scenarioStores: { chat: useChatStore, sessions: useSessionStore, settings: useSettingsStore, files: useFileStore },
       getMessages(optsOrTabId?: string | { tabId?: string; last?: number; summary?: boolean }) {
         const opts = typeof optsOrTabId === 'string' ? { tabId: optsOrTabId } : (optsOrTabId || {});
         const id = opts.tabId || useSessionStore.getState().selectedSessionId;
@@ -484,7 +488,8 @@ function App() {
           if (useSessionStore.getState().selectedSessionId !== sessionId) {
             return { switchedTo: sessionId, aborted: true, note: 'User switched away during load' };
           }
-          const { messages, agents } = parseSessionMessages(rawMessages);
+          const { messages, agents, contextInputTokens, contextOutputTokens } = parseSessionMessages(rawMessages);
+          setSessionMeta(sessionId, { contextInputTokens, contextOutputTokens });
           for (const agent of agents) useAgentStore.getState().upsertAgent(agent);
           for (const message of messages) {
             if ((message as any).toolResultContent) {

@@ -190,7 +190,7 @@ describe('automation runtime regressions', () => {
   });
 
   it('exposes Scheduled as a first-class sidebar inbox with unread state', () => {
-    expect(settingsStoreSource).toContain("export type SettingsTab = 'general' | 'provider' | 'cli'");
+    expect(settingsStoreSource).toContain("export type SettingsTab = 'about' | 'general' | 'provider' | 'cli'");
     expect(settingsStoreSource).toContain("export type MainView = 'chat' | 'extensions' | 'automations' | 'taskCenter'");
     expect(settingsStoreSource).toContain("openSettings: (tab?: SettingsTab) => void");
     expect(settingsSource).not.toContain("{ id: 'automations', labelKey: 'settings.tab.automations' }");
@@ -235,7 +235,7 @@ describe('automation runtime regressions', () => {
     expect(automationBackendSource).toContain('retry_of_run_id');
     expect(automationBackendSource).toContain('recovered_by_run_id');
     expect(rustEntrySource).toContain('automations::retry_automation_run');
-    expect(automationUiSource).toContain('bridge.retryAutomationRun(runId)');
+    expect(automationUiSource).toContain('bridge.retryAutomationRun(runId, catchUp)');
     expect(automationUiSource).toContain("case 'RECOVERED':");
     expect(i18nSource).toContain("'automations.status.recovered': '已完成 · 已恢复'");
   });

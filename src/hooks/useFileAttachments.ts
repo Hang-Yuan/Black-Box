@@ -1,3 +1,4 @@
+import { createImageDetails } from '../lib/image-detail';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { bridge } from '../lib/tauri-bridge';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -17,6 +18,8 @@ export interface FileAttachment {
   type: string;
   isImage: boolean;
   preview?: string;   // Base64 data URL for image thumbnails
+  detailWarning?: string;
+  detailPaths?: string[]; // Original-resolution lossless screenshot crops
 }
 
 // --- Helper ---
@@ -112,7 +115,10 @@ async function readFileAsBytes(file: File): Promise<Uint8Array> {
 // --- Hook ---
 
 export function useFileAttachments() {
-  const [files, setFiles] = useState<FileAttachment[]>([]);
+  const [files, setFiles] = useState<FileAttachment[]>(() => {
+    const tabId = useSessionStore.getState().selectedSessionId;
+    return tabId ? useChatStore.getState().getTab(tabId)?.pendingAttachments ?? [] : [];
+  });
   const [isProcessing, setIsProcessing] = useState(false);
   const setFilesForTab = useCallback((tabId: string | null, nextFiles: FileAttachment[]) => {
     if (tabId) {
@@ -145,7 +151,17 @@ export function useFileAttachments() {
             cwd || undefined,
           );
 
+          let detailWarning: string | undefined;
+          const dataUrl = isImageMime(file.type) ? await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file);
+          }).catch(() => { detailWarning = '细节裁图未生成，原图已保留 / Detail crops unavailable; original preserved'; return null; }) : null;
+          const detailPaths = dataUrl ? await createImageDetails(dataUrl, file.name,
+            (name, data) => bridge.saveTempFile(name, data, cwd || undefined)).catch(() => {
+              detailWarning = '细节裁图未生成，原图已保留 / Detail crops unavailable; original preserved';
+              return [];
+            }) : undefined;
           newFiles.push({
+            detailWarning, detailPaths,
             id: generateFileId(),
             name: file.name,
             path: tempPath,
@@ -194,10 +210,16 @@ export function useFileAttachments() {
           // Generate thumbnail for image files (#70) so they display as
           // visual previews in FileUploadChips instead of bare paths.
           let preview: string | undefined;
+          let detailPaths: string[] | undefined;
+          let detailWarning: string | undefined;
           if (isImg) {
             try {
               const b64 = await bridge.readFileBase64(filePath);
-              const dataUrl = `data:${mime};base64,${b64}`;
+              const dataUrl = b64.startsWith('data:') ? b64 : `data:${mime};base64,${b64}`;
+              detailPaths = await createImageDetails(dataUrl, name, (tileName, bytes) =>
+                bridge.saveTempFile(tileName, bytes, useSettingsStore.getState().workingDirectory || undefined)).catch(() => {
+                  detailWarning = '细节裁图未生成，原图已保留 / Detail crops unavailable; original preserved'; return [];
+                });
               preview = await new Promise<string | undefined>((resolve) => {
                 const img = new Image();
                 img.onload = () => {
@@ -226,6 +248,7 @@ export function useFileAttachments() {
             id: generateFileId(),
             name,
             path: filePath,
+            detailPaths, detailWarning,
             size: fileSize,
             type: mime,
             isImage: isImg,

@@ -245,11 +245,13 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
     (option) => option.id === defaultAuxiliaryModel,
   )?.label;
 
+  const [recoveryPlans, setRecoveryPlans] = useState<Awaited<ReturnType<typeof bridge.listAutomationRecoveryPlans>>>([]);
   const load = useCallback(async () => {
     try {
-      const [nextItems, nextRuns] = await Promise.all([
-        bridge.listAutomations(), bridge.listAutomationRuns(undefined, 50),
+      const [nextItems, nextRuns, nextRecoveryPlans] = await Promise.all([
+        bridge.listAutomations(), bridge.listAutomationRuns(undefined, 50), bridge.listAutomationRecoveryPlans(),
       ]);
+      setRecoveryPlans(nextRecoveryPlans);
       setItems(nextItems);
       setRuns(nextRuns);
       setError('');
@@ -646,13 +648,13 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
     }
   }, [load, prepareProviderForRun]);
 
-  const retryRun = useCallback(async (runId: string) => {
+  const retryRun = useCallback(async (runId: string, catchUp = false) => {
     if (retryingRunId) return;
     setError('');
     setRetryingRunId(runId);
     try {
       if (!await prepareProviderForRun()) return;
-      await bridge.retryAutomationRun(runId);
+      await bridge.retryAutomationRun(runId, catchUp);
       await load();
     } catch (reason) {
       setError(String(reason));
@@ -1057,6 +1059,16 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   </div>
                 </div>
               </summary>
+              {recoveryPlans.filter((plan) => plan.originalRunId === run.runId || plan.recoveryRunId === run.runId || plan.catchupRunId === run.runId).map((plan) => (
+                <div key={plan.originalRunId} className="mt-3 rounded-md border border-border-subtle bg-bg-secondary/60 p-3 text-[11px] leading-6">
+                  <p>{t('automations.recoveryAuthorized')} · {formatTime(plan.authorizedAt, locale)}</p>
+                  {plan.governancePending && <p className="text-warning">{t('automations.recoveryGovernance')}</p>}
+                  <p>{t('automations.recoveryChain')} · {plan.phase === 'BACKFILL' ? (t('automations.recoveryBackfill'))
+                    : plan.phase === 'CATCHUP' ? (t('automations.recoveryCatchup'))
+                    : plan.phase === 'VERDICT_PENDING' ? (t('automations.recoveryVerdict'))
+                    : plan.phase === 'COMPLETE' ? (t('automations.recoveryComplete')) : (t('automations.recoveryFailed'))}</p>
+                </div>
+              ))}
               {run.status === 'RECOVERED' && (
                 <div className="mt-3 rounded-md border border-success/20 bg-success/5 px-3 py-2 text-[10px] text-text-muted">
                   {t('automations.recoveredDetail').replace(
@@ -1305,6 +1317,10 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   }} className="text-[11px] text-red-500 hover:text-red-400">{t('automations.stop')}</button>
                 ) : (
                   <>
+                    {run.status === 'FAILED' && !run.retryOfRunId && run.scheduledAt && (
+                      <button disabled={retryingRunId === run.runId} onClick={() => void retryRun(run.runId, true)}
+                        className="text-[11px] text-accent disabled:opacity-50">{t('automations.recoveryAuthorize')}</button>
+                    )}
                     {run.status === 'FAILED' && !run.retryOfRunId && (
                       <button
                         disabled={retryingRunId === run.runId}

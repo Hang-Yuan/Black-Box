@@ -9,7 +9,7 @@ export type ColorTheme = 'black' | 'blue' | 'purple' | 'green';
 export type SurfaceTheme = 'graphite' | 'midnight' | 'paper' | 'forest';
 export type SecondaryPanelTab = 'activity' | 'files';
 export type MainView = 'chat' | 'extensions' | 'automations' | 'taskCenter';
-export type SettingsTab = 'general' | 'provider' | 'cli' | 'desktopPet';
+export type SettingsTab = 'about' | 'general' | 'provider' | 'cli' | 'desktopPet';
 export type ModelTier = 'fable' | 'opus' | 'sonnet' | 'haiku';
 /** @deprecated Prefer ModelTier. Kept as a source-compatible alias. */
 export type ModelId = ModelTier;

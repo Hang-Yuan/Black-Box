@@ -176,3 +176,22 @@ export function shouldRetryContextDrop(
     && cacheCreationTokens === 0
     && cacheReadTokens === 0;
 }
+
+/** Conservative preflight estimate, including a response/tool reserve. */
+export function planContextBudget(inputTokens: number, prompt: string, compactThreshold: number) {
+  const threshold = Math.max(0, compactThreshold);
+  const promptTokens = Math.ceil(new TextEncoder().encode(prompt).length / 3);
+  const reserve = Math.max(8_000, Math.ceil(threshold * 0.08));
+  const used = Math.max(0, inputTokens || 0);
+  return { promptTokens, reserve, remaining: Math.max(0, Math.floor(threshold / 0.8) - used - promptTokens),
+    compact: threshold > 0 && used > 0 && used + promptTokens + reserve >= threshold };
+}
+
+export function classifySessionSilence(input: { now: number; lastProgressAt?: number; alive?: boolean; waitingForUser?: boolean }) {
+  if (input.alive === false) return 'dead' as const;
+  if (input.waitingForUser) return 'waiting' as const;
+  const silence = input.lastProgressAt ? Math.max(0, input.now - input.lastProgressAt) : 0;
+  if (silence >= 300_000) return 'stalled' as const;
+  if (silence >= 120_000) return 'slow' as const;
+  return 'active' as const;
+}

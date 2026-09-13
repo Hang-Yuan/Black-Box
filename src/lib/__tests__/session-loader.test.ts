@@ -5,6 +5,20 @@ import { __streamThinkingTesting } from '../../hooks/useStreamProcessor';
 import { buildInterruptedContinuationPrompt } from '../interrupted-continuation';
 
 describe('session-loader tool result recovery', () => {
+  it('keeps a completed answer and its reading anchor when a stale prefix arrives after final', () => {
+    const loaded = parseSessionMessages([
+      { type: 'assistant', uuid: 'final', timestamp: 10, message: {
+        id: 'same-answer', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Complete answer with details.' }],
+      } },
+      { type: 'assistant', uuid: 'late-prefix', timestamp: 20, message: {
+        id: 'same-answer', content: [{ type: 'text', text: 'Complete answer' }],
+      } },
+    ]);
+    expect(loaded.messages).toEqual([expect.objectContaining({
+      content: 'Complete answer with details.', timestamp: 10, isFinalResponse: true,
+    })]);
+  });
+
   it('rehydrates mid-loop queued_command attachments as delivered steer messages', () => {
     const loaded = parseSessionMessages([
       {
@@ -136,11 +150,6 @@ describe('session-loader tool result recovery', () => {
 
     expect(loaded.messages).toEqual([
       expect.objectContaining({
-        id: 'logical-message__thinking_committed',
-        type: 'thinking',
-        content: 'internal draft',
-      }),
-      expect.objectContaining({
         id: 'logical-message_text_0',
         type: 'text',
         content: 'final answer',
@@ -148,7 +157,7 @@ describe('session-loader tool result recovery', () => {
     ]);
   });
 
-  it('coalesces replayed thinking wrappers into one historical row', () => {
+  it('omits replayed thinking wrappers from product history', () => {
     const loaded = parseSessionMessages([
       {
         type: 'assistant',
@@ -171,11 +180,6 @@ describe('session-loader tool result recovery', () => {
     ]);
 
     expect(loaded.messages).toEqual([
-      expect.objectContaining({
-        id: 'logical-thinking__thinking_committed',
-        type: 'thinking',
-        content: 'first half second half',
-      }),
     ]);
   });
 
@@ -553,7 +557,7 @@ describe('background assistant finalization', () => {
     useChatStore.setState({ tabs: new Map(), sessionCache: new Map() });
   });
 
-  it('commits background thinking once before clearing stream state', () => {
+  it('discards background thinking before clearing stream state', () => {
     const store = useChatStore.getState();
     store.ensureTab('bg-tab');
     store.updatePartialMessage('bg-tab', 'draft answer');
@@ -582,11 +586,6 @@ describe('background assistant finalization', () => {
 
     const tab = useChatStore.getState().getTab('bg-tab');
     expect(tab?.messages).toEqual([
-      expect.objectContaining({
-        id: 'msg-bg__thinking_committed',
-        type: 'thinking',
-        content: 'draft thought',
-      }),
     ]);
     expect(tab?.partialText).toBe('');
     expect(tab?.partialThinking).toBe('');

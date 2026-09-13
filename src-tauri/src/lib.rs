@@ -1,7 +1,9 @@
 mod automations;
 mod auxiliary_model_hook;
 mod client_runtime;
+mod app_update;
 mod commands;
+mod conversation_projection;
 mod debug_runtime_guard;
 mod desktop_pet;
 pub mod env_manager;
@@ -4003,6 +4005,7 @@ async fn start_claude_session(
         let reader = BufReader::with_capacity(1024 * 1024, stdout);
         let mut lines = reader.lines();
         let mut line_count: u64 = 0;
+        let mut execution_projection = conversation_projection::ExecutionProjection::new(generation.clone());
         let mut emit_fail_count: u32 = 0;
         let spawn_time = std::time::Instant::now();
         loop {
@@ -4020,34 +4023,10 @@ async fn start_claude_session(
             line_count += 1;
             // Log first 10 lines with timing to diagnose startup delay
             if line_count <= 10 {
-                let elapsed = spawn_time.elapsed().as_millis();
-                // CRITICAL: must clamp to char boundary, otherwise slicing
-                // through a multi-byte UTF-8 char (e.g. Chinese punctuation
-                // at byte 149-152) panics the entire stdout reader task,
-                // killing the stream pipeline while CLI is still alive.
-                let end = if line.len() > 150 {
-                    let mut i = 150;
-                    while i > 0 && !line.is_char_boundary(i) {
-                        i -= 1;
-                    }
-                    i
-                } else {
-                    line.len()
-                };
-                let preview = &line[..end];
-                eprintln!(
-                    "[BLACKBOX:stdout] #{} @{}ms type={} preview={}",
-                    line_count,
-                    elapsed,
-                    serde_json::from_str::<Value>(&line)
-                        .ok()
-                        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
-                        .unwrap_or_else(|| "?".into()),
-                    preview
-                );
+                eprintln!("[BLACKBOX:stdout] #{} @{}ms", line_count, spawn_time.elapsed().as_millis());
             }
             // Parse every line as a JSON Value first (avoids serde enum pitfalls)
-            let json = match serde_json::from_str::<Value>(&line) {
+            let mut json = match serde_json::from_str::<Value>(&line) {
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
@@ -4067,6 +4046,8 @@ async fn start_claude_session(
                     tools.join(",")
                 );
             }
+
+            execution_projection.annotate(&mut json);
 
             // Newer SDK transports can cancel a pending control request after an
             // interrupt or tool-state transition. Forward the cancellation to the
@@ -5970,7 +5951,7 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
     for line in reader.lines() {
         if let Ok(line) = line {
             if let Ok(json) = serde_json::from_str::<Value>(&line) {
-                messages.push(json);
+                messages.push(conversation_projection::without_thinking(json));
             }
         }
     }
@@ -7150,7 +7131,7 @@ async fn export_session_json(path: String, output_path: String) -> Result<(), St
     for line in reader.lines() {
         if let Ok(line) = line {
             if let Ok(json) = serde_json::from_str::<Value>(&line) {
-                messages.push(json);
+                messages.push(conversation_projection::without_thinking(json));
             }
         }
     }
@@ -12781,6 +12762,8 @@ pub fn run() {
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
         .manage(CliMaintenanceState::default())
+        .manage(app_update::AppUpdateState::default())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PowerAssertionState::default())
         .plugin(tauri_plugin_process::init())
         .on_window_event(|window, event| {
@@ -13070,6 +13053,10 @@ pub fn run() {
             delete_cli,
             repair_cli,
             install_claude_cli,
+            app_update::get_app_update_status,
+            app_update::check_app_update,
+            app_update::download_app_update,
+            app_update::install_app_update,
             update_claude_cli,
             reinstall_claude_cli,
             check_cli_update,
@@ -13140,6 +13127,7 @@ pub fn run() {
             automations::set_automation_status,
             automations::run_automation_now,
             automations::retry_automation_run,
+            automations::recovery::list_automation_recovery_plans,
             automations::cancel_automation_run,
             automations::list_automation_runs,
             automations::get_automation_worktree_review,

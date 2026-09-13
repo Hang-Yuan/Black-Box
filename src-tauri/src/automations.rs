@@ -4,6 +4,8 @@
 //! next-run calculation, run state, and the Scheduled inbox. The scheduler is
 //! hosted by the desktop app, matching Codex's documented app-running model.
 
+pub mod recovery;
+
 use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc, Weekday};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -881,6 +883,15 @@ fn open_database() -> Result<Connection, String> {
               recovered_by_run_id TEXT,
               recovered_at INTEGER,
               recovery_evidence TEXT
+            );
+            CREATE TABLE IF NOT EXISTS automation_recovery_plans (
+              original_run_id TEXT PRIMARY KEY,
+              automation_id TEXT NOT NULL,
+              recovery_run_id TEXT NOT NULL,
+              authorized_at INTEGER NOT NULL,
+              phase TEXT NOT NULL,
+              catchup_run_id TEXT,
+              governance_pending INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS automation_claims (
               automation_id TEXT NOT NULL,
@@ -4883,7 +4894,7 @@ fn claim_due_automations() -> Result<Vec<(AutomationDefinition, String, i64)>, S
     let now = now_ms();
     let due: Vec<(String, i64, String)> = {
         let mut statement = transaction
-            .prepare("SELECT id,next_run_at,rrule FROM automations WHERE status='ACTIVE' AND next_run_at IS NOT NULL AND next_run_at<=?1 AND active_run_id IS NULL")
+            .prepare("SELECT id,next_run_at,rrule FROM automations WHERE status='ACTIVE' AND next_run_at IS NOT NULL AND next_run_at<=?1 AND active_run_id IS NULL AND NOT EXISTS (SELECT 1 FROM automation_recovery_plans p WHERE p.automation_id=automations.id AND p.phase IN ('BACKFILL','CATCHUP','VERDICT_PENDING'))")
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(params![now], |row| {
@@ -4922,6 +4933,13 @@ fn claim_due_automations() -> Result<Vec<(AutomationDefinition, String, i64)>, S
 async fn scheduler_tick() {
     if crate::cli_update_in_progress() {
         return;
+    }
+    let recovery_runs = match recovery::claim_ready() {
+        Ok(runs) => runs,
+        Err(error) => { eprintln!("[BLACKBOX AUTOMATIONS] recovery plan failed closed: {error}"); return; }
+    };
+    for (definition, run_id, scheduled_at) in recovery_runs {
+        tauri::async_runtime::spawn(execute_automation(definition, run_id, Some(scheduled_at), None));
     }
     match claim_due_automations() {
         Ok(claimed) => {
@@ -5077,7 +5095,7 @@ pub fn run_automation_now(id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn retry_automation_run(run_id: String) -> Result<String, String> {
+pub fn retry_automation_run(run_id: String, catch_up: Option<bool>) -> Result<String, String> {
     if crate::cli_update_in_progress() {
         return Err("CLI_UPDATE_IN_PROGRESS".to_string());
     }
@@ -5112,6 +5130,12 @@ pub fn retry_automation_run(run_id: String) -> Result<String, String> {
     drop(connection);
 
     let (definition, recovery_run_id) = claim_manual_run(&automation_id)?;
+    if catch_up.unwrap_or(false) {
+        if let Err(error) = recovery::authorize(&definition, &run_id, &recovery_run_id) {
+            let _ = open_database()?.execute("UPDATE automations SET active_run_id=NULL WHERE id=?1 AND active_run_id=?2", params![automation_id, recovery_run_id]);
+            return Err(error);
+        }
+    }
     let returned = recovery_run_id.clone();
     tauri::async_runtime::spawn(execute_automation(
         definition,

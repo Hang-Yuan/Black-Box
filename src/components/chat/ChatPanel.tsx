@@ -1,3 +1,6 @@
+import { buildConversationHandoff } from '../../lib/conversation-handoff';
+import { classifySessionSilence } from '../../lib/context-recovery';
+import { captureConversationViewport, restoreConversationViewport, type ConversationViewportSnapshot } from '../../lib/conversation-viewport';
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
 import { isSessionBusy, useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
@@ -219,54 +222,6 @@ function getVisibleConversationTurnKey(container: HTMLElement): string | undefin
   }
 
   return closestBeforeTarget ?? firstVisible;
-}
-
-interface ConversationViewportSnapshot {
-  atBottom: boolean;
-  scrollTop: number;
-  anchorId?: string;
-  anchorOffset?: number;
-}
-
-function captureConversationViewport(container: HTMLElement): ConversationViewportSnapshot {
-  const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
-  const containerRect = container.getBoundingClientRect();
-  const targetY = containerRect.top + Math.min(containerRect.height * 0.35, 240);
-  const anchors = Array.from(
-    container.querySelectorAll<HTMLElement>('[data-conversation-anchor-id]'),
-  );
-  const anchor = anchors.find((element) => {
-    const rect = element.getBoundingClientRect();
-    return rect.top <= targetY && rect.bottom >= targetY;
-  }) ?? anchors.find((element) => element.getBoundingClientRect().bottom >= containerRect.top);
-  return {
-    atBottom,
-    scrollTop: container.scrollTop,
-    anchorId: anchor?.dataset.conversationAnchorId,
-    anchorOffset: anchor
-      ? anchor.getBoundingClientRect().top - containerRect.top
-      : undefined,
-  };
-}
-
-function restoreConversationViewport(
-  container: HTMLElement,
-  snapshot: ConversationViewportSnapshot,
-): void {
-  if (snapshot.atBottom) {
-    container.scrollTop = container.scrollHeight;
-    return;
-  }
-  const anchor = snapshot.anchorId
-    ? Array.from(container.querySelectorAll<HTMLElement>('[data-conversation-anchor-id]'))
-      .find((element) => element.dataset.conversationAnchorId === snapshot.anchorId)
-    : undefined;
-  if (anchor && snapshot.anchorOffset !== undefined) {
-    const nextOffset = anchor.getBoundingClientRect().top - container.getBoundingClientRect().top;
-    container.scrollTop += nextOffset - snapshot.anchorOffset;
-    return;
-  }
-  container.scrollTop = snapshot.scrollTop;
 }
 
 function scrollComparisonToTurn(
@@ -779,7 +734,7 @@ function formatApiRetryText(retry: ApiRetryStatus, t: (key: string) => string): 
 /** Activity indicator with elapsed time and token count */
 function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   activityStatus: { phase: string; toolName?: string };
-  sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus };
+  sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; contextInputTokens?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus; recoveryPhase?: string; contextRemaining?: number };
   sessionStatus?: string;
 }) {
   const t = useT();
@@ -796,6 +751,9 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
     && activityStatus.phase === 'idle';
   const retryText = retryStatus ? formatApiRetryText(retryStatus, t) : null;
   const phaseText = isStopping ? t('chat.stopping')
+    : sessionMeta.recoveryPhase === 'compacting' ? t('chat.autoCompacting')
+    : sessionMeta.recoveryPhase === 'resuming' ? t('chat.reconnecting')
+    : sessionMeta.recoveryPhase === 'first_event' ? t('chat.startingAgent')
     : retryText ? retryText
     : isStarting ? t('chat.startingAgent')
     : activityStatus.phase === 'thinking' ? t('chat.thinking')
@@ -819,7 +777,7 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   const resolvedModel = _customModelId ?? (selectedModelResolution.ok ? selectedModelResolution.model : '');
   const is1MContextModel = isOneMillionModel(resolvedModel);
   const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
-  const inputTokens = sessionMeta.inputTokens || 0;
+  const inputTokens = sessionMeta.contextInputTokens || 0;
   const contextWarning = !isStopping && inputTokens > contextWindow * 0.6;
 
   // Stall detection: 120s of silence (no stream activity), not total elapsed time.
@@ -850,7 +808,7 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
           <svg className="w-3.5 h-3.5 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
             <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z" clipRule="evenodd" />
           </svg>
-          {t('chat.stallWarning')}
+          {classifySessionSilence({ now, lastProgressAt: sessionMeta.lastProgressAt }) === 'stalled' ? t('chat.stalledDetailed') : t('chat.slowDetailed')}
         </span>
       )}
       {contextWarning && !stallWarning && (
@@ -925,17 +883,21 @@ export function ChatPanel() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const viewportSnapshotRef = useRef<ConversationViewportSnapshot | null>(null);
+  const layoutRestoreUntilRef = useRef(0);
 
   const captureViewportBeforeLayoutChange = useCallback(() => {
     const container = scrollRef.current;
-    if (container) viewportSnapshotRef.current = captureConversationViewport(container);
+    if (container && !viewportSnapshotRef.current) viewportSnapshotRef.current = captureConversationViewport(container);
+    layoutRestoreUntilRef.current = performance.now() + 400;
   }, []);
 
   const restoreViewportAfterLayoutChange = useCallback(() => {
     const snapshot = viewportSnapshotRef.current;
     const container = scrollRef.current;
-    viewportSnapshotRef.current = null;
-    if (container && snapshot) restoreConversationViewport(container, snapshot);
+    if (container && snapshot) {
+      layoutRestoreUntilRef.current = performance.now() + 100;
+      restoreConversationViewport(container, snapshot);
+    }
   }, []);
 
   const runWithPreservedViewport = useCallback((change: () => void) => {
@@ -1006,14 +968,14 @@ export function ChatPanel() {
       const filePath = (e as CustomEvent<string>).detail;
       if (!filePath) return;
       // Open secondary panel, hydrate ancestors, then select/preview the file.
-      useSettingsStore.getState().setSecondaryTab('files');
+      runWithPreservedViewport(() => useSettingsStore.getState().setSecondaryTab('files'));
       const rootHint = useSettingsStore.getState().workingDirectory
         || useFileStore.getState().rootPath;
       void useFileStore.getState().openFileReference(filePath, rootHint);
     };
     window.addEventListener('blackbox:open-file', onOpenFile);
     return () => window.removeEventListener('blackbox:open-file', onOpenFile);
-  }, []);
+  }, [runWithPreservedViewport]);
 
   const displayItems = useMemo(
     () => buildConversationDisplayItems(messages, sessionStatus),
@@ -1073,13 +1035,16 @@ export function ChatPanel() {
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
+    if (performance.now() < layoutRestoreUntilRef.current) return;
     // Consider "near bottom" if within 80px of the end
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (!restoringScrollRef.current) viewportSnapshotRef.current = captureConversationViewport(el);
     isNearBottomRef.current = nearBottom;
     if (selectedSessionId && !restoringScrollRef.current) {
       saveChatScrollPosition(selectedSessionId, {
         top: el.scrollTop,
         atBottom: nearBottom,
+        viewport: viewportSnapshotRef.current ?? undefined,
       });
     }
     // Show scroll-to-bottom button when far from bottom (>300px)
@@ -1088,6 +1053,30 @@ export function ChatPanel() {
     if (nearBottom) {
       userScrollingUpRef.current = false;
     }
+  }, [selectedSessionId]);
+
+  // Layout and Markdown hydration can change line wrapping without a scroll event.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    viewportSnapshotRef.current = null;
+    let frame = 0;
+    const restore = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (restoringScrollRef.current || pendingScrollRestoreRef.current) return;
+        const snapshot = viewportSnapshotRef.current;
+        if (snapshot && !snapshot.atBottom) {
+          layoutRestoreUntilRef.current = performance.now() + 100;
+          restoreConversationViewport(el, snapshot);
+        } else if (!snapshot) viewportSnapshotRef.current = captureConversationViewport(el);
+      });
+    };
+    const resize = new ResizeObserver(restore);
+    resize.observe(el);
+    const mutation = new MutationObserver(restore);
+    mutation.observe(el, { subtree: true, childList: true, characterData: true });
+    return () => { resize.disconnect(); mutation.disconnect(); cancelAnimationFrame(frame); };
   }, [selectedSessionId]);
 
   // Each conversation owns its reading position. Switching tabs restores the
@@ -1109,7 +1098,8 @@ export function ChatPanel() {
     const frame = requestAnimationFrame(() => {
       const target = loadChatScrollPosition(selectedSessionId);
       if (target) {
-        el.scrollTop = target.atBottom ? el.scrollHeight : target.top;
+        if (target.viewport) restoreConversationViewport(el, target.viewport);
+        else el.scrollTop = target.atBottom ? el.scrollHeight : target.top;
       } else {
         el.scrollTop = el.scrollHeight;
       }
@@ -1117,10 +1107,12 @@ export function ChatPanel() {
       setShowScrollBtn(distance > 300);
       const contentReady = !target
         || target.atBottom
+        || (target.viewport?.anchorId && Array.from(el.querySelectorAll<HTMLElement>('[data-conversation-anchor-id]')).some((anchor) => anchor.dataset.conversationAnchorId === target.viewport?.anchorId))
         || el.scrollHeight >= target.top + el.clientHeight;
       if (contentReady) {
         pendingScrollRestoreRef.current = null;
         restoringScrollRef.current = false;
+        viewportSnapshotRef.current = captureConversationViewport(el);
       }
     });
     return () => cancelAnimationFrame(frame);
@@ -1131,6 +1123,7 @@ export function ChatPanel() {
     const el = scrollRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      layoutRestoreUntilRef.current = 0;
       if (e.deltaY < 0) {
         // User is scrolling up — suppress auto-scroll
         userScrollingUpRef.current = true;
@@ -1276,6 +1269,7 @@ export function ChatPanel() {
         ref={scrollRef}
         onScroll={handleScroll}
         data-testid="chat-messages"
+        style={{ overflowAnchor: 'none' }}
         className="flex-1 overflow-y-auto px-5 py-6 selectable"
       >
         {!workingDirectory && messages.length === 0 && !isStreaming ? (
@@ -1502,6 +1496,21 @@ export function ChatPanel() {
         </div>
       )}
 
+      {workingDirectory && messages.length >= 4 && (messages.length >= 100 || (sessionMeta.contextInputTokens ?? 0) >= 120_000) && (
+        <div className="mx-4 mb-2 flex items-center justify-between gap-3 rounded-md border border-border-subtle px-3 py-2 text-xs text-text-muted">
+          <span>{t('chat.longSessionHandoffHint')}</span>
+          <button className="shrink-0 text-accent disabled:opacity-40" disabled={isSessionBusy(sessionStatus)} onClick={() => {
+            if (!selectedSessionId || isSessionBusy(sessionStatus)) return;
+            const draft = buildConversationHandoff(messages, selectedSessionId);
+            useChatStore.getState().saveToCache(selectedSessionId);
+            const id = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            useSessionStore.getState().addDraftSession(id, workingDirectory);
+            useChatStore.getState().ensureTab(id);
+            useChatStore.getState().setInputDraft(id, draft);
+            useAgentStore.getState().clearAgents();
+          }}>{t('chat.longSessionHandoff')}</button>
+        </div>
+      )}
       {/* Input — only show when a project folder is selected and exists */}
       {workingDirectory && !directoryMissing && <InputBar />}
       </div>{/* end main chat area */}

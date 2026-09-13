@@ -1,3 +1,4 @@
+import { AboutUpdateTab } from './AboutUpdateTab';
 import { useEffect, useState } from 'react';
 import { type SettingsTab, useSettingsStore } from '../../stores/settingsStore';
 import { useT } from '../../lib/i18n';
@@ -8,6 +9,7 @@ import { CliTab } from './CliTab';
 import { DesktopPetSetting } from './DesktopPetSetting';
 
 const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
+  about: <span aria-hidden>↻</span>,
   general: (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
       <circle cx="8" cy="8" r="3" />
@@ -39,6 +41,7 @@ const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
 };
 
 const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
+  { id: 'about', labelKey: 'settings.tab.about' },
   { id: 'general', labelKey: 'settings.tab.general' },
   { id: 'provider', labelKey: 'settings.tab.provider' },
   { id: 'cli', labelKey: 'settings.tab.cli' },
@@ -119,6 +122,7 @@ export function SettingsPanel() {
 
           {/* Content area */}
           <div className="flex-1 overflow-y-auto px-8 py-6">
+            {activeTab === 'about' && <AboutUpdateTab />}
             {activeTab === 'general' && <GeneralTab />}
             {activeTab === 'provider' && <ProviderTab />}
             {activeTab === 'cli' && <CliTab />}
@@ -126,8 +130,7 @@ export function SettingsPanel() {
           </div>
         </div>
 
-        {/* Footer: local build identity only. App updates stay disabled until
-            this fork owns a signed release channel. */}
+        {/* Local installed build identity. */}
         <SettingsFooter />
       </div>
     </div>

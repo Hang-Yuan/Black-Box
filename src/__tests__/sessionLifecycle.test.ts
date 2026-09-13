@@ -581,7 +581,7 @@ describe('handleProcessExitFinalize', () => {
     expect(mockUnregisterStdinTab).toHaveBeenCalledWith('desk_OLD');
   });
 
-  it('flushes before preserving partial text and compact thinking', () => {
+  it('flushes and preserves visible partial text without product thinking', () => {
     mockGetTabForStdin.mockReturnValue('tab-1');
 
     let tab = {
@@ -606,9 +606,9 @@ describe('handleProcessExitFinalize', () => {
 
     handleProcessExitFinalize('desk_123');
 
-    expect(mockAddMessage).toHaveBeenCalledWith(
+    expect(mockAddMessage).not.toHaveBeenCalledWith(
       'tab-1',
-      expect.objectContaining({ type: 'thinking', content: 'late thinking' }),
+      expect.objectContaining({ type: 'thinking' }),
     );
     expect(mockAddMessage).toHaveBeenCalledWith(
       'tab-1',

@@ -19,7 +19,7 @@ describe('native Loop control', () => {
     expect(loopControl).toContain("new CustomEvent('blackbox:loop-submit'");
     expect(inputBar).toContain("window.addEventListener('blackbox:loop-submit'");
     expect(inputBar).toContain('queueMicrotask(() => handleSubmitRef.current())');
-    expect(inputBar).toContain('prompt: text');
+    expect(inputBar).toContain('prompt: prepareOutboundPrompt()');
     expect(inputBar).toContain('init only after it receives the first message');
     expect(inputBar).not.toContain('sendAfterStdinReady');
   });

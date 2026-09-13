@@ -20,6 +20,9 @@ pub fn emit_to_frontend<S>(app: &AppHandle, event: &str, payload: S) -> Result<(
 where
     S: Serialize + Clone,
 {
+    let payload = crate::conversation_projection::without_thinking(
+        serde_json::to_value(payload).map_err(|error| error.to_string())?,
+    );
     if let Err(e1) = app.emit_to(MAIN_WINDOW_LABEL, event, payload.clone()) {
         if let Err(e2) = app.emit(event, payload) {
             return Err(format!("emit_to failed: {e1}, emit failed: {e2}"));

@@ -1,3 +1,5 @@
+import { extractResponseArtifacts } from '../../lib/response-artifacts';
+import { ResponseArtifacts } from './ResponseArtifacts';
 import React, { memo, useState, useCallback, useMemo, useEffect, type ReactNode } from 'react';
 import Markdown from 'react-markdown';
 import rehypeRaw from 'rehype-raw';
@@ -386,13 +388,16 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
   }, []);
 
   const openReference = useCallback((reference: ParsedFileReference) => {
+    window.dispatchEvent(new Event('blackbox:chat-layout-will-change'));
     useSettingsStore.getState().setSecondaryTab('files');
+    requestAnimationFrame(() => requestAnimationFrame(() => window.dispatchEvent(new Event('blackbox:chat-layout-did-change'))));
     const rootHint = workingDirectory || useFileStore.getState().rootPath;
     void useFileStore.getState().openFileReference(reference, rootHint);
   }, [workingDirectory]);
 
   // Pre-process: wrap bare file paths in backticks so `code` handler makes them clickable
-  const processedContent = useMemo(() => wrapBareFilePaths(content), [content]);
+  const artifactProjection = useMemo(() => sourcePath ? { markdown: content, artifacts: [] } : extractResponseArtifacts(content), [content, sourcePath]);
+  const processedContent = useMemo(() => wrapBareFilePaths(artifactProjection.markdown), [artifactProjection.markdown]);
 
   // Stable components object — only recreated if `t` or resolveBase changes
   const components = useMemo(() => ({
@@ -605,6 +610,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
           {processedContent}
         </Markdown>
       </MarkdownErrorBoundary>
+      {artifactProjection.artifacts.length > 0 && <ResponseArtifacts artifacts={artifactProjection.artifacts} />}
     </div>
   );
 });

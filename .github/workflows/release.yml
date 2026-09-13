@@ -111,6 +111,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           EDITION: ${{ steps.edition.outputs.edition }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           includeUpdaterJson: false
           args: ${{ matrix.args }} ${{ steps.edition.outputs.extra_args }}
@@ -120,6 +122,8 @@ jobs:
         with:
           name: release-${{ matrix.artifact }}
           path: |
+            src-tauri/target/**/release/bundle/**/*.app.tar.gz
+            src-tauri/target/**/release/bundle/**/*.sig
             src-tauri/target/**/release/bundle/**/*.dmg
             src-tauri/target/**/release/bundle/**/*.deb
             src-tauri/target/**/release/bundle/**/*.rpm
@@ -137,45 +141,23 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
       - name: Download platform installers
         uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: release-downloads
-          merge-multiple: true
+          merge-multiple: false
 
-      - name: Flatten and verify the platform set
-        shell: bash
-        run: |
-          mkdir release-assets
-          while IFS= read -r -d '' asset; do
-            name="$(basename "$asset")"
-            normalized_name="${name// /.}"
-            if [[ -e "release-assets/$normalized_name" ]]; then
-              echo "Duplicate release asset name after normalization: $normalized_name" >&2
-              exit 1
-            fi
-            cp "$asset" "release-assets/$normalized_name"
-          done < <(find release-downloads -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.msi' -o -name '*.exe' \) -print0)
-
-          require_count() {
-            pattern="$1"
-            minimum="$2"
-            count="$(find release-assets -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')"
-            if (( count < minimum )); then
-              echo "Expected at least $minimum asset(s) matching $pattern; found $count" >&2
-              exit 1
-            fi
-          }
-
-          require_count '*.dmg' 2
-          require_count '*.deb' 1
-          require_count '*.rpm' 1
-          require_count '*.AppImage' 1
-          require_count '*.msi' 1
-          require_count '*.exe' 1
-
-          find release-assets -maxdepth 1 -type f -print | sort
+      - name: Verify signatures and generate updater manifest
+        run: node scripts/update-manifest.mjs
 
       - name: Generate SHA-256 checksums
         working-directory: release-assets
@@ -184,12 +166,6 @@ jobs:
       - name: Create or update the draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_NOTES: |
-            Download the installer for your platform from the assets below. SHA-256 checksums are provided in `SHA256SUMS`.
-            请从下方 Assets 下载对应平台的安装包；`SHA256SUMS` 提供 SHA-256 校验值。
-
-            macOS packages are ad-hoc signed and not notarized; Windows packages are currently unsigned. The operating system may ask for manual confirmation before opening the app.
-            macOS 安装包目前采用 ad-hoc 签名且未经 notarization；Windows 安装包目前未签名。首次打开时，系统可能要求手动确认。
         run: |
           if [[ "$GITHUB_REF_NAME" == *-alpha* ]]; then
             release_title="Black Box Preview $GITHUB_REF_NAME"
@@ -200,9 +176,9 @@ jobs:
           fi
 
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$release_title" --notes "$RELEASE_NOTES" $prerelease_flag
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$release_title" --notes-file "releases/${GITHUB_REF_NAME}.md" $prerelease_flag
           else
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "$release_title" --notes "$RELEASE_NOTES" $prerelease_flag
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "$release_title" --notes-file "releases/${GITHUB_REF_NAME}.md" $prerelease_flag
           fi
 
       - name: Upload checksums and publish

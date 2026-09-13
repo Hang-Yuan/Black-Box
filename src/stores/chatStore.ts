@@ -1,3 +1,4 @@
+import { useAgentStore, isAgentActive } from './agentStore';
 import { create } from 'zustand';
 import { useSessionStore } from './sessionStore';
 import type { ApiRetryStatus } from '../lib/api-retry';
@@ -143,6 +144,10 @@ export interface SessionMeta {
   pendingCommandMsgId?: string;
   /** Accumulated input tokens from stream events (message_start) — per turn, reset each turn */
   inputTokens?: number;
+  /** Latest API window occupancy, including cached input; never a per-turn sum. */
+  contextInputTokens?: number;
+  contextOutputTokens?: number;
+  restoreNeedsHistory?: boolean;
   /** Accumulated output tokens from stream events (message_delta) — per turn, reset each turn */
   outputTokens?: number;
   /** Cumulative input tokens across ALL turns in this session/task */
@@ -153,6 +158,13 @@ export interface SessionMeta {
   turnStartTime?: number;
   /** Timestamp of last stream activity — used for stall detection instead of total elapsed */
   lastProgressAt?: number;
+  preflightPrompt?: string;
+  recoveryPhase?: 'compacting' | 'resuming' | 'first_event';
+  contextRemaining?: number;
+  backgroundExecutionOnly?: boolean;
+  executionId?: string;
+  closedExecutionIds?: string[];
+  terminalReceipts?: string[];
   /** Latest API retry event for this turn, such as provider 429/backoff state. */
   apiRetry?: ApiRetryStatus;
   /** JSON fingerprint of the active provider config used when spawning the CLI process.
@@ -566,6 +578,13 @@ export function getActiveTabState(): TabSession {
   return tab ?? EMPTY_TAB;
 }
 
+export function hasLiveBackgroundWork(tabId: string): boolean {
+  const agents = useAgentStore.getState();
+  const selected = useSessionStore.getState().selectedSessionId;
+  const current = selected === tabId ? agents.agents : agents.agentCache.get(tabId);
+  return Array.from(current?.values() ?? []).some((agent) => agent.background && isAgentActive(agent));
+}
+
 // --- Store ---
 
 export const useChatStore = create<ChatState>()((set, get) => ({
@@ -578,6 +597,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
   addMessage: (tabId, message) =>
     set((state) => {
+      if (message.type === 'thinking') return state;
       const displayMessage = message.role === 'assistant' && message.type === 'text'
         ? { ...message, content: sanitizeAssistantTextForDisplay(message.content) }
         : message;
@@ -587,7 +607,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         // a complete assistant message that was previously delivered partially.
         const existingIdx = tab.messages.findIndex((m) => m.id === displayMessage.id);
         const messages = existingIdx !== -1
-          ? tab.messages.map((m, i) => i === existingIdx ? { ...m, ...displayMessage } : m)
+          ? tab.messages.map((m, i) => i === existingIdx ? { ...m, ...displayMessage, isFinalResponse: m.isFinalResponse || displayMessage.isFinalResponse } : m)
           : [...tab.messages, displayMessage];
         return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
         // NOTE: partialText/isStreaming are NOT cleared here. Clearing is handled
@@ -610,7 +630,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     set((state) => {
       const result = updateTab(state.tabs, tabId, (tab) => {
         const messages = tab.messages.map((m) =>
-          m.id === id ? { ...m, ...updates } : m,
+          m.id === id ? { ...m, ...updates, isFinalResponse: m.isFinalResponse || updates.isFinalResponse } : m,
         );
         return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
       });
@@ -628,11 +648,11 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       return result ?? state;
     }),
 
-  updatePartialThinking: (tabId, text) =>
+  updatePartialThinking: (tabId, _text) =>
     set((state) => {
       const result = updateTab(state.tabs, tabId, (tab) => ({
         ...tab,
-        partialThinking: tab.partialThinking + text,
+        partialThinking: '',
         isStreaming: true,
         activityStatus:
           tab.activityStatus.phase === 'tool'
@@ -646,7 +666,10 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       return result ?? state;
     }),
 
-  setSessionStatus: (tabId, status) => {
+  setSessionStatus: (tabId, requestedStatus) => {
+    const backgroundOnly = requestedStatus === 'completed'
+      && Boolean(get().getTab(tabId)?.sessionMeta.stdinId) && hasLiveBackgroundWork(tabId);
+    const status = backgroundOnly ? 'running' : requestedStatus;
     // Sync running state to sessionStore for tab indicators.
     // 'reconnecting' counts as running for sidebar indicator purposes
     // (the tab is still actively doing something — recovering).
@@ -659,6 +682,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       const result = updateTab(state.tabs, tabId, (tab) => ({
         ...tab,
         sessionStatus: status,
+        sessionMeta: { ...tab.sessionMeta, backgroundExecutionOnly: backgroundOnly },
+        ...(backgroundOnly ? { isStreaming: false, partialText: '', partialThinking: '', activityStatus: { phase: 'tool' as ActivityPhase } } : {}),
         // Reset streaming state when session reaches a terminal state.
         // IMPORTANT: do NOT reset on 'reconnecting' or 'stopping' — we keep
         // partialText visible so the user sees prior content while we
@@ -670,6 +695,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
             partialThinking: '',
             sessionMeta: {
               ...tab.sessionMeta,
+              backgroundExecutionOnly: false,
               apiRetry: undefined,
               goalRequestActive: undefined,
             },
@@ -711,8 +737,9 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         // Preserve sessionMeta (especially sessionId for resume)
         activityStatus: { phase: 'idle' },
         waitingFor: undefined,
-        inputDraft: '',
-        pendingAttachments: [],
+        inputDraft: tab.sessionMeta.restoreNeedsHistory ? tab.inputDraft : '',
+        pendingAttachments: tab.sessionMeta.restoreNeedsHistory ? tab.pendingAttachments : [],
+        sessionMeta: { ...tab.sessionMeta, restoreNeedsHistory: undefined },
         pendingUserMessages: [],
       }));
       return result ?? state;
@@ -997,6 +1024,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   restoreFromCache: (tabId) => {
     const tab = get().tabs.get(tabId);
     if (!tab) return false;
+    if (tab.sessionMeta.restoreNeedsHistory && useSessionStore.getState().sessions.some((session) => session.id === tabId && session.path)) return false;
     const restoredAt = Date.now();
     // #27/#30 safety net: if tab has zero messages but this is a persisted session
     // (has a disk path), treat as cache miss so the caller falls back to disk load.
@@ -1085,7 +1113,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       return result ?? state;
     });
     // Sync running state to sessionStore for sidebar indicator (FI-1 fix)
-    useSessionStore.getState().setSessionRunning(tabId, tab.sessionStatus === 'running');
+    useSessionStore.getState().setSessionRunning(tabId, isSessionBusy(tab.sessionStatus));
     return true;
   },
 
@@ -1136,3 +1164,17 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     get().updateMessage(tabId, msgId, updates);
   },
 }));
+
+// Background task completion is a runtime fact shared by composer, sidebar,
+// chat and Activity. A root final alone does not settle its surviving children.
+useAgentStore.subscribe(() => {
+  const store = useChatStore.getState();
+  for (const [tabId, tab] of store.tabs) {
+    if (!tab.sessionMeta.stdinId || tab.sessionMeta.teardownReason) continue;
+    const background = hasLiveBackgroundWork(tabId);
+    if ((tab.sessionStatus === 'completed' && background)
+      || (tab.sessionMeta.backgroundExecutionOnly && !background)) {
+      store.setSessionStatus(tabId, 'completed');
+    }
+  }
+});

@@ -99,7 +99,7 @@ describe('B3 · orphan queue', () => {
 
     const tab = useChatStore.getState().getTab('tab_001');
     expect(tab?.partialText).toBe('early tokens ');
-    expect(tab?.partialThinking).toBe('early thinking ');
+    expect(tab?.partialThinking).toBe('');
     expect(__orphanTesting.has('stdin_late')).toBe(false);
   });
 

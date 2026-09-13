@@ -1318,8 +1318,10 @@ export const bridge = {
   runAutomationNow: (id: string) =>
     invoke<string>('run_automation_now', { id }),
 
-  retryAutomationRun: (runId: string) =>
-    invoke<string>('retry_automation_run', { runId }),
+  retryAutomationRun: (runId: string, catchUp = false) =>
+    invoke<string>('retry_automation_run', { runId, catchUp }),
+
+  listAutomationRecoveryPlans: () => invoke<Array<{ originalRunId: string; recoveryRunId: string; authorizedAt: number; phase: string; catchupRunId: string | null; governancePending: boolean }>>('list_automation_recovery_plans'),
 
   cancelAutomationRun: (runId: string) =>
     invoke<void>('cancel_automation_run', { runId }),
