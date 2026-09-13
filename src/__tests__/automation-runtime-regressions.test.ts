@@ -418,6 +418,20 @@ describe('automation runtime regressions', () => {
     expect(automationUiSource).toContain("t('automations.stop')");
   });
 
+  it('bounds silent scheduled runs and resumes the same durable session', () => {
+    expect(automationBackendSource).toContain('BLACKBOX_AUTOMATION_INACTIVITY_TIMEOUT_SECS');
+    expect(automationBackendSource).toContain('DEFAULT_AUTOMATION_INACTIVITY_TIMEOUT_SECS');
+    expect(automationBackendSource).toContain('wait_for_automation_child');
+    expect(automationBackendSource).toContain('stdout_activity_sender.try_send(())');
+    expect(automationBackendSource).toContain('isolate_automation_process_group');
+    expect(automationBackendSource).toContain('collect_automation_pipe');
+    expect(automationBackendSource).toContain('taskkill');
+    expect(automationBackendSource).toContain('recover_automation_stall');
+    expect(automationBackendSource).toContain('Automation produced no stream activity');
+    expect(automationBackendSource).toContain('Resume the SAME durable session');
+    expect(automationBackendSource).toContain('do not blindly relaunch the same stalled Agent call');
+  });
+
   it('snapshots before cleanup and exposes a recoverable worktree flow', () => {
     const cleanupSource = automationBackendSource.slice(
       automationBackendSource.indexOf('pub fn cleanup_automation_worktree'),

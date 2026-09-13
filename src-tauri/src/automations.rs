@@ -20,7 +20,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 const ACTIVE: &str = "ACTIVE";
 const PAUSED: &str = "PAUSED";
@@ -36,6 +36,8 @@ const MAX_REVIEW_FILE_LIST_BYTES: usize = 1024 * 1024;
 const MAX_REVIEW_PATCH_BYTES: usize = 256 * 1024;
 const DEFAULT_WORKTREE_RETENTION_LIMIT: u32 = 15;
 const MAX_WORKTREE_RETENTION_LIMIT: u32 = 100;
+const DEFAULT_AUTOMATION_INACTIVITY_TIMEOUT_SECS: u64 = 15 * 60;
+const DEFAULT_AUTOMATION_PIPE_DRAIN_TIMEOUT_SECS: u64 = 5;
 static SCHEDULER_STARTED: AtomicBool = AtomicBool::new(false);
 static RUN_CANCELLATIONS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 
@@ -411,6 +413,7 @@ struct AutomationExecutionError {
     message: String,
     trace: Vec<AutomationTraceEvent>,
     output: String,
+    recoverable_stall: bool,
 }
 
 #[derive(Debug)]
@@ -430,6 +433,7 @@ impl AutomationExecutionError {
             message: message.into(),
             trace: Vec::new(),
             output: String::new(),
+            recoverable_stall: false,
         }
     }
 }
@@ -466,6 +470,135 @@ fn automation_timeout() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(4 * 60 * 60);
     Duration::from_secs(seconds)
+}
+
+fn automation_inactivity_timeout() -> Duration {
+    let seconds = std::env::var("BLACKBOX_AUTOMATION_INACTIVITY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUTOMATION_INACTIVITY_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AutomationWaitFailure {
+    Cancelled,
+    Process(String),
+    TimedOut(Duration),
+    Inactive(Duration),
+}
+
+#[cfg(unix)]
+fn isolate_automation_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_automation_process_group(_command: &mut Command) {}
+
+async fn stop_automation_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The CLI is spawned as its own process group. Killing the group also
+        // closes pipes inherited by Bash/tool subprocesses, so recovery cannot
+        // remain blocked on an orphaned writer after the parent exits.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let pid = pid.to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .status()
+            .await;
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn collect_automation_pipe(
+    task: &mut tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    drain_timeout: Duration,
+) -> Vec<u8> {
+    match tokio::time::timeout(drain_timeout, &mut *task).await {
+        Ok(Ok(Ok(bytes))) => bytes,
+        Ok(Ok(Err(_))) | Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Vec::new()
+        }
+    }
+}
+
+impl AutomationWaitFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Cancelled => "Automation cancelled by user".to_string(),
+            Self::Process(error) => format!("Cannot wait for Claude CLI: {error}"),
+            Self::TimedOut(duration) => {
+                format!("Automation timed out after {} seconds", duration.as_secs())
+            }
+            Self::Inactive(duration) => format!(
+                "Automation produced no stream activity for {} seconds; the unresponsive Claude CLI was stopped for same-session recovery",
+                duration.as_secs()
+            ),
+        }
+    }
+
+    fn is_recoverable_stall(&self) -> bool {
+        matches!(self, Self::Inactive(_))
+    }
+}
+
+async fn wait_for_automation_child(
+    child: &mut tokio::process::Child,
+    mut cancel_receiver: oneshot::Receiver<()>,
+    mut activity_receiver: mpsc::Receiver<()>,
+    total_timeout: Duration,
+    inactivity_timeout: Duration,
+) -> Result<std::process::ExitStatus, AutomationWaitFailure> {
+    let total_deadline = tokio::time::sleep(total_timeout);
+    let inactivity_deadline = tokio::time::sleep(inactivity_timeout);
+    tokio::pin!(total_deadline);
+    tokio::pin!(inactivity_deadline);
+    let mut activity_channel_open = true;
+
+    loop {
+        tokio::select! {
+            result = child.wait() => {
+                return result.map_err(|error| AutomationWaitFailure::Process(error.to_string()));
+            }
+            _ = &mut cancel_receiver => {
+                stop_automation_child(child).await;
+                return Err(AutomationWaitFailure::Cancelled);
+            }
+            _ = &mut total_deadline => {
+                stop_automation_child(child).await;
+                return Err(AutomationWaitFailure::TimedOut(total_timeout));
+            }
+            activity = activity_receiver.recv(), if activity_channel_open => {
+                if activity.is_some() {
+                    inactivity_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + inactivity_timeout);
+                } else {
+                    activity_channel_open = false;
+                }
+            }
+            _ = &mut inactivity_deadline => {
+                stop_automation_child(child).await;
+                return Err(AutomationWaitFailure::Inactive(inactivity_timeout));
+            }
+        }
+    }
 }
 
 fn automation_root() -> Result<PathBuf, String> {
@@ -3190,6 +3323,7 @@ fn automation_prompt(
 }
 
 const AUTOMATION_COMPLETION_RECOVERY_LIMIT: usize = 3;
+const AUTOMATION_STALL_RECOVERY_LIMIT: usize = 2;
 
 fn automation_completion_recovery_prompt(
     definition: &AutomationDefinition,
@@ -3199,6 +3333,15 @@ fn automation_completion_recovery_prompt(
         "<automation_completion_recovery>\nRecovery attempt {attempt}/{limit}. The scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. Write a self-contained user-facing completion report before exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}. Never return a directive by itself.\n</automation_completion_recovery>",
         id = definition.id,
         limit = AUTOMATION_COMPLETION_RECOVERY_LIMIT,
+    )
+}
+
+fn automation_stall_recovery_prompt(definition: &AutomationDefinition, attempt: usize) -> String {
+    format!(
+        "<automation_stall_recovery>\nBlack Box stopped the previous Claude CLI invocation after {idle_seconds} seconds without a stream event. Recovery attempt {attempt}/{limit}. Resume the SAME durable session for automation {id}. Treat unresolved tool calls from the interrupted invocation as indeterminate: inspect durable receipts and filesystem state before acting, preserve completed work, and do not blindly relaunch the same stalled Agent call. Prefer bounded direct reads or local commands when they can recover the missing evidence. Finish the remaining work and write a self-contained user-facing completion report before exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}. If state cannot be established safely, fail visibly instead of waiting indefinitely.\n</automation_stall_recovery>",
+        idle_seconds = automation_inactivity_timeout().as_secs(),
+        id = definition.id,
+        limit = AUTOMATION_STALL_RECOVERY_LIMIT,
     )
 }
 
@@ -3553,6 +3696,7 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
             message,
             trace,
             output: String::new(),
+            recoverable_stall: false,
         });
     }
     match final_output {
@@ -3567,6 +3711,7 @@ fn parse_stream_execution(stdout: &str) -> Result<AutomationExecution, Automatio
             message: "Claude stream ended without a result event".to_string(),
             trace,
             output: String::new(),
+            recoverable_stall: false,
         }),
     }
 }
@@ -3779,6 +3924,7 @@ async fn invoke_claude(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.kill_on_drop(true);
+    isolate_automation_process_group(&mut command);
     crate::env_manager::apply_to_command(&mut command, &env_config);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -3792,14 +3938,23 @@ async fn invoke_claude(
     };
     let mut stdout_reader = child.stdout.take();
     let mut stderr_reader = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
+    let (stdout_activity_sender, stdout_activity_receiver) = mpsc::channel(1);
+    let mut stdout_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
         if let Some(ref mut reader) = stdout_reader {
-            reader.read_to_end(&mut bytes).await?;
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let read = reader.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                let _ = stdout_activity_sender.try_send(());
+            }
         }
         Ok::<Vec<u8>, std::io::Error>(bytes)
     });
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
         if let Some(ref mut reader) = stderr_reader {
             reader.read_to_end(&mut bytes).await?;
@@ -3828,32 +3983,22 @@ async fn invoke_claude(
         ));
     }
 
-    let wait_result = tokio::select! {
-        result = child.wait() => result.map_err(|error| format!("Cannot wait for Claude CLI: {error}")),
-        _ = cancel_receiver => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Err("Automation cancelled by user".to_string())
-        }
-        _ = tokio::time::sleep(automation_timeout()) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Err(format!("Automation timed out after {} seconds", automation_timeout().as_secs()))
-        }
-    };
+    let wait_result = wait_for_automation_child(
+        &mut child,
+        cancel_receiver,
+        stdout_activity_receiver,
+        automation_timeout(),
+        automation_inactivity_timeout(),
+    )
+    .await;
     if let Ok(mut registry) = run_cancellations().lock() {
         registry.remove(run_id);
     }
-    let stdout = stdout_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    let stderr = stderr_task
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let pipe_drain_timeout = Duration::from_secs(DEFAULT_AUTOMATION_PIPE_DRAIN_TIMEOUT_SECS);
+    let (stdout, stderr) = tokio::join!(
+        collect_automation_pipe(&mut stdout_task, pipe_drain_timeout),
+        collect_automation_pipe(&mut stderr_task, pipe_drain_timeout),
+    );
     crate::cleanup_mcp_scratch_config(&mcp_scratch_id);
     cleanup_automation_security_settings(&security_settings_path);
     let stdout = String::from_utf8_lossy(&stdout).to_string();
@@ -3861,15 +4006,16 @@ async fn invoke_claude(
     let parsed = parse_stream_execution(&stdout);
     let status = match wait_result {
         Ok(status) => status,
-        Err(message) => {
+        Err(failure) => {
             let (output, trace) = match parsed {
                 Ok(execution) => (execution.output, execution.trace),
                 Err(error) => (error.output, error.trace),
             };
             return Err(AutomationExecutionError {
-                message,
+                message: failure.message(),
                 trace,
                 output,
+                recoverable_stall: failure.is_recoverable_stall(),
             });
         }
     };
@@ -3882,6 +4028,7 @@ async fn invoke_claude(
             message: format!("Claude exited with {:?}: {}", status.code(), stderr.trim()),
             trace,
             output,
+            recoverable_stall: false,
         });
     }
     let execution = parsed?;
@@ -3894,6 +4041,7 @@ async fn invoke_claude(
             ),
             trace: execution.trace,
             output: execution.output,
+            recoverable_stall: false,
         });
     }
     Ok(execution)
@@ -4064,6 +4212,107 @@ fn merge_automation_executions(
     }
 }
 
+fn stalled_automation_execution(
+    mut error: AutomationExecutionError,
+    session_id: &str,
+) -> AutomationExecution {
+    let next_sequence = error
+        .trace
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    error.trace.push(AutomationTraceEvent {
+        sequence: next_sequence,
+        event_type: "runtime_recovery".to_string(),
+        tool_name: None,
+        tool_use_id: None,
+        parent_tool_use_id: None,
+        agent_id: None,
+        agent_type: None,
+        agent_kind: None,
+        agent_depth: None,
+        summary: error.message,
+    });
+    AutomationExecution {
+        output: error.output,
+        trace: error.trace,
+        session_id: Some(session_id.to_string()),
+        last_main_assistant_event: None,
+        last_agent_completion_event: None,
+    }
+}
+
+async fn recover_automation_stall(
+    definition: &AutomationDefinition,
+    scheduled_at: Option<i64>,
+    run_id: &str,
+    execution_cwd: &Path,
+    session_target: &AutomationSessionTarget,
+    initial_error: AutomationExecutionError,
+) -> Result<AutomationExecution, AutomationExecutionError> {
+    let resume_target = AutomationSessionTarget {
+        session_id: session_target.session_id.clone(),
+        arguments: vec!["--resume".to_string(), session_target.session_id.clone()],
+        creates_new_session: false,
+    };
+    let mut execution = stalled_automation_execution(initial_error, &session_target.session_id);
+
+    for attempt in 1..=AUTOMATION_STALL_RECOVERY_LIMIT {
+        let recovery_prompt = automation_stall_recovery_prompt(definition, attempt);
+        match invoke_claude(
+            definition,
+            scheduled_at,
+            run_id,
+            execution_cwd,
+            &resume_target,
+            Some(&recovery_prompt),
+        )
+        .await
+        {
+            Ok(continuation) => {
+                return Ok(merge_automation_executions(execution, continuation));
+            }
+            Err(error) if error.recoverable_stall => {
+                let stalled = stalled_automation_execution(error, &session_target.session_id);
+                execution = merge_automation_executions(execution, stalled);
+            }
+            Err(mut error) => {
+                let output = if error.output.trim().is_empty() {
+                    execution.output
+                } else {
+                    format!(
+                        "{}\n\n{}",
+                        execution.output.trim_end(),
+                        error.output.trim_start()
+                    )
+                };
+                let mut trace = execution.trace;
+                trace.append(&mut error.trace);
+                return Err(AutomationExecutionError {
+                    message: format!(
+                        "Scheduled task stall recovery failed on attempt {attempt}: {}",
+                        error.message
+                    ),
+                    trace,
+                    output,
+                    recoverable_stall: false,
+                });
+            }
+        }
+    }
+
+    Err(AutomationExecutionError {
+        message: format!(
+            "Scheduled task remained inactive after {AUTOMATION_STALL_RECOVERY_LIMIT} same-session recovery attempts"
+        ),
+        trace: execution.trace,
+        output: execution.output,
+        recoverable_stall: false,
+    })
+}
+
 async fn recover_automation_completion(
     definition: &AutomationDefinition,
     scheduled_at: Option<i64>,
@@ -4114,6 +4363,7 @@ async fn recover_automation_completion(
                     ),
                     trace,
                     output,
+                    recoverable_stall: false,
                 });
             }
         }
@@ -4461,6 +4711,22 @@ async fn execute_automation(
                                     None,
                                 )
                                 .await;
+                                let first_execution = match first_execution {
+                                    Err(error)
+                                        if definition.kind == "cron" && error.recoverable_stall =>
+                                    {
+                                        recover_automation_stall(
+                                            &definition,
+                                            scheduled_at,
+                                            &run_id,
+                                            &directory.execution_cwd,
+                                            &session_target,
+                                            error,
+                                        )
+                                        .await
+                                    }
+                                    other => other,
+                                };
                                 match first_execution {
                                     Ok(execution) if definition.kind == "cron" => {
                                         recover_automation_completion(
@@ -6130,6 +6396,70 @@ mod tests {
         assert_eq!(automation_trigger(Some(1_785_363_000_000)), "scheduled");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn automation_child_is_stopped_after_stream_inactivity() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 5 & wait"])
+            .stdout(Stdio::piped());
+        isolate_automation_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (_cancel_sender, cancel_receiver) = oneshot::channel();
+        let (_activity_sender, activity_receiver) = mpsc::channel(1);
+        let inactivity = Duration::from_millis(50);
+
+        let result = wait_for_automation_child(
+            &mut child,
+            cancel_receiver,
+            activity_receiver,
+            Duration::from_secs(1),
+            inactivity,
+        )
+        .await;
+
+        assert_eq!(result, Err(AutomationWaitFailure::Inactive(inactivity)));
+        assert!(child.try_wait().unwrap().is_some());
+        let mut bytes = Vec::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), stdout.read_to_end(&mut bytes))
+                .await
+                .is_ok(),
+            "the isolated tool subprocess must not keep stdout open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_activity_resets_the_automation_inactivity_deadline() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 0.14"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (_cancel_sender, cancel_receiver) = oneshot::channel();
+        let (activity_sender, activity_receiver) = mpsc::channel(1);
+        let activity_task = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let _ = activity_sender.send(()).await;
+            }
+        });
+
+        let result = wait_for_automation_child(
+            &mut child,
+            cancel_receiver,
+            activity_receiver,
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )
+        .await;
+        activity_task.await.unwrap();
+
+        assert!(result.unwrap().success());
+    }
+
     #[test]
     fn configured_automation_write_paths_stay_under_the_data_root() {
         let sandbox = tempfile::tempdir().unwrap();
@@ -7151,6 +7481,20 @@ mod tests {
         assert!(prompt.contains("::automation-failed"));
         assert!(prompt.contains("Recovery attempt 1/3"));
         assert_eq!(AUTOMATION_COMPLETION_RECOVERY_LIMIT, 3);
+
+        let stall_prompt = automation_stall_recovery_prompt(
+            &AutomationDefinition {
+                id: "daily-review-dream".to_string(),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(stall_prompt.contains("Resume the SAME durable session"));
+        assert!(stall_prompt.contains("unresolved tool calls"));
+        assert!(stall_prompt.contains("do not blindly relaunch the same stalled Agent call"));
+        assert!(stall_prompt.contains("fail visibly instead of waiting indefinitely"));
+        assert!(stall_prompt.contains("Recovery attempt 1/2"));
+        assert_eq!(AUTOMATION_STALL_RECOVERY_LIMIT, 2);
     }
 
     #[test]
