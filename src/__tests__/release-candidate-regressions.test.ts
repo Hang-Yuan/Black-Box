@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const root = resolve(__dirname, '../..');
@@ -38,11 +38,12 @@ describe('release candidate safety regressions', () => {
   it('keeps the unified feature release version consistent across every authority', () => {
     const cargoVersion = rustManifest.match(/^version = "([^"]+)"/m)?.[1];
     const lockVersion = cargoLock.match(/\[\[package\]\]\nname = "blackbox"\nversion = "([^"]+)"/)?.[1];
-    expect(packageJson.version).toBe('0.14.54');
+    expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(tauriConfig.version).toBe(packageJson.version);
     expect(cargoVersion).toBe(packageJson.version);
     expect(lockVersion).toBe(packageJson.version);
-    expect(changelog).toContain("version: '0.14.49'");
+    expect(changelog.match(/version: '([^']+)'/)?.[1]).toBe(packageJson.version);
+    expect(existsSync(resolve(root, `releases/v${packageJson.version}.md`))).toBe(true);
   });
 
   it('publishes reproducible multi-platform releases with checksums', () => {
