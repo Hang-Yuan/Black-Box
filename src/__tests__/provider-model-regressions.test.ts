@@ -94,6 +94,8 @@ describe('provider editing regressions', () => {
     expect(providerForm).toContain('contextWindowTokens: parsed');
     expect(providerStore).toContain('contextWindowTokens ?? null');
     expect(apiConfig).toContain('contextWindowTokens: m.contextWindowTokens');
+    expect(chatPanel).toContain('configuredContextWindow');
+    expect(chatPanel).toContain('resolveDisplayedContextWindow');
     expect(parseContextWindowInput('20k')).toBe(20_000);
     expect(parseContextWindowInput('1m')).toBe(1_000_000);
     expect(parseContextWindowInput('200000')).toBe(200_000);

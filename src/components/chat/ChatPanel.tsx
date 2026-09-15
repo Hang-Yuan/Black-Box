@@ -1,5 +1,5 @@
 import { ConversationHandoff } from './ConversationHandoff';
-import { classifySessionSilence, projectContextPressure } from '../../lib/context-recovery';
+import { classifySessionSilence, projectContextPressure, resolveDisplayedContextWindow } from '../../lib/context-recovery';
 import { captureConversationViewport, restoreConversationViewport, type ConversationViewportSnapshot } from '../../lib/conversation-viewport';
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
@@ -774,8 +774,22 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   const _customModelId = useSettingsStore((s) => s.customModelId);
   const selectedModelResolution = resolveModelOrError(_selectedModel);
   const resolvedModel = sessionMeta.spawnedModel || sessionMeta.model || _customModelId || (selectedModelResolution.ok ? selectedModelResolution.model : '');
-  const is1MContextModel = isOneMillionModel(resolvedModel);
-  const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
+  const activeProvider = useProviderStore((state) => (
+    state.activeProviderId
+      ? state.providers.find((provider) => provider.id === state.activeProviderId) ?? null
+      : null
+  ));
+  const normalizedResolvedModel = resolvedModel.trim().toLowerCase();
+  const configuredContextWindow = activeProvider?.modelMappings.find((mapping) => (
+    mapping.providerModel.trim().toLowerCase() === normalizedResolvedModel
+  ))?.contextWindowTokens
+    ?? activeProvider?.modelMappings.find((mapping) => (
+      mapping.tier.trim().toLowerCase() === _selectedModel.trim().toLowerCase()
+    ))?.contextWindowTokens;
+  const contextWindow = resolveDisplayedContextWindow(
+    configuredContextWindow,
+    isOneMillionModel(resolvedModel),
+  );
   const inputTokens = sessionMeta.contextInputTokens || 0;
   const contextPressure = projectContextPressure(inputTokens, contextWindow);
   const contextWarning = !isStopping && contextPressure.visible;

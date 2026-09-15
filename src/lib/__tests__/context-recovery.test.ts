@@ -6,6 +6,7 @@ import {
   EMPTY_TERMINAL_RECOVERY_LIMIT,
   isGenericContextGreeting,
   isGreetingOnlyPrompt,
+  resolveDisplayedContextWindow,
   shouldRetryContextDrop,
 } from '../context-recovery';
 
@@ -92,6 +93,14 @@ describe('context-drop recovery signature', () => {
       cache_creation_input_tokens: 4_622,
       cache_read_input_tokens: 148_675,
     })).toBe(153_305);
+  });
+
+  it('uses a configured provider window for occupancy instead of the model-name fallback', () => {
+    expect(resolveDisplayedContextWindow(20_000, true)).toBe(20_000);
+    expect(resolveDisplayedContextWindow(200_000, false)).toBe(200_000);
+    expect(resolveDisplayedContextWindow(1_000_000, false)).toBe(1_000_000);
+    expect(resolveDisplayedContextWindow(undefined, true)).toBe(1_000_000);
+    expect(resolveDisplayedContextWindow(undefined, false)).toBe(200_000);
   });
 
   it('recovers empty terminal success on the same session with bounded retries', () => {

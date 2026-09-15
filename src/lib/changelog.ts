@@ -19,6 +19,19 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.58', date: '2026-09-16',
+    highlights: {
+      zh: [
+        '运行栏的上下文占用现在读取当前 Provider 模型保存的真实窗口，20K、200K 与 1M 显示会随模型自动切换',
+        '高占用提示改为说明 Claude Code 会原生自动压缩，不再引导用户手动执行 /compact',
+      ],
+      en: [
+        'The running context meter now uses the active provider model\'s saved window, so 20K, 200K, and 1M displays follow model switches automatically',
+        'High-usage guidance now explains that Claude Code compacts natively instead of prompting users to run /compact manually',
+      ],
+    },
+  },
+  {
     version: '0.14.57', date: '2026-09-16',
     highlights: {
       zh: [

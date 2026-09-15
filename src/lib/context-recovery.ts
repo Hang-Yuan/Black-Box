@@ -116,6 +116,22 @@ export function projectContextPressure(inputTokens: number, contextWindow: numbe
   return { used, window, percent: Math.round(ratio * 100), visible: ratio >= 0.6, high: ratio >= 0.8 };
 }
 
+/** Use the provider mapping when it declares a real window; otherwise retain
+ * Claude Code's model-name fallback for the occupancy display. */
+export function resolveDisplayedContextWindow(
+  configuredWindow: number | undefined,
+  isOneMillionModel: boolean,
+): number {
+  if (
+    typeof configuredWindow === 'number'
+    && Number.isInteger(configuredWindow)
+    && configuredWindow >= 1_024
+  ) {
+    return configuredWindow;
+  }
+  return isOneMillionModel ? 1_000_000 : 200_000;
+}
+
 /**
  * Decide one bounded recovery step for a successful CLI result that did not
  * close the user's turn with visible output.
