@@ -2334,8 +2334,8 @@ fn normalize_cli_model_id(model: &str) -> String {
 mod provider_capability_tests {
     use super::{
         apply_provider_connection_auth, enforce_provider_loopback_child_env,
-        merge_provider_extra_env, model_mapping_context_window, normalize_cli_model_id,
-        parse_bool_override,
+        configured_context_window_env, merge_provider_extra_env, model_mapping_context_window,
+        normalize_cli_model_id, parse_bool_override,
         provider_connection_probe_body, provider_connection_probe_url,
         provider_error_indicates_auth_failure, provider_inherited_env_removals,
         redacted_env_for_log, resolve_provider_auth_scheme, resolve_provider_auth_scheme_parts,
@@ -2396,6 +2396,56 @@ mod provider_capability_tests {
         );
         assert_eq!(model_mapping_context_window(&p, "HAIKU"), Some(20_000));
         assert_eq!(model_mapping_context_window(&p, "unknown"), None);
+    }
+
+    #[test]
+    fn configured_context_window_uses_the_native_control_that_can_represent_the_capacity() {
+        assert_eq!(
+            configured_context_window_env("relay-small", 20_000),
+            vec![(
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+                "20000".to_string(),
+            )]
+        );
+        assert_eq!(
+            configured_context_window_env("claude-fable-5-1", 20_000),
+            vec![
+                (
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+                    "100000".to_string(),
+                ),
+                (
+                    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
+                    "16".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            configured_context_window_env("relay-medium", 200_000),
+            vec![
+                (
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+                    "200000".to_string(),
+                ),
+                (
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+                    "200000".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            configured_context_window_env("relay-large", 1_000_000),
+            vec![
+                (
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+                    "1000000".to_string(),
+                ),
+                (
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+                    "1000000".to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -3201,6 +3251,53 @@ fn model_mapping_context_window(provider: &ApiProvider, model_name: &str) -> Opt
         .and_then(|mapping| mapping.context_window_tokens)
 }
 
+fn configured_context_window_env(model_name: &str, context_window: u64) -> Vec<(String, String)> {
+    const MIN_AUTO_COMPACT_WINDOW: u64 = 100_000;
+    const MAX_AUTO_COMPACT_WINDOW: u64 = 1_000_000;
+
+    let normalized_model = model_name.trim().to_ascii_lowercase();
+    let recognized_claude_window = matches!(
+        normalized_model.as_str(),
+        "fable" | "opus" | "sonnet" | "haiku"
+    ) || normalized_model.contains("claude-fable")
+        || normalized_model.contains("claude-opus")
+        || normalized_model.contains("claude-sonnet")
+        || normalized_model.contains("claude-haiku")
+        || normalized_model.contains("[1m]")
+        || normalized_model.ends_with("-1m");
+
+    if context_window < MIN_AUTO_COMPACT_WINDOW && recognized_claude_window {
+        // Claude Code only accepts 100K..1M for AUTO_COMPACT_WINDOW and does
+        // not apply MAX_CONTEXT_TOKENS to model ids whose Claude family it
+        // recognizes. Keep compaction native by using the 100K floor plus a
+        // conservative percentage that fires at 80% of the declared window.
+        let trigger_tokens = context_window.saturating_mul(80) / 100;
+        let trigger_percent = trigger_tokens.div_ceil(1_000).clamp(1, 80);
+        return vec![
+            (
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+                MIN_AUTO_COMPACT_WINDOW.to_string(),
+            ),
+            (
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
+                trigger_percent.to_string(),
+            ),
+        ];
+    }
+
+    let mut overrides = vec![(
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
+        context_window.to_string(),
+    )];
+    if (MIN_AUTO_COMPACT_WINDOW..=MAX_AUTO_COMPACT_WINDOW).contains(&context_window) {
+        overrides.push((
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+            context_window.to_string(),
+        ));
+    }
+    overrides
+}
+
 pub(crate) fn auxiliary_model_hook_settings(
     auxiliary_model_tier: &str,
 ) -> Result<serde_json::Value, String> {
@@ -3657,20 +3754,26 @@ async fn start_claude_session(
     // Claude Code owns automatic compaction. Native/recognized models use its
     // built-in context metadata. Provider aliases can attach their real token
     // capacity to each model mapping; changing models then changes the CLI's
-    // auto-compact capacity with the same spawn.
+    // context assumption and native auto-compact controls with the same spawn.
     let configured_context_window = resolve_provider_model_context_window(
         params.provider_id.as_deref(),
         params.model.as_deref(),
     )?;
     if let Some(context_window) = configured_context_window {
-        resolved_env.insert(
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
-            context_window.to_string(),
-        );
+        let selected_model = params.model.as_deref().unwrap_or("selected model");
+        for key in [
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+        ] {
+            resolved_env.remove(key);
+        }
+        for (key, value) in configured_context_window_env(selected_model, context_window) {
+            resolved_env.insert(key, value);
+        }
         eprintln!(
             "[BLACKBOX] Set model context window to {} tokens for {}",
-            context_window,
-            params.model.as_deref().unwrap_or("selected model")
+            context_window, selected_model
         );
     } else if let Some(model_name) = params.model.as_deref() {
         let m = model_name.to_lowercase();

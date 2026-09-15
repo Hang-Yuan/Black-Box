@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "blackbox"
-version = "0.14.56"
+version = "0.14.57"
 dependencies = [
  "async-stream",
  "axum",

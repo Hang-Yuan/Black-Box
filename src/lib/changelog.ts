@@ -19,6 +19,21 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.57', date: '2026-09-16',
+    highlights: {
+      zh: [
+        '修正代理模型窗口适配：20K 等小于 100K 的窗口不再被 Claude Code 钳到 100K 后延迟压缩',
+        '自定义模型别名使用 Claude Code 的真实窗口覆盖；Claude 家族别名的小窗口通过原生压缩窗口与百分比安全换算',
+        '200K 与 1M 映射继续按准确 token 容量应用，切换主模型或辅助模型时自动生效',
+      ],
+      en: [
+        'Fixes proxy context adaptation so windows below 100K, including 20K, no longer clamp to 100K and compact too late',
+        'Uses Claude Code\'s assumed-context override for custom aliases and a native window-plus-percentage fallback for small Claude-family mappings',
+        'Keeps exact 200K and 1M mappings and applies them automatically when the main or auxiliary model changes',
+      ],
+    },
+  },
+  {
     version: '0.14.56', date: '2026-09-16',
     highlights: {
       zh: [
