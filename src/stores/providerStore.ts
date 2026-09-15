@@ -13,6 +13,8 @@ export interface ModelMapping {
   /** Stable tier ('fable'|'opus'|'sonnet'|'haiku') or a legacy direct model ID */
   tier: string;
   providerModel: string;
+  /** Optional provider-declared context capacity used by Claude Code auto compact. */
+  contextWindowTokens?: number;
 }
 
 export interface ApiProvider {
@@ -83,7 +85,13 @@ export function migrateLegacyFableMapping(mappings: readonly ModelMapping[]): Mo
   );
   if (!legacyOpus) return [...mappings];
   return [
-    { tier: 'fable', providerModel: legacyOpus.providerModel },
+    {
+      tier: 'fable',
+      providerModel: legacyOpus.providerModel,
+      ...(legacyOpus.contextWindowTokens
+        ? { contextWindowTokens: legacyOpus.contextWindowTokens }
+        : {}),
+    },
     ...mappings,
   ];
 }
@@ -283,8 +291,13 @@ function normalizeRecord(record: Record<string, string> | undefined): string {
 function normalizeMappings(mappings: readonly ModelMapping[]): string {
   return JSON.stringify(
     mappings
-      .map(({ tier, providerModel }) => [tier, providerModel.trim()])
-      .sort(([left], [right]) => left.localeCompare(right)),
+      .slice()
+      .sort((left, right) => left.tier.localeCompare(right.tier))
+      .map(({ tier, providerModel, contextWindowTokens }) => [
+        tier,
+        providerModel.trim(),
+        contextWindowTokens ?? null,
+      ]),
   );
 }
 

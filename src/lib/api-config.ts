@@ -13,7 +13,7 @@ export interface ApiConfigFileV2 {
     apiFormat: ProviderApiFormat;
     authScheme?: ProviderAuthScheme;
     apiKey?: string;
-    modelMappings: { tier: string; model: string }[];
+    modelMappings: { tier: string; model: string; contextWindowTokens?: number }[];
     extra_env?: Record<string, string>;
   };
 }
@@ -35,7 +35,11 @@ export function exportProvider(provider: ApiProvider): string {
       ...(provider.authScheme ? { authScheme: provider.authScheme } : {}),
       modelMappings: provider.modelMappings
         .filter((m) => m.providerModel)
-        .map((m) => ({ tier: m.tier, model: m.providerModel })),
+        .map((m) => ({
+          tier: m.tier,
+          model: m.providerModel,
+          ...(m.contextWindowTokens ? { contextWindowTokens: m.contextWindowTokens } : {}),
+        })),
       ...(provider.extraEnv && Object.keys(provider.extraEnv).length > 0
         ? { extra_env: provider.extraEnv }
         : {}),
@@ -138,7 +142,11 @@ export function parseAndValidate(
   }
 
   const validTiers = ['fable', 'opus', 'sonnet', 'haiku'];
-  const mappings: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; providerModel: string }[] = [];
+  const mappings: {
+    tier: 'fable' | 'opus' | 'sonnet' | 'haiku';
+    providerModel: string;
+    contextWindowTokens?: number;
+  }[] = [];
   for (const item of rawMappings) {
     if (typeof item !== 'object' || item === null) {
       return { ok: false, error: '模型映射条目格式不正确' };
@@ -149,7 +157,18 @@ export function parseAndValidate(
       return { ok: false, error: `无效的模型层级：${tier}，仅支持 fable / opus / sonnet / haiku` };
     }
     const model = String(m.model ?? m.providerModel ?? '');
-    mappings.push({ tier: tier as 'fable' | 'opus' | 'sonnet' | 'haiku', providerModel: model });
+    const rawContextWindow = m.contextWindowTokens;
+    if (
+      rawContextWindow !== undefined
+      && (!Number.isInteger(rawContextWindow) || Number(rawContextWindow) < 1_024 || Number(rawContextWindow) > 10_000_000)
+    ) {
+      return { ok: false, error: `模型 ${tier} 的 contextWindowTokens 应为 1024 到 10000000 之间的整数` };
+    }
+    mappings.push({
+      tier: tier as 'fable' | 'opus' | 'sonnet' | 'haiku',
+      providerModel: model,
+      ...(rawContextWindow !== undefined ? { contextWindowTokens: Number(rawContextWindow) } : {}),
+    });
   }
 
   // extra_env (v2 only)

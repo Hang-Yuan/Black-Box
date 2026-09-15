@@ -90,7 +90,7 @@ describe('Gemini native provider config', () => {
       authScheme: 'x-goog-api-key',
       apiKey: 'test-secret-must-not-export',
       modelMappings: [
-        { tier: 'fable', providerModel: 'gemini-3.5-flash' },
+        { tier: 'fable', providerModel: 'gemini-3.5-flash', contextWindowTokens: 1_000_000 },
         { tier: 'opus', providerModel: 'gemini-3.5-flash' },
         { tier: 'sonnet', providerModel: 'gemini-3.5-flash' },
         { tier: 'haiku', providerModel: 'gemini-3.1-flash-lite' },
@@ -104,6 +104,52 @@ describe('Gemini native provider config', () => {
       apiFormat: 'gemini',
       authScheme: 'x-goog-api-key',
     });
+    expect(exported.provider.modelMappings[0]).toEqual({
+      tier: 'fable',
+      model: 'gemini-3.5-flash',
+      contextWindowTokens: 1_000_000,
+    });
     expect(exported.provider).not.toHaveProperty('apiKey');
+  });
+
+  it('imports a per-model context capacity and rejects invalid capacities', () => {
+    const valid = parseAndValidate(JSON.stringify({
+      version: 2,
+      provider: {
+        name: 'Relay',
+        baseUrl: 'https://relay.example.com',
+        apiFormat: 'anthropic',
+        modelMappings: [
+          { tier: 'fable', model: 'relay-large', contextWindowTokens: 1_000_000 },
+          { tier: 'haiku', model: 'relay-small', contextWindowTokens: 20_000 },
+        ],
+      },
+    }));
+
+    expect(valid).toMatchObject({
+      ok: true,
+      provider: {
+        modelMappings: [
+          { tier: 'fable', providerModel: 'relay-large', contextWindowTokens: 1_000_000 },
+          { tier: 'haiku', providerModel: 'relay-small', contextWindowTokens: 20_000 },
+        ],
+      },
+    });
+
+    const invalid = parseAndValidate(JSON.stringify({
+      version: 2,
+      provider: {
+        name: 'Relay',
+        baseUrl: 'https://relay.example.com',
+        apiFormat: 'anthropic',
+        modelMappings: [
+          { tier: 'fable', model: 'relay-large', contextWindowTokens: 20_000.5 },
+        ],
+      },
+    }));
+    expect(invalid).toEqual({
+      ok: false,
+      error: '模型 fable 的 contextWindowTokens 应为 1024 到 10000000 之间的整数',
+    });
   });
 });

@@ -29,7 +29,6 @@ export const EMPTY_TERMINAL_RECOVERY_PROMPT = [
 export type EmptyTerminalRecoveryAction =
   | 'none'
   | 'retry'
-  | 'compact'
   | 'resume_after_compact'
   | 'fail';
 
@@ -42,9 +41,6 @@ export interface EmptyTerminalRecoveryCandidate {
   stdinAvailable?: boolean;
   pendingCommand?: boolean;
   recoveryCompactPending?: boolean;
-  contextInputTokens?: number;
-  autoCompactThreshold?: number;
-  compactAlreadyFired?: boolean;
 }
 
 const GENERIC_GREETING_RESPONSES = new Set([
@@ -145,15 +141,6 @@ export function decideEmptyTerminalRecovery(
   if (!candidate.stdinAvailable || attempts >= EMPTY_TERMINAL_RECOVERY_LIMIT) {
     return 'fail';
   }
-  const compactThreshold = candidate.autoCompactThreshold ?? 0;
-  const recoveryCompactThreshold = Math.floor(compactThreshold * 0.9);
-  if (
-    !candidate.compactAlreadyFired
-    && compactThreshold > 0
-    && (candidate.contextInputTokens ?? 0) >= recoveryCompactThreshold
-  ) {
-    return 'compact';
-  }
   return 'retry';
 }
 
@@ -183,16 +170,6 @@ export function shouldRetryContextDrop(
     && outputTokens <= 24
     && cacheCreationTokens === 0
     && cacheReadTokens === 0;
-}
-
-/** Conservative preflight estimate, including a response/tool reserve. */
-export function planContextBudget(inputTokens: number, prompt: string, compactThreshold: number) {
-  const threshold = Math.max(0, compactThreshold);
-  const promptTokens = Math.ceil(new TextEncoder().encode(prompt).length / 3);
-  const reserve = Math.max(8_000, Math.ceil(threshold * 0.08));
-  const used = Math.max(0, inputTokens || 0);
-  return { promptTokens, reserve, remaining: Math.max(0, Math.floor(threshold / 0.8) - used - promptTokens),
-    compact: threshold > 0 && used > 0 && used + promptTokens + reserve >= threshold };
 }
 
 export function classifySessionSilence(input: { now: number; lastProgressAt?: number; alive?: boolean; waitingForUser?: boolean }) {

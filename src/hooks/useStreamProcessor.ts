@@ -26,7 +26,7 @@ import { usePlanStore } from '../stores/planStore';
 import { useWorkflowStore } from '../stores/workflowStore';
 import { adoptCliSessionIdentity } from '../lib/session-identity';
 import { bridge } from '../lib/tauri-bridge';
-import { spawnConfigHash, getAutoCompactThreshold } from '../lib/api-provider';
+import { spawnConfigHash } from '../lib/api-provider';
 import { buildApiRetryStatus } from '../lib/api-retry';
 import {
   assistantContentHasVisibleTerminalResponse,
@@ -55,8 +55,6 @@ import {
   cleanupStdinRoute,
   teardownSession,
   waitForStdinCleared,
-  hasAutoCompactFired,
-  markAutoCompactFired,
   getRecentlyFinalizedStdin,
 } from '../lib/sessionLifecycle';
 import { matchingSessionPermissionGrants } from '../lib/session-permission-grants';
@@ -354,13 +352,12 @@ interface EmptyTerminalRecoveryResultArgs {
   stdinId: string | undefined;
   subtype: string | undefined;
   resultDisplayText: string;
-  usage: any;
 }
 
 /**
  * Keep a successful CLI result from silently settling an unfinished turn.
- * Recovery stays on the same stdin/durable session, is bounded, and compacts
- * once before retrying when cached + uncached input is close to the window.
+ * Recovery stays on the same stdin/durable session and is bounded. Routine
+ * context compaction remains owned by Claude Code.
  */
 function handlePreflightCompactResult(tabId: string, msg: any): boolean {
   if (msg.parent_tool_use_id) return false;
@@ -389,7 +386,6 @@ function handleEmptyTerminalRecoveryResult({
   stdinId,
   subtype,
   resultDisplayText,
-  usage,
 }: EmptyTerminalRecoveryResultArgs): boolean {
   const store = useChatStore.getState();
   const tab = store.getTab(tabId);
@@ -413,9 +409,6 @@ function handleEmptyTerminalRecoveryResult({
     stdinAvailable: Boolean(stdinId),
     pendingCommand: Boolean(meta.pendingCommandMsgId),
     recoveryCompactPending: meta.emptyTerminalRecoveryAfterCompact,
-    contextInputTokens: effectiveContextInputTokens(usage),
-    autoCompactThreshold: getAutoCompactThreshold(meta.spawnedModel),
-    compactAlreadyFired: hasAutoCompactFired(tabId),
   });
   if (action === 'none') return false;
 
@@ -450,49 +443,6 @@ function handleEmptyTerminalRecoveryResult({
 
   const attempts = meta.contextRecoveryAttempts ?? 0;
   const startedAt = Date.now();
-  if (action === 'compact') {
-    const compactMsgId = generateMessageId();
-    markAutoCompactFired(tabId);
-    store.addMessage(tabId, {
-      id: compactMsgId,
-      role: 'system',
-      type: 'text',
-      content: t('chat.autoCompacting'),
-      commandType: 'processing',
-      commandData: { command: '/compact', automatic: true, recovery: true },
-      commandStartTime: startedAt,
-      commandCompleted: false,
-      timestamp: startedAt,
-    });
-    store.setSessionMeta(tabId, {
-      pendingCommandMsgId: compactMsgId,
-      contextRecoveryAttempts: attempts + 1,
-      awaitingVisibleAssistantResponse: true,
-      emptyTerminalRecoveryAfterCompact: true,
-      turnStartTime: startedAt,
-      lastProgressAt: startedAt,
-      inputTokens: 0,
-      outputTokens: 0,
-      apiRetry: undefined,
-    });
-    store.setSessionStatus(tabId, 'running');
-    store.setActivityStatus(tabId, { phase: 'thinking' });
-    console.warn('[BLACKBOX] Empty terminal response near context limit; compacting before recovery', {
-      tabId,
-      contextInputTokens: effectiveContextInputTokens(usage),
-    });
-    bridge.sendStdin(stdinId, '/compact').catch((error) => {
-      console.error('[BLACKBOX] Empty terminal recovery compact failed:', error);
-      failRecovery('error.emptyTerminalRecoveryFailed');
-    });
-    setTimeout(() => {
-      if (store.getTab(tabId)?.sessionMeta.pendingCommandMsgId === compactMsgId) {
-        markPendingCommandSlow(tabId, compactMsgId, t('chat.compactStillRunning'));
-      }
-    }, 15_000);
-    return true;
-  }
-
   completePendingCommand(tabId);
   store.setSessionMeta(tabId, {
     contextRecoveryAttempts: action === 'retry' ? attempts + 1 : attempts,
@@ -2159,7 +2109,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           stdinId: bgResultStdinId,
           subtype: msg.subtype,
           resultDisplayText: bgResultDisplayText,
-          usage: msg.usage,
         })) {
           break;
         }
@@ -2222,85 +2171,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             });
           }
         }
-        // Auto-compact must outrank pending follow-ups on background tabs just
-        // as it does on the foreground path. The compact result will re-enter
-        // this handler and only then drain the next queued stage.
-        let bgAutoCompactTriggered = false;
-        {
-          const bgCompactTab = store.getTab(tabId);
-          const bgResultInputTokens = (bgCompactTab?.sessionMeta.contextInputTokens ?? effectiveContextInputTokens(msg.usage)) + (bgCompactTab?.sessionMeta.contextOutputTokens ?? 0);
-          const bgCompactStdinId = bgCompactTab?.sessionMeta.stdinId;
-          const bgCompactThreshold = getAutoCompactThreshold(bgCompactTab?.sessionMeta.spawnedModel);
-          if (bgResultInputTokens > bgCompactThreshold && !hasAutoCompactFired(tabId) && bgCompactStdinId && msg.subtype === 'success') {
-            bgAutoCompactTriggered = true;
-            markAutoCompactFired(tabId);
-            console.log('[BLACKBOX] Background tab auto-compact triggered:', tabId, 'inputTokens =', bgResultInputTokens);
-            const queuedCompact = bgCompactTab?.pendingUserMessages.find(
-              (item) => item.kind === 'command' && item.text.trim().toLowerCase() === '/compact',
-            );
-            const bgCompactMsgId = queuedCompact?.commandMessageId || generateMessageId();
-            if (queuedCompact?.commandMessageId) {
-              store.removePendingCommand(tabId, queuedCompact.commandMessageId);
-            }
-            const bgCompactStartedAt = Date.now();
-            if (queuedCompact?.commandMessageId) {
-              const existing = store.getTab(tabId)?.messages.find(
-                (message) => message.id === bgCompactMsgId,
-              );
-              store.updateMessage(tabId, bgCompactMsgId, {
-                content: t('chat.autoCompacting'),
-                commandStartTime: bgCompactStartedAt,
-                commandCompleted: false,
-                commandData: { ...existing?.commandData, queued: false, automatic: true },
-              });
-            } else {
-              store.addMessage(tabId, {
-                id: bgCompactMsgId,
-                role: 'system',
-                type: 'text',
-                content: t('chat.autoCompacting'),
-                commandType: 'processing',
-                commandData: { command: '/compact', automatic: true },
-                commandStartTime: bgCompactStartedAt,
-                timestamp: Date.now(),
-              });
-            }
-            store.setSessionMeta(tabId, { pendingCommandMsgId: bgCompactMsgId });
-            store.setSessionStatus(tabId, 'running');
-            store.setSessionMeta(tabId, {
-              turnStartTime: bgCompactStartedAt,
-              lastProgressAt: bgCompactStartedAt,
-              inputTokens: 0,
-              outputTokens: 0,
-            });
-            store.setActivityStatus(tabId, { phase: 'thinking' });
-            bridge.sendStdin(bgCompactStdinId, '/compact').catch((err) => {
-              console.error('[BLACKBOX] Background tab auto-compact failed:', err);
-              completePendingCommand(tabId, { output: 'Compact failed to start' });
-              if (store.getTab(tabId)?.sessionStatus === 'running') {
-                store.setSessionStatus(tabId, 'error');
-              }
-            });
-            setTimeout(() => {
-              const meta = store.getTab(tabId)?.sessionMeta ?? {};
-              if (meta.pendingCommandMsgId === bgCompactMsgId) {
-                markPendingCommandSlow(tabId, bgCompactMsgId, t('chat.compactStillRunning'));
-              }
-            }, 15_000);
-          }
-        }
-
-        if (!bgAutoCompactTriggered) {
-          const bgDrainTab = store.getTab(tabId);
-          drainPendingQueueAfterSettlement({
-            tabId,
-            stdinId: bgDrainTab?.sessionMeta.stdinId,
-            wasStopping: bgWasStopping,
-            onDraftRestored: useSessionStore.getState().selectedSessionId === tabId
-              ? setInputSync
-              : undefined,
-          });
-        }
+        const bgDrainTab = store.getTab(tabId);
+        drainPendingQueueAfterSettlement({
+          tabId,
+          stdinId: bgDrainTab?.sessionMeta.stdinId,
+          wasStopping: bgWasStopping,
+          onDraftRestored: useSessionStore.getState().selectedSessionId === tabId
+            ? setInputSync
+            : undefined,
+        });
 
         useSessionStore.getState().fetchSessions();
 
@@ -3780,7 +3659,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           stdinId: msgStdinId,
           subtype: msg.subtype,
           resultDisplayText,
-          usage: msg.usage,
         })) {
           break;
         }
@@ -3933,70 +3811,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               }
             }
           }
-        }
-
-        // --- Auto-compact: when input tokens exceed 80% of context window,
-        // automatically send /compact to prevent context overflow on the next turn.
-        // Fires at most once per session to avoid infinite loops.
-        // Threshold is model-aware: 160K for 200K models, 800K for 1M models.
-        const contextMeta = useChatStore.getState().getTab(tabId)?.sessionMeta;
-        const resultInputTokens = (contextMeta?.contextInputTokens ?? effectiveContextInputTokens(msg.usage)) + (contextMeta?.contextOutputTokens ?? 0);
-        const compactStdinId = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
-        const fgCompactThreshold = getAutoCompactThreshold(useChatStore.getState().getTab(tabId)?.sessionMeta.spawnedModel);
-        if (resultInputTokens > fgCompactThreshold && !hasAutoCompactFired(tabId) && compactStdinId && msg.subtype === 'success') {
-          markAutoCompactFired(tabId);
-          console.log('[BLACKBOX] Auto-compact triggered: inputTokens =', resultInputTokens);
-          const compactTab = useChatStore.getState().getTab(tabId);
-          const queuedCompact = compactTab?.pendingUserMessages.find(
-            (item) => item.kind === 'command' && item.text.trim().toLowerCase() === '/compact',
-          );
-          const compactMsgId = queuedCompact?.commandMessageId || generateMessageId();
-          if (queuedCompact?.commandMessageId) {
-            useChatStore.getState().removePendingCommand(tabId, queuedCompact.commandMessageId);
-            const existing = useChatStore.getState().getTab(tabId)?.messages.find(
-              (message) => message.id === compactMsgId,
-            );
-            useChatStore.getState().updateMessage(tabId, compactMsgId, {
-              content: t('chat.autoCompacting'),
-              commandStartTime: Date.now(),
-              commandCompleted: false,
-              commandData: { ...existing?.commandData, queued: false, automatic: true },
-            });
-          } else {
-            addMessage({
-              id: compactMsgId,
-              role: 'system',
-              type: 'text',
-              content: t('chat.autoCompacting'),
-              commandType: 'processing',
-              commandData: { command: '/compact', automatic: true },
-              commandStartTime: Date.now(),
-              commandCompleted: false,
-              timestamp: Date.now(),
-            });
-          }
-          // FI-4: Register pendingCommandMsgId so result handler can mark it completed
-          setSessionMeta({ pendingCommandMsgId: compactMsgId });
-          setSessionStatus('running');
-          setActivityStatus({ phase: 'thinking' });
-          bridge.sendStdin(compactStdinId, '/compact').catch((err) => {
-            console.error('[BLACKBOX] Auto-compact failed:', err);
-            completePendingCommand(tabId, { output: 'Compact failed to start' });
-            if (useChatStore.getState().getTab(tabId)?.sessionStatus === 'running') {
-              useChatStore.getState().setSessionStatus(tabId, 'error');
-            }
-          });
-          // A large compact may legitimately take longer than 15 seconds. Keep
-          // the session busy and its stdin owned until a real assistant/result
-          // or process_exit settles it; otherwise a concurrent send/reload can
-          // race the CLI while it is rewriting context.
-          setTimeout(() => {
-            const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
-            if (meta.pendingCommandMsgId === compactMsgId) {
-              markPendingCommandSlow(tabId, compactMsgId, t('chat.compactStillRunning'));
-            }
-          }, 15_000);
-          break; // Skip pending message flush — compact takes priority
         }
 
         {

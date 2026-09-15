@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { is1MModel, getAutoCompactThreshold, resolveModelForProvider, resolveModelOrError } from '../lib/api-provider';
+import { is1MModel, resolveModelForProvider, resolveModelOrError } from '../lib/api-provider';
 import { useProviderStore } from '../stores/providerStore';
 import { normalizeModelTier, useSettingsStore } from '../stores/settingsStore';
 import type { ApiProvider } from '../stores/providerStore';
@@ -59,12 +59,6 @@ describe('model context routing', () => {
     expect(is1MModel('claude-opus-4-6-1m')).toBe(true);
     expect(is1MModel('mimo-v2-pro[1m]')).toBe(true);
     expect(is1MModel('claude-opus-4-6')).toBe(false);
-    expect(getAutoCompactThreshold('claude-fable-5')).toBe(160_000);
-    expect(getAutoCompactThreshold('claude-fable-5-1m')).toBe(800_000);
-    expect(getAutoCompactThreshold('claude-opus-4-8')).toBe(160_000);
-    expect(getAutoCompactThreshold('claude-opus-4-8-1m')).toBe(800_000);
-    expect(getAutoCompactThreshold('claude-opus-4-6-1m')).toBe(800_000);
-    expect(getAutoCompactThreshold('claude-opus-4-6')).toBe(160_000);
   });
 
   it('maps the four UI tiers to built-in native model ids', () => {
@@ -146,7 +140,6 @@ describe('model context routing', () => {
     ]);
     useProviderStore.setState({ providers: [p], activeProviderId: p.id });
     expect(is1MModel('opus')).toBe(true);
-    expect(getAutoCompactThreshold('opus')).toBe(800_000);
     expect(is1MModel('sonnet')).toBe(false);
   });
 

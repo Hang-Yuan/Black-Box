@@ -271,18 +271,6 @@ export function is1MModel(modelId?: string): boolean {
 }
 
 /**
- * Return the auto-compact token threshold for the given model.
- * 80% of context window: 160K for 200K models, 800K for 1M models.
- */
-export function getAutoCompactThreshold(modelId?: string): number {
-  if (import.meta.env.DEV && typeof window !== 'undefined') {
-    const override = Number((window as any).__blackbox_test_auto_compact_threshold);
-    if (Number.isFinite(override) && override >= 0) return override;
-  }
-  return is1MModel(modelId) ? 800_000 : 160_000;
-}
-
-/**
  * Result of model resolution — either a mapped model name or an error.
  */
 export type ModelResolution =

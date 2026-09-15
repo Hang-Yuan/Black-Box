@@ -103,23 +103,18 @@ describe('context-drop recovery signature', () => {
       stdinAvailable: true,
       pendingCommand: false,
       recoveryCompactPending: false,
-      autoCompactThreshold: 160_000,
-      compactAlreadyFired: false,
     } as const;
     expect(decideEmptyTerminalRecovery({
       ...base,
       attempts: 0,
-      contextInputTokens: 80_000,
     })).toBe('retry');
     expect(decideEmptyTerminalRecovery({
       ...base,
       attempts: 0,
-      contextInputTokens: 153_305,
-    })).toBe('compact');
+    })).toBe('retry');
     expect(decideEmptyTerminalRecovery({
       ...base,
       attempts: EMPTY_TERMINAL_RECOVERY_LIMIT,
-      contextInputTokens: 80_000,
     })).toBe('fail');
     expect(decideEmptyTerminalRecovery({
       ...base,

@@ -55,7 +55,8 @@ describe('stdin route regressions', () => {
 
   it('sends the first pre-warm prompt before system:init to avoid the Claude 2.1.220 deadlock', () => {
     expect(inputBarSource).toContain('Claude Code 2.1.220 no longer emits system:init');
-    expect(inputBarSource).toContain('await bridge.sendStdin(stdinId, prepareOutboundPrompt());');
+    expect(inputBarSource).toContain('await bridge.sendStdin(stdinId, text);');
+    expect(inputBarSource).not.toContain('prepareOutboundPrompt');
     expect(inputBarSource).not.toContain('holding first message until system:init');
   });
 
@@ -140,9 +141,8 @@ describe('stdin route regressions', () => {
     expect(inputBarSource).toContain('setSessionMeta(spawnOwnerTabId, {');
   });
 
-  it('background auto-compact keeps the tab busy until compact settles', () => {
-    expect(streamProcessorSource).toContain("store.setSessionStatus(tabId, 'running');");
-    expect(streamProcessorSource).toContain('markPendingCommandSlow(tabId, bgCompactMsgId');
-    expect(streamProcessorSource).not.toContain("completePendingCommand(tabId, { output: 'Compact timed out' });");
+  it('does not inject a background compact after a completed turn', () => {
+    expect(streamProcessorSource).not.toContain('bgCompactMsgId');
+    expect(streamProcessorSource).not.toMatch(/sendStdin\([^\n]*['"]\/compact/);
   });
 });

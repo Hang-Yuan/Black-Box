@@ -19,6 +19,20 @@ const MODEL_TIERS: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; labelKey: stri
 
 const INPUT_CLASS = 'w-full px-3 py-2 text-[13px] bg-bg-chat border border-border-subtle rounded-md text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent';
 
+export function parseContextWindowInput(value: string): number | undefined {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*([km])?$/i);
+  if (!match) return undefined;
+  const multiplier = match[2]?.toLowerCase() === 'm'
+    ? 1_000_000
+    : match[2]?.toLowerCase() === 'k'
+      ? 1_000
+      : 1;
+  const tokens = Math.round(Number(match[1]) * multiplier);
+  return Number.isInteger(tokens) && tokens >= 1_024 && tokens <= 10_000_000
+    ? tokens
+    : undefined;
+}
+
 /* SVG eye icons */
 function EyeOpenIcon() {
   return (
@@ -64,6 +78,12 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   const [showKey, setShowKey] = useState(false);
   const [proxyUrl, setProxyUrl] = useState(provider.proxyUrl || '');
   const [mappings, setMappings] = useState<ModelMapping[]>(provider.modelMappings);
+  const [contextInputs, setContextInputs] = useState<Record<string, string>>(() => Object.fromEntries(
+    provider.modelMappings.map((mapping) => [
+      mapping.tier,
+      mapping.contextWindowTokens ? String(mapping.contextWindowTokens) : '',
+    ]),
+  ));
   const [extraEnv, setExtraEnv] = useState<Record<string, string>>(provider.extraEnv || {});
   const [testStatus, _setTestStatus] = useState<TestStatus>('idle');
   const [_testError, setTestError] = useState('');
@@ -115,11 +135,37 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
     return mappings.find((m) => m.tier === tier)?.providerModel || '';
   };
 
+  const getContextWindow = (tier: string): string => {
+    return contextInputs[tier] ?? '';
+  };
+
   const updateMapping = (tier: string, value: string) => {
+    const current = mappings.find((m) => m.tier === tier);
     const updated = mappings.filter((m) => m.tier !== tier);
     if (value) {
-      updated.push({ tier, providerModel: value });
+      updated.push({ ...current, tier, providerModel: value });
     }
+    setMappings(updated);
+    autoSave({ modelMappings: updated });
+  };
+
+  const commitMappingContext = (tier: string) => {
+    const raw = contextInputs[tier] ?? '';
+    const parsed = raw.trim() ? parseContextWindowInput(raw) : undefined;
+    if (raw.trim() && parsed === undefined) {
+      const previous = mappings.find((mapping) => mapping.tier === tier)?.contextWindowTokens;
+      setContextInputs((current) => ({ ...current, [tier]: previous ? String(previous) : '' }));
+      return;
+    }
+    const updated = mappings.map((mapping) => (
+      mapping.tier === tier
+        ? {
+            ...mapping,
+            contextWindowTokens: parsed,
+          }
+        : mapping
+    ));
+    setContextInputs((current) => ({ ...current, [tier]: parsed ? String(parsed) : '' }));
     setMappings(updated);
     autoSave({ modelMappings: updated });
   };
@@ -135,8 +181,13 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   /** Update extra model: tier and providerModel are always the same value */
   const updateExtraModel = (oldTier: string, modelName: string) => {
     const updated = mappings.map((m) =>
-      m.tier === oldTier && !FIXED_TIERS.has(m.tier) ? { tier: modelName, providerModel: modelName } : m,
+      m.tier === oldTier && !FIXED_TIERS.has(m.tier) ? { ...m, tier: modelName, providerModel: modelName } : m,
     );
+    setContextInputs((current) => {
+      const next = { ...current, [modelName]: current[oldTier] ?? '' };
+      if (oldTier !== modelName) delete next[oldTier];
+      return next;
+    });
     setMappings(updated);
     autoSave({ modelMappings: updated });
   };
@@ -432,6 +483,13 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
                 value={getMapping(tier)}
                 onChange={(e) => updateMapping(tier, e.target.value)}
                 placeholder={t(placeholderKey)} />
+              <input className={`${INPUT_CLASS} w-28 shrink-0`}
+                value={getContextWindow(tier)}
+                inputMode="decimal"
+                onChange={(e) => setContextInputs((current) => ({ ...current, [tier]: e.target.value }))}
+                onBlur={() => commitMappingContext(tier)}
+                placeholder={t('provider.contextWindowAuto')}
+                title={t('provider.contextWindowHint')} />
             </div>
           ))}
           {extraMappings.map((m, i) => (
@@ -440,6 +498,13 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
                 value={m.providerModel}
                 onChange={(e) => updateExtraModel(m.tier, e.target.value)}
                 placeholder={t('provider.extraModelPlaceholder')} />
+              <input className={`${INPUT_CLASS} w-28 shrink-0`}
+                value={getContextWindow(m.tier)}
+                inputMode="decimal"
+                onChange={(e) => setContextInputs((current) => ({ ...current, [m.tier]: e.target.value }))}
+                onBlur={() => commitMappingContext(m.tier)}
+                placeholder={t('provider.contextWindowAuto')}
+                title={t('provider.contextWindowHint')} />
               <button onClick={() => removeExtraMapping(m.tier)}
                 className="text-text-tertiary hover:text-text-primary transition-smooth shrink-0 p-0.5">
                 <svg width="12" height="12" viewBox="0 0 16 16" fill="none"

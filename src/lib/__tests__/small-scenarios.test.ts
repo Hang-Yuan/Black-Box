@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { extractResponseArtifacts } from '../response-artifacts';
 import { imageDetailTiles } from '../image-detail';
 import { projectExecutionEvent } from '../execution-state';
-import { planContextBudget, classifySessionSilence } from '../context-recovery';
+import { classifySessionSilence } from '../context-recovery';
 import { parseSessionMessages } from '../session-loader';
 import { useChatStore } from '../../stores/chatStore';
 
@@ -80,7 +80,7 @@ describe('long responses and dense screenshots', () => {
   });
 });
 
-describe('context reserve and silence classification', () => {
+describe('context accounting and silence classification', () => {
   it('uses the last API window after reload, including cached input rather than cumulative result usage', () => {
     const loaded = parseSessionMessages([
       { type: 'assistant', message: { usage: { input_tokens: 100, cache_creation_input_tokens: 30000, cache_read_input_tokens: 120000, output_tokens: 200 }, content: [{ type: 'text', text: 'Done' }] } },
@@ -88,12 +88,8 @@ describe('context reserve and silence classification', () => {
     ]);
     expect(loaded.contextInputTokens).toBe(150100);
     expect(loaded.contextOutputTokens).toBe(200);
-    expect(planContextBudget(loaded.contextInputTokens!, 'Continue', 160000).compact).toBe(true);
   });
-  it('reserves enough space before sending and distinguishes a known dead process from silence', () => {
-    expect(planContextBudget(150_000, '继续执行'.repeat(300), 160_000).compact).toBe(true);
-    expect(planContextBudget(30_000, '继续', 160_000).compact).toBe(false);
-    expect(planContextBudget(0, 'first message', 160_000).compact).toBe(false);
+  it('distinguishes a known dead process from silence', () => {
     expect(classifySessionSilence({ now: 500_000, lastProgressAt: 200_000, alive: true })).toBe('stalled');
     expect(classifySessionSilence({ now: 500_000, lastProgressAt: 200_000, waitingForUser: true })).toBe('waiting');
     expect(classifySessionSilence({ now: 500_000, lastProgressAt: 490_000, alive: false })).toBe('dead');

@@ -1227,6 +1227,8 @@ fn safe_data_dir() -> Result<std::path::PathBuf, String> {
 struct ModelMapping {
     tier: String,
     provider_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1551,6 +1553,16 @@ fn save_providers(mut data: ProvidersFile) -> Result<ProvidersFile, String> {
     }
 
     for provider in &mut data.providers {
+        for mapping in &provider.model_mappings {
+            if let Some(tokens) = mapping.context_window_tokens {
+                if !(1_024..=10_000_000).contains(&tokens) {
+                    return Err(format!(
+                        "Model '{}' contextWindowTokens must be between 1024 and 10000000",
+                        mapping.tier
+                    ));
+                }
+            }
+        }
         provider.auth_scheme = Some(resolve_provider_auth_scheme(provider)?);
         let previous = existing_by_id.get(&provider.id);
         let incoming_secret = provider
@@ -2322,7 +2334,8 @@ fn normalize_cli_model_id(model: &str) -> String {
 mod provider_capability_tests {
     use super::{
         apply_provider_connection_auth, enforce_provider_loopback_child_env,
-        merge_provider_extra_env, normalize_cli_model_id, parse_bool_override,
+        merge_provider_extra_env, model_mapping_context_window, normalize_cli_model_id,
+        parse_bool_override,
         provider_connection_probe_body, provider_connection_probe_url,
         provider_error_indicates_auth_failure, provider_inherited_env_removals,
         redacted_env_for_log, resolve_provider_auth_scheme, resolve_provider_auth_scheme_parts,
@@ -2352,6 +2365,7 @@ mod provider_capability_tests {
             model_mappings: vec![ModelMapping {
                 tier: "sonnet".to_string(),
                 provider_model: "model".to_string(),
+                context_window_tokens: None,
             }],
             extra_env,
             proxy_url: None,
@@ -2359,6 +2373,29 @@ mod provider_capability_tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn model_mapping_context_window_follows_the_selected_model() {
+        let mut p = provider("https://relay.example.com", None, "anthropic", None);
+        p.model_mappings = vec![
+            ModelMapping {
+                tier: "fable".to_string(),
+                provider_model: "relay-large".to_string(),
+                context_window_tokens: Some(1_000_000),
+            },
+            ModelMapping {
+                tier: "haiku".to_string(),
+                provider_model: "relay-small".to_string(),
+                context_window_tokens: Some(20_000),
+            },
+        ];
+        assert_eq!(
+            model_mapping_context_window(&p, "relay-large"),
+            Some(1_000_000)
+        );
+        assert_eq!(model_mapping_context_window(&p, "HAIKU"), Some(20_000));
+        assert_eq!(model_mapping_context_window(&p, "unknown"), None);
     }
 
     #[test]
@@ -3137,6 +3174,33 @@ pub(crate) fn apply_provider_model_aliases(
     Ok(())
 }
 
+fn resolve_provider_model_context_window(
+    provider_id: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<Option<u64>, String> {
+    let (Some(provider_id), Some(model_name)) = (provider_id, model_name) else {
+        return Ok(None);
+    };
+    let providers = read_providers_file()?;
+    let provider = providers
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| format!("Provider '{provider_id}' not found"))?;
+    Ok(model_mapping_context_window(provider, model_name))
+}
+
+fn model_mapping_context_window(provider: &ApiProvider, model_name: &str) -> Option<u64> {
+    provider
+        .model_mappings
+        .iter()
+        .find(|mapping| {
+            mapping.provider_model.eq_ignore_ascii_case(model_name)
+                || mapping.tier.eq_ignore_ascii_case(model_name)
+        })
+        .and_then(|mapping| mapping.context_window_tokens)
+}
+
 pub(crate) fn auxiliary_model_hook_settings(
     auxiliary_model_tier: &str,
 ) -> Result<serde_json::Value, String> {
@@ -3590,13 +3654,25 @@ async fn start_claude_session(
         "1".to_string(),
     );
 
-    // For models with a 1M context window (explicit Opus 1M variants such as
-    // `claude-opus-4-8[1m]` / `claude-opus-4-6[1m]`, MiMo v2 Pro, etc.), override
-    // the auto-compact threshold so Claude Code doesn't compact prematurely. The
-    // CLI's internal model map may only know ~200K for some of these models; this
-    // env var directly sets the compact window. Standard 200K variants (e.g.
-    // `claude-opus-4-8`) deliberately do not match.
-    if let Some(model_name) = params.model.as_deref() {
+    // Claude Code owns automatic compaction. Native/recognized models use its
+    // built-in context metadata. Provider aliases can attach their real token
+    // capacity to each model mapping; changing models then changes the CLI's
+    // auto-compact capacity with the same spawn.
+    let configured_context_window = resolve_provider_model_context_window(
+        params.provider_id.as_deref(),
+        params.model.as_deref(),
+    )?;
+    if let Some(context_window) = configured_context_window {
+        resolved_env.insert(
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+            context_window.to_string(),
+        );
+        eprintln!(
+            "[BLACKBOX] Set model context window to {} tokens for {}",
+            context_window,
+            params.model.as_deref().unwrap_or("selected model")
+        );
+    } else if let Some(model_name) = params.model.as_deref() {
         let m = model_name.to_lowercase();
         let is_1m_model = m.contains("mimo") || m.contains("[1m]") || m.ends_with("-1m");
         if is_1m_model {

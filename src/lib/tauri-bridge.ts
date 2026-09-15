@@ -538,7 +538,7 @@ export interface ProvidersFile {
     credentialHint?: string;
     credentialState?: 'missing' | 'local_file';
     revision?: number;
-    modelMappings: { tier: string; providerModel: string }[];
+    modelMappings: { tier: string; providerModel: string; contextWindowTokens?: number }[];
     extraEnv?: Record<string, string>;
     proxyUrl?: string;
     preset?: string;

@@ -19,6 +19,21 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.56', date: '2026-09-16',
+    highlights: {
+      zh: [
+        '上下文自动压缩统一交由 Claude Code 按模型窗口管理，发送前、回答后和空终态恢复均不再由 Black Box 注入 /compact',
+        'API 设置可为每个代理模型保存 20K、200K、1M 等上下文容量；切换模型时自动应用，官方与明确扩展模型可留空交给 Claude Code 识别',
+        '继续保留用户手动 /compact、压缩过程展示、输入草稿保护和旧版进行中压缩的恢复兼容',
+      ],
+      en: [
+        'Claude Code now exclusively manages automatic compaction from the active model context window; Black Box no longer injects /compact before sends, after responses, or during empty-terminal recovery',
+        'API settings can save a 20K, 200K, 1M, or other context capacity per proxy model and apply it automatically on model switches; official and explicit extended models can remain on automatic detection',
+        'Keeps user-requested /compact, compaction progress, draft preservation, and compatibility with an in-flight compaction started by an older build',
+      ],
+    },
+  },
+  {
     version: '0.14.55', date: '2026-09-13',
     highlights: {
       zh: [

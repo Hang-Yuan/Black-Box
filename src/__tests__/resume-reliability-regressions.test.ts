@@ -46,11 +46,12 @@ describe('durable resume reliability regressions', () => {
     expect(identity).toContain('useAgentStore.getState().moveCache(currentTabId, durableId)');
   });
 
-  it('keeps slow auto-compact busy until a real CLI settlement event', () => {
+  it('leaves automatic compaction to Claude Code', () => {
     const stream = read('hooks/useStreamProcessor.ts');
-    expect(stream).toContain('markPendingCommandSlow(tabId, compactMsgId');
-    expect(stream).toContain('markPendingCommandSlow(tabId, bgCompactMsgId');
-    expect(stream).not.toContain("completePendingCommand(tabId, { output: 'Compact timed out' })");
+    const input = read('components/chat/InputBar.tsx');
+    expect(stream).not.toMatch(/sendStdin\([^\n]*['"]\/compact/);
+    expect(input).not.toContain("return '/compact'");
+    expect(input).not.toContain('preflightPrompt: text');
   });
 
   it('hides on red close and flushes live CLI sessions only on explicit app exit', () => {
@@ -114,15 +115,11 @@ describe('durable resume reliability regressions', () => {
     expect(checkpointConfig).not.toContain('if provider_caps.is_native_anthropic');
   });
 
-  it('serializes manual and automatic compact ahead of pending follow-ups', () => {
+  it('serializes a user-requested compact ahead of pending follow-ups', () => {
     const input = read('components/chat/InputBar.tsx');
     const stream = read('hooks/useStreamProcessor.ts');
     expect(input).toContain("cmd === 'compact' && isSessionBusy(commandTab.sessionStatus)");
     expect(input).toContain("kind: 'command'");
-    const backgroundStart = stream.indexOf('// Auto-compact must outrank pending follow-ups on background tabs');
-    const backgroundDrain = stream.indexOf('drainPendingQueueAfterSettlement({', backgroundStart);
-    expect(backgroundStart).toBeGreaterThan(-1);
-    expect(backgroundDrain).toBeGreaterThan(backgroundStart);
     expect(stream).toContain("item.kind === 'command'");
     expect(stream).toContain('store.shiftPendingMessage(tabId)!');
   });
@@ -177,9 +174,8 @@ describe('durable resume reliability regressions', () => {
     const chatStore = read('stores/chatStore.ts');
     expect(stream).toContain('handleEmptyTerminalRecoveryResult({');
     expect(stream).toContain('assistantContentHasVisibleTerminalResponse(content)');
-    expect(stream).toContain('effectiveContextInputTokens(msg.usage)');
     expect(stream).toContain("bridge.sendStdin(stdinId, EMPTY_TERMINAL_RECOVERY_PROMPT)");
-    expect(stream).toContain("bridge.sendStdin(stdinId, '/compact')");
+    expect(stream).not.toContain("bridge.sendStdin(stdinId, '/compact')");
     expect(input).toContain('awaitingVisibleAssistantResponse: true');
     expect(chatStore).toContain('emptyTerminalRecoveryAfterCompact?: boolean');
     expect(recovery).toContain('EMPTY_TERMINAL_RECOVERY_LIMIT = 3');

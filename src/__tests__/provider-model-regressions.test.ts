@@ -11,6 +11,7 @@ import {
 import { useProviderStore, type ApiProvider } from '../stores/providerStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { maskedProviderKey } from '../components/chat/ProviderQuickSelector';
+import { parseContextWindowInput } from '../components/settings/ProviderForm';
 
 const providerForm = readFileSync(
   resolve(__dirname, '../components/settings/ProviderForm.tsx'),
@@ -85,6 +86,18 @@ describe('provider editing regressions', () => {
     expect(providerForm).toContain('updateProvider(provider.id, patch);');
     expect(providerForm).toContain('void flushSave().catch');
     expect(providerForm).toContain('providerStore coalesces the');
+  });
+
+  it('stores an optional context capacity beside each model mapping', () => {
+    expect(providerForm).toContain('parseContextWindowInput');
+    expect(providerForm).toContain("t('provider.contextWindowAuto')");
+    expect(providerForm).toContain('contextWindowTokens: parsed');
+    expect(providerStore).toContain('contextWindowTokens ?? null');
+    expect(apiConfig).toContain('contextWindowTokens: m.contextWindowTokens');
+    expect(parseContextWindowInput('20k')).toBe(20_000);
+    expect(parseContextWindowInput('1m')).toBe(1_000_000);
+    expect(parseContextWindowInput('200000')).toBe(200_000);
+    expect(parseContextWindowInput('20 bananas')).toBeUndefined();
   });
 
   it('uses the configured proxy in both form and card connection tests', () => {

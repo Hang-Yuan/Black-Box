@@ -817,9 +817,6 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
       store.setSessionMeta(tabId, { pendingCommandMsgId: undefined });
     }
 
-    // 5b. Clear per-tab autoCompact tracking (NEW-B fix)
-    clearAutoCompact(tabId);
-
     // 6. Clear sessionMeta: clear stdinId, KEEP cliResumeId and cwdSnapshot
     store.setSessionMeta(tabId, {
       stdinId: undefined,
@@ -861,29 +858,6 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
     // Refresh session list
     useSessionStore.getState().fetchSessions();
   });
-}
-
-// ---------------------------------------------------------------------------
-// autoCompactFiredMap — per-tab tracking (replaces global ref)
-// ---------------------------------------------------------------------------
-
-/** Per-tab auto-compact tracking. Replaces the module-level `autoCompactFiredRef`
- *  in InputBar.tsx to avoid cross-tab pollution. */
-export const autoCompactFiredMap = new Map<string, boolean>();
-
-/** Mark auto-compact as fired for a tab. */
-export function markAutoCompactFired(tabId: string): void {
-  autoCompactFiredMap.set(tabId, true);
-}
-
-/** Check if auto-compact has fired for a tab. */
-export function hasAutoCompactFired(tabId: string): boolean {
-  return autoCompactFiredMap.get(tabId) ?? false;
-}
-
-/** Clear auto-compact tracking for a tab (called on teardown). */
-export function clearAutoCompact(tabId: string): void {
-  autoCompactFiredMap.delete(tabId);
 }
 
 /** Read-only liveness observations never terminate a merely slow process. */
