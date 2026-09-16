@@ -1,7 +1,7 @@
 {
   "name": "blackbox",
   "private": true,
-  "version": "0.14.58",
+  "version": "0.14.59",
   "packageManager": "pnpm@9.15.9",
   "type": "module",
   "scripts": {

@@ -18,7 +18,7 @@ import { AgentPanel } from '../agents/AgentPanel';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useT } from '../../lib/i18n';
 import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
-import { flushAndCaptureSpawnConfiguration, getResolvedModelDisplayName, is1MModel as isOneMillionModel, resolveModelOrError } from '../../lib/api-provider';
+import { flushAndCaptureSpawnConfiguration, getResolvedModelDisplayName, resolveModelOrError } from '../../lib/api-provider';
 import { hasUsableProviderCredential, useProviderStore } from '../../stores/providerStore';
 import { spawnSession } from '../../lib/sessionLifecycle';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
@@ -788,7 +788,7 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
     ))?.contextWindowTokens;
   const contextWindow = resolveDisplayedContextWindow(
     configuredContextWindow,
-    isOneMillionModel(resolvedModel),
+    resolvedModel,
   );
   const inputTokens = sessionMeta.contextInputTokens || 0;
   const contextPressure = projectContextPressure(inputTokens, contextWindow);

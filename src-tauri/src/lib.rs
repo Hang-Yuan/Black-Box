@@ -2334,8 +2334,9 @@ fn normalize_cli_model_id(model: &str) -> String {
 mod provider_capability_tests {
     use super::{
         apply_provider_connection_auth, enforce_provider_loopback_child_env,
-        configured_context_window_env, merge_provider_extra_env, model_mapping_context_window,
-        normalize_cli_model_id, parse_bool_override,
+        configured_context_window_env, effective_model_context_window,
+        merge_provider_extra_env, model_mapping_context_window, normalize_cli_model_id,
+        official_claude_context_window, parse_bool_override,
         provider_connection_probe_body, provider_connection_probe_url,
         provider_error_indicates_auth_failure, provider_inherited_env_removals,
         redacted_env_for_log, resolve_provider_auth_scheme, resolve_provider_auth_scheme_parts,
@@ -2445,6 +2446,51 @@ mod provider_capability_tests {
                     "1000000".to_string(),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn official_claude_models_use_their_largest_supported_context() {
+        assert_eq!(
+            official_claude_context_window("claude-fable-5-1"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            official_claude_context_window("claude-opus-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            official_claude_context_window("claude-sonnet-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            official_claude_context_window("claude-opus-4-8"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            official_claude_context_window("claude-sonnet-4-6"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            official_claude_context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        assert_eq!(official_claude_context_window("relay-large"), None);
+    }
+
+    #[test]
+    fn official_claude_capacity_wins_over_stale_provider_values() {
+        assert_eq!(
+            effective_model_context_window("claude-opus-5", Some(200_000)),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            effective_model_context_window("claude-haiku-4-5-20251001", Some(1_000_000)),
+            Some(200_000)
+        );
+        assert_eq!(
+            effective_model_context_window("relay-small", Some(20_000)),
+            Some(20_000)
         );
     }
 
@@ -3251,6 +3297,62 @@ fn model_mapping_context_window(provider: &ApiProvider, model_name: &str) -> Opt
         .and_then(|mapping| mapping.context_window_tokens)
 }
 
+fn model_id_has_release_prefix(model_name: &str, release_prefix: &str) -> bool {
+    model_name == release_prefix
+        || model_name
+            .strip_prefix(release_prefix)
+            .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('['))
+}
+
+/// Largest official context window for Claude model ids that Black Box knows.
+/// This remains independent of provider configuration because compatible
+/// relays commonly expose the official model id without Claude Code's `[1m]`
+/// marker.
+fn official_claude_context_window(model_name: &str) -> Option<u64> {
+    const STANDARD: u64 = 200_000;
+    const EXTENDED: u64 = 1_000_000;
+
+    let model = model_name.trim().to_ascii_lowercase();
+    if model.is_empty() {
+        return None;
+    }
+    if model.contains("[1m]") || model.ends_with("-1m") {
+        return Some(EXTENDED);
+    }
+
+    let one_million_release = [
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
+    .iter()
+    .any(|release| model_id_has_release_prefix(&model, release));
+    if one_million_release {
+        return Some(EXTENDED);
+    }
+
+    if [
+        "claude-fable",
+        "claude-opus",
+        "claude-sonnet",
+        "claude-haiku",
+    ]
+    .iter()
+    .any(|family| model_id_has_release_prefix(&model, family))
+    {
+        return Some(STANDARD);
+    }
+    None
+}
+
+fn effective_model_context_window(model_name: &str, configured_window: Option<u64>) -> Option<u64> {
+    official_claude_context_window(model_name).or(configured_window)
+}
+
 fn configured_context_window_env(model_name: &str, context_window: u64) -> Vec<(String, String)> {
     const MIN_AUTO_COMPACT_WINDOW: u64 = 100_000;
     const MAX_AUTO_COMPACT_WINDOW: u64 = 1_000_000;
@@ -3751,42 +3853,47 @@ async fn start_claude_session(
         "1".to_string(),
     );
 
-    // Claude Code owns automatic compaction. Native/recognized models use its
-    // built-in context metadata. Provider aliases can attach their real token
-    // capacity to each model mapping; changing models then changes the CLI's
-    // context assumption and native auto-compact controls with the same spawn.
+    // Claude Code owns automatic compaction. Black Box supplies the largest
+    // official capacity for recognized Claude releases because relay model ids
+    // commonly omit the optional `[1m]` marker. Unknown proxy aliases keep the
+    // capacity configured on their provider mapping.
     let configured_context_window = resolve_provider_model_context_window(
         params.provider_id.as_deref(),
         params.model.as_deref(),
     )?;
-    if let Some(context_window) = configured_context_window {
-        let selected_model = params.model.as_deref().unwrap_or("selected model");
-        for key in [
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
-        ] {
-            resolved_env.remove(key);
-        }
-        for (key, value) in configured_context_window_env(selected_model, context_window) {
-            resolved_env.insert(key, value);
-        }
-        eprintln!(
-            "[BLACKBOX] Set model context window to {} tokens for {}",
-            context_window, selected_model
-        );
-    } else if let Some(model_name) = params.model.as_deref() {
-        let m = model_name.to_lowercase();
-        let is_1m_model = m.contains("mimo") || m.contains("[1m]") || m.ends_with("-1m");
-        if is_1m_model {
-            resolved_env.insert(
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
-                "1000000".to_string(),
-            );
+    if let Some(selected_model) = params.model.as_deref() {
+        let effective_context_window =
+            effective_model_context_window(selected_model, configured_context_window);
+        if let Some(context_window) = effective_context_window {
+            for key in [
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+            ] {
+                resolved_env.remove(key);
+            }
+            for (key, value) in configured_context_window_env(selected_model, context_window) {
+                resolved_env.insert(key, value);
+            }
             eprintln!(
-                "[BLACKBOX] Set CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000 for model {}",
-                model_name
+                "[BLACKBOX] Set model context window to {} tokens for {}",
+                context_window, selected_model
             );
+        } else {
+            let model = selected_model.to_lowercase();
+            let is_1m_alias = model.contains("mimo")
+                || model.contains("[1m]")
+                || model.ends_with("-1m");
+            if is_1m_alias {
+                resolved_env.insert(
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
+                    "1000000".to_string(),
+                );
+                eprintln!(
+                    "[BLACKBOX] Set CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000 for model {}",
+                    selected_model
+                );
+            }
         }
     }
 

@@ -19,6 +19,21 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.59', date: '2026-09-16',
+    highlights: {
+      zh: [
+        'Claude 官方型号自动使用该型号的最大上下文：Fable 5.x、Opus 5、Sonnet 5 及已支持扩展窗口的 4.x 型号统一启用 1M',
+        '后台启动参数与运行栏共用同一能力表，Provider 中遗留的 200K 值不会再降低受支持 Claude 型号的窗口',
+        '官方 Claude 型号的上下文字段改为只读显示；手动容量仅用于 Black Box 无法识别的代理模型别名',
+      ],
+      en: [
+        'Official Claude models now use their largest supported context window automatically, including 1M for Fable 5.x, Opus 5, Sonnet 5, and supported 4.x releases',
+        'The backend launch environment and running context meter share one capability table, so stale 200K provider values cannot reduce supported Claude models',
+        'Context capacity is read-only for recognized Claude models and remains configurable only for unrecognized proxy aliases',
+      ],
+    },
+  },
+  {
     version: '0.14.58', date: '2026-09-16',
     highlights: {
       zh: [

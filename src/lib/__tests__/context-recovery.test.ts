@@ -95,12 +95,13 @@ describe('context-drop recovery signature', () => {
     })).toBe(153_305);
   });
 
-  it('uses a configured provider window for occupancy instead of the model-name fallback', () => {
-    expect(resolveDisplayedContextWindow(20_000, true)).toBe(20_000);
-    expect(resolveDisplayedContextWindow(200_000, false)).toBe(200_000);
-    expect(resolveDisplayedContextWindow(1_000_000, false)).toBe(1_000_000);
-    expect(resolveDisplayedContextWindow(undefined, true)).toBe(1_000_000);
-    expect(resolveDisplayedContextWindow(undefined, false)).toBe(200_000);
+  it('uses official Claude maxima before provider overrides and retains proxy capacities', () => {
+    expect(resolveDisplayedContextWindow(200_000, 'claude-opus-5')).toBe(1_000_000);
+    expect(resolveDisplayedContextWindow(undefined, 'claude-fable-5-1')).toBe(1_000_000);
+    expect(resolveDisplayedContextWindow(undefined, 'claude-sonnet-4-6')).toBe(1_000_000);
+    expect(resolveDisplayedContextWindow(1_000_000, 'claude-haiku-4-5-20251001')).toBe(200_000);
+    expect(resolveDisplayedContextWindow(20_000, 'relay-small')).toBe(20_000);
+    expect(resolveDisplayedContextWindow(undefined, 'relay-standard')).toBe(200_000);
   });
 
   it('recovers empty terminal success on the same session with bounded retries', () => {

@@ -2,6 +2,7 @@ import {
   isCliPlaceholder,
   sanitizeAssistantTextForDisplay,
 } from './presentation-sanitizer';
+import { resolveModelContextWindow } from './model-context-window';
 
 export interface ContextDropUsage {
   input_tokens?: number;
@@ -116,20 +117,12 @@ export function projectContextPressure(inputTokens: number, contextWindow: numbe
   return { used, window, percent: Math.round(ratio * 100), visible: ratio >= 0.6, high: ratio >= 0.8 };
 }
 
-/** Use the provider mapping when it declares a real window; otherwise retain
- * Claude Code's model-name fallback for the occupancy display. */
+/** Keep the occupancy display on the same effective window used at spawn. */
 export function resolveDisplayedContextWindow(
   configuredWindow: number | undefined,
-  isOneMillionModel: boolean,
+  modelId: string,
 ): number {
-  if (
-    typeof configuredWindow === 'number'
-    && Number.isInteger(configuredWindow)
-    && configuredWindow >= 1_024
-  ) {
-    return configuredWindow;
-  }
-  return isOneMillionModel ? 1_000_000 : 200_000;
+  return resolveModelContextWindow(modelId, configuredWindow);
 }
 
 /**

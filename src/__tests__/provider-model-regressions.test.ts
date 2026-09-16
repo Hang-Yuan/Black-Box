@@ -90,6 +90,8 @@ describe('provider editing regressions', () => {
 
   it('stores an optional context capacity beside each model mapping', () => {
     expect(providerForm).toContain('parseContextWindowInput');
+    expect(providerForm).toContain('getOfficialClaudeContextWindow');
+    expect(providerForm).toContain('disabled={officialContextWindow !== undefined}');
     expect(providerForm).toContain("t('provider.contextWindowAuto')");
     expect(providerForm).toContain('contextWindowTokens: parsed');
     expect(providerStore).toContain('contextWindowTokens ?? null');

@@ -12,6 +12,7 @@ import {
   type ThinkingLevel,
 } from '../stores/settingsStore';
 import { bridge } from '../lib/tauri-bridge';
+import { getOfficialClaudeContextWindow } from './model-context-window';
 
 /**
  * Legacy/exact ids mapped to their stable logical tier. Fable is deliberately
@@ -253,9 +254,9 @@ export function getResolvedModelDisplayName(modelId: string): string {
  * Check whether the given model ID (or the currently selected model) uses
  * the 1M context window variant.
  *
- * 1M variants advertise themselves either via a `-1m` suffix (UI ids such as
- * `claude-opus-4-8-1m`) or a `[1m]` marker (CLI / provider ids such as
- * `claude-opus-4-8[1m]`). Standard variants (e.g. `claude-opus-4-8`) are 200K.
+ * Explicit 1M aliases and Claude releases whose official maximum is 1M both
+ * resolve to the extended window. Provider mappings do not need to duplicate
+ * that capability.
  */
 export function is1MModel(modelId?: string): boolean {
   const raw = modelId ?? useSettingsStore.getState().selectedModel;
@@ -266,7 +267,8 @@ export function is1MModel(modelId?: string): boolean {
     id = resolution.model;
   }
   const lower = id.toLowerCase();
-  return lower.endsWith('-1m')
+  return getOfficialClaudeContextWindow(id) === 1_000_000
+    || lower.endsWith('-1m')
     || lower.includes('[1m]');
 }
 

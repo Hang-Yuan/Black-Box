@@ -48,17 +48,21 @@ function provider(id: string, suffix: string, mappings?: ApiProvider['modelMappi
 }
 
 describe('model context routing', () => {
-  it('treats only explicit 1M variants as 1M models', () => {
-    // Standard variants are 200K; 1M is opt-in via -1m / [1m].
-    expect(is1MModel('claude-fable-5')).toBe(false);
+  it('uses the largest official Claude context without provider-specific flags', () => {
+    expect(is1MModel('claude-fable-5')).toBe(true);
+    expect(is1MModel('claude-fable-5-1')).toBe(true);
+    expect(is1MModel('claude-opus-5')).toBe(true);
+    expect(is1MModel('claude-sonnet-5')).toBe(true);
     expect(is1MModel('claude-fable-5-1m')).toBe(true);
     expect(is1MModel('claude-fable-5[1m]')).toBe(true);
-    expect(is1MModel('claude-opus-4-8')).toBe(false);
+    expect(is1MModel('claude-opus-4-8')).toBe(true);
     expect(is1MModel('claude-opus-4-8-1m')).toBe(true);
     expect(is1MModel('claude-opus-4-8[1m]')).toBe(true);
     expect(is1MModel('claude-opus-4-6-1m')).toBe(true);
     expect(is1MModel('mimo-v2-pro[1m]')).toBe(true);
-    expect(is1MModel('claude-opus-4-6')).toBe(false);
+    expect(is1MModel('claude-opus-4-6')).toBe(true);
+    expect(is1MModel('claude-sonnet-4-6')).toBe(true);
+    expect(is1MModel('claude-haiku-4-5-20251001')).toBe(false);
   });
 
   it('maps the four UI tiers to built-in native model ids', () => {

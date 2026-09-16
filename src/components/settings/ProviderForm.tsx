@@ -9,6 +9,7 @@ import {
   type ProviderApiFormat,
 } from '../../lib/provider-presets';
 import { getProviderConnectionTestModel } from '../../lib/api-provider';
+import { getOfficialClaudeContextWindow } from '../../lib/model-context-window';
 
 const MODEL_TIERS: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; labelKey: string; placeholderKey: string }[] = [
   { tier: 'fable', labelKey: 'provider.fableModel', placeholderKey: 'provider.fablePlaceholder' },
@@ -138,6 +139,10 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   const getContextWindow = (tier: string): string => {
     return contextInputs[tier] ?? '';
   };
+
+  const getOfficialContextWindow = (modelId: string): number | undefined => (
+    getOfficialClaudeContextWindow(modelId)
+  );
 
   const updateMapping = (tier: string, value: string) => {
     const current = mappings.find((m) => m.tier === tier);
@@ -474,7 +479,9 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
         <label className="text-xs text-text-muted mb-1 block">{t('provider.modelMappings')}</label>
         <p className="text-xs text-text-tertiary mb-1.5">{t('provider.modelMappingsHint')}</p>
         <div className="space-y-1.5">
-          {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }, index) => (
+          {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }, index) => {
+            const officialContextWindow = getOfficialContextWindow(getMapping(tier));
+            return (
             <div key={tier} className="flex items-center gap-2">
               <span className="text-xs text-text-muted w-14 shrink-0">
                 {provider.preset === 'anthropic' ? t(labelKey) : `${t('provider.modelChoice')} ${index + 1}`}
@@ -484,27 +491,36 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
                 onChange={(e) => updateMapping(tier, e.target.value)}
                 placeholder={t(placeholderKey)} />
               <input className={`${INPUT_CLASS} w-28 shrink-0`}
-                value={getContextWindow(tier)}
+                value={officialContextWindow ? String(officialContextWindow) : getContextWindow(tier)}
                 inputMode="decimal"
+                disabled={officialContextWindow !== undefined}
                 onChange={(e) => setContextInputs((current) => ({ ...current, [tier]: e.target.value }))}
                 onBlur={() => commitMappingContext(tier)}
                 placeholder={t('provider.contextWindowAuto')}
-                title={t('provider.contextWindowHint')} />
+                title={officialContextWindow
+                  ? t('provider.contextWindowOfficial')
+                  : t('provider.contextWindowHint')} />
             </div>
-          ))}
-          {extraMappings.map((m, i) => (
+            );
+          })}
+          {extraMappings.map((m, i) => {
+            const officialContextWindow = getOfficialContextWindow(m.providerModel);
+            return (
             <div key={`extra-${i}`} className="flex items-center gap-1.5">
               <input className="flex-1 min-w-0 px-3 py-2 text-[13px] bg-bg-chat border border-border-subtle rounded-md text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent font-mono"
                 value={m.providerModel}
                 onChange={(e) => updateExtraModel(m.tier, e.target.value)}
                 placeholder={t('provider.extraModelPlaceholder')} />
               <input className={`${INPUT_CLASS} w-28 shrink-0`}
-                value={getContextWindow(m.tier)}
+                value={officialContextWindow ? String(officialContextWindow) : getContextWindow(m.tier)}
                 inputMode="decimal"
+                disabled={officialContextWindow !== undefined}
                 onChange={(e) => setContextInputs((current) => ({ ...current, [m.tier]: e.target.value }))}
                 onBlur={() => commitMappingContext(m.tier)}
                 placeholder={t('provider.contextWindowAuto')}
-                title={t('provider.contextWindowHint')} />
+                title={officialContextWindow
+                  ? t('provider.contextWindowOfficial')
+                  : t('provider.contextWindowHint')} />
               <button onClick={() => removeExtraMapping(m.tier)}
                 className="text-text-tertiary hover:text-text-primary transition-smooth shrink-0 p-0.5">
                 <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
@@ -513,7 +529,8 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
                 </svg>
               </button>
             </div>
-          ))}
+            );
+          })}
           <button onClick={addExtraMapping}
             className="flex items-center gap-1 text-xs text-text-tertiary hover:text-text-muted transition-smooth mt-1">
             <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
