@@ -213,13 +213,20 @@ describe('automation runtime regressions', () => {
   it('separates scheduled result severity from read state', () => {
     expect(automationBackendSource).toContain("status='SUCCEEDED'");
     expect(automationBackendSource).toContain("status='NEEDS_ATTENTION'");
+    expect(automationBackendSource).toContain("status='RESOLVED'");
     expect(automationBackendSource).toContain('::automation-needs-attention{');
     expect(automationBackendSource).toContain('migrate_legacy_run_statuses');
     expect(automationUiSource).toContain("case 'SUCCEEDED':");
     expect(automationUiSource).toContain("case 'NEEDS_ATTENTION':");
+    expect(automationUiSource).toContain("case 'RESOLVED':");
+    expect(automationUiSource).toContain('bridge.resolveAutomationAttention(run.runId)');
+    expect(rustEntrySource).toContain('automations::resolve_automation_attention');
     expect(automationUiSource).toContain('isUnreadAutomationResult(run)');
     expect(i18nSource).toContain("'automations.status.succeeded': '已完成'");
     expect(i18nSource).toContain("'automations.status.needsAttention': '已完成 · 待裁决'");
+    expect(i18nSource).toContain("'automations.status.resolved': '已完成 · 已裁决'");
+    expect(automationBackendSource).toContain('attention_completion_failure');
+    expect(automationBackendSource).toContain('required completion receipt existed');
   });
 
   it('keeps recent-run status, unread state, and timestamp in aligned non-wrapping slots', () => {

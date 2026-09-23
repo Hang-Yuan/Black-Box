@@ -52,6 +52,8 @@ describe('model context routing', () => {
     expect(is1MModel('claude-fable-5')).toBe(true);
     expect(is1MModel('claude-fable-5-1')).toBe(true);
     expect(is1MModel('claude-opus-5')).toBe(true);
+    expect(is1MModel('claude-opus-5.5')).toBe(true);
+    expect(is1MModel('claude-opus-5-5')).toBe(true);
     expect(is1MModel('claude-sonnet-5')).toBe(true);
     expect(is1MModel('claude-fable-5-1m')).toBe(true);
     expect(is1MModel('claude-fable-5[1m]')).toBe(true);

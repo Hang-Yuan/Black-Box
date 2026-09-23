@@ -83,7 +83,11 @@ else
   export CARGO_ENCODED_RUSTFLAGS="$remap_flag"
 fi
 
-pnpm tauri build --bundles app,dmg --ci
+# The checked-in config enables signed updater artifacts for public releases.
+# Local builds intentionally have no updater private key, so disable only that
+# artifact in this build flavor while keeping the app and DMG bundles enabled.
+pnpm tauri build --bundles app,dmg --ci \
+  --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
 app_path="src-tauri/target/release/bundle/macos/Black Box.app"
 dmg_dir="src-tauri/target/release/bundle/dmg"

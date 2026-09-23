@@ -20,6 +20,14 @@ import { useGroupStore } from '../../stores/groupStore';
 import { useWorkflowStore } from '../../stores/workflowStore';
 import { useComposerModeStore } from '../../stores/composerModeStore';
 import { useLoopStore } from '../../stores/loopStore';
+import { useFileStore, restoreConversationFileState, saveConversationFileState } from '../../stores/fileStore';
+import {
+  clearConversationViewStateForTests,
+  loadChatScrollPosition,
+  loadFileScrollPosition,
+  saveChatScrollPosition,
+  saveFileScrollPosition,
+} from '../conversation-view-state';
 
 const draftId = 'draft_background';
 const realId = '11111111-1111-4111-8111-111111111111';
@@ -30,6 +38,7 @@ describe('CLI session identity adoption', () => {
   beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
+    clearConversationViewStateForTests();
     vi.clearAllMocks();
     useChatStore.setState({ tabs: new Map(), sessionCache: new Map() });
     useSessionStore.setState({
@@ -55,6 +64,14 @@ describe('CLI session identity adoption', () => {
     });
     useComposerModeStore.setState({ tabs: {} });
     useLoopStore.setState({ jobs: [] });
+    useFileStore.setState({
+      selectedFile: null,
+      fileContent: null,
+      previewSnapshots: {},
+      explorerSnapshots: {},
+      rootPath: '',
+      expandedFolders: new Set(),
+    });
   });
 
   it('atomically moves every draft-scoped authority to the durable CLI UUID', () => {
@@ -100,6 +117,16 @@ describe('CLI session identity adoption', () => {
       createdAt: now,
       updatedAt: now,
     });
+    useFileStore.setState({
+      selectedFile: '/tmp/project/report.md',
+      fileContent: '# report',
+      previewMode: 'preview',
+      rootPath: '/tmp/project',
+      expandedFolders: new Set(['/tmp/project/docs']),
+    });
+    saveConversationFileState(draftId);
+    saveChatScrollPosition(draftId, { top: 640, atBottom: false });
+    saveFileScrollPosition(draftId, '/tmp/project/report.md', 'preview', 220);
 
     expect(adoptCliSessionIdentity(draftId, realId, stdinId)).toBe(realId);
 
@@ -129,6 +156,10 @@ describe('CLI session identity adoption', () => {
     expect(useComposerModeStore.getState().tabs[draftId]).toBeUndefined();
     expect(useLoopStore.getState().jobs[0]?.threadId).toBe(realId);
     expect(useGroupStore.getState().getGroupOfSession(realId)).toBeDefined();
+    restoreConversationFileState(realId);
+    expect(useFileStore.getState().selectedFile).toBe('/tmp/project/report.md');
+    expect(loadChatScrollPosition(realId)).toEqual({ top: 640, atBottom: false });
+    expect(loadFileScrollPosition(realId, '/tmp/project/report.md', 'preview')).toBe(220);
   });
 
   it('is idempotent for an already durable task', () => {

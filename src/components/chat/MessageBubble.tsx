@@ -24,6 +24,7 @@ import {
 interface Props {
   message: ChatMessage;
   isFirstInGroup?: boolean;
+  basePath?: string;
 }
 
 /** Guard against raw content-block objects ({text, type}) being rendered as
@@ -34,7 +35,7 @@ function safeContent(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, isFirstInGroup = true }: Props) {
+export const MessageBubble = memo(function MessageBubble({ message, isFirstInGroup = true, basePath }: Props) {
   if (message.role === 'user') return <UserMsg message={message} />;
   if (message.role === 'system' && message.commandType === 'processing') return <CommandProcessingCard message={message} />;
   if (message.role === 'system' && message.commandType) return <CommandFeedbackMsg message={message} />;
@@ -52,7 +53,7 @@ export const MessageBubble = memo(function MessageBubble({ message, isFirstInGro
   if (message.type === 'permission' && !message.resolved && message.interactionState !== 'resolved') return null;
   if (message.type === 'permission') return <PermissionCard message={message} />;
   if (message.type === 'plan') return <PlanMsg message={message} />;
-  return <AssistantMsg message={message} isFirstInGroup={isFirstInGroup} />;
+  return <AssistantMsg message={message} isFirstInGroup={isFirstInGroup} basePath={basePath} />;
 });
 
 /* ================================================================
@@ -443,7 +444,7 @@ function CommandFeedbackMsg({ message }: Props) {
 /* ================================================================
    AssistantMsg — markdown with avatar (uses shared MarkdownRenderer)
    ================================================================ */
-function AssistantMsg({ message, isFirstInGroup = true }: Props) {
+function AssistantMsg({ message, isFirstInGroup = true, basePath }: Props) {
   return (
     <div className="flex gap-3">
       {/* Avatar: show only for the first message in a consecutive group */}
@@ -453,7 +454,10 @@ function AssistantMsg({ message, isFirstInGroup = true }: Props) {
         <div className="w-[60px] flex-shrink-0" />
       )}
       <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
-        <MarkdownRenderer content={sanitizeAssistantTextForDisplay(message.content)} />
+        <MarkdownRenderer
+          content={sanitizeAssistantTextForDisplay(message.content)}
+          basePath={message.cwd || basePath}
+        />
       </div>
       {/* Right gutter mirrors the avatar so assistant text aligns with the user bubble's right edge */}
       <div className="w-[60px] flex-shrink-0" />

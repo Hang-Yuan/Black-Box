@@ -4,8 +4,12 @@ import {
   decideEmptyTerminalRecovery,
   effectiveContextInputTokens,
   EMPTY_TERMINAL_RECOVERY_LIMIT,
+  EMPTY_TERMINAL_RECOVERY_PROMPT,
   isGenericContextGreeting,
   isGreetingOnlyPrompt,
+  isInternalRecoveryPrompt,
+  isInternalRunnerRecoveryPrompt,
+  projectInternalRunnerRecovery,
   resolveDisplayedContextWindow,
   shouldRetryContextDrop,
 } from '../context-recovery';
@@ -97,6 +101,7 @@ describe('context-drop recovery signature', () => {
 
   it('uses official Claude maxima before provider overrides and retains proxy capacities', () => {
     expect(resolveDisplayedContextWindow(200_000, 'claude-opus-5')).toBe(1_000_000);
+    expect(resolveDisplayedContextWindow(200_000, 'claude-opus-5.5')).toBe(1_000_000);
     expect(resolveDisplayedContextWindow(undefined, 'claude-fable-5-1')).toBe(1_000_000);
     expect(resolveDisplayedContextWindow(undefined, 'claude-sonnet-4-6')).toBe(1_000_000);
     expect(resolveDisplayedContextWindow(1_000_000, 'claude-haiku-4-5-20251001')).toBe(200_000);
@@ -130,6 +135,36 @@ describe('context-drop recovery signature', () => {
       ...base,
       recoveryCompactPending: true,
     })).toBe('resume_after_compact');
+    expect(decideEmptyTerminalRecovery({
+      ...base,
+      activeBackgroundAgent: true,
+    })).toBe('none');
+  });
+
+  it('recognizes Claude runner restart control traffic and preserves retry state', () => {
+    expect(isInternalRunnerRecoveryPrompt('Continue from where you left off.')).toBe(true);
+    expect(isInternalRunnerRecoveryPrompt(
+      'Continue from where you left off. Note: this session was automatically restarted after its process exited unexpectedly.',
+    )).toBe(true);
+    expect(isInternalRunnerRecoveryPrompt('Please continue from where you left off.')).toBe(false);
+    expect(isInternalRecoveryPrompt(EMPTY_TERMINAL_RECOVERY_PROMPT)).toBe(true);
+    expect(isInternalRecoveryPrompt('用户自己说继续')).toBe(false);
+
+    expect(projectInternalRunnerRecovery({})).toEqual({
+      activeTurnInput: EMPTY_TERMINAL_RECOVERY_PROMPT,
+      contextRecoveryAttempts: 0,
+      awaitingVisibleAssistantResponse: true,
+      recoveryPhase: 'resuming',
+    });
+    expect(projectInternalRunnerRecovery({
+      activeTurnInput: '原始用户任务',
+      contextRecoveryAttempts: 2,
+    })).toEqual({
+      activeTurnInput: '原始用户任务',
+      contextRecoveryAttempts: 2,
+      awaitingVisibleAssistantResponse: true,
+      recoveryPhase: 'resuming',
+    });
   });
 
   it('does not replay completed, failed, command, or already visible turns', () => {

@@ -19,6 +19,302 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.82', date: '2026-09-23',
+    highlights: {
+      zh: [
+        'API 配置可从当前服务商的模型目录自动识别 Fable、Opus、Sonnet、Haiku 各家族最高版本，连接测试前也会自动刷新',
+        '模型 ID 按接口返回值原样保存，显示名独立格式化；目录不可用或缺少某家族时保留现有手动填写',
+      ],
+      en: [
+        'API settings can discover the highest Fable, Opus, Sonnet, and Haiku model from the active provider catalogue and refresh before connection tests',
+        'Returned model IDs are stored verbatim while display names are formatted separately; manual values survive unavailable or incomplete catalogues',
+      ],
+    },
+  },
+  {
+    version: '0.14.81', date: '2026-09-23',
+    highlights: {
+      zh: [
+        'Opus 5.5 的点号与连字符模型 ID 均可手动填写，并统一识别为 Opus 5.5',
+        'Claude 5.x 自定义映射继续自动采用 1M 官方上下文，不会在编辑模型名后回落到 200K',
+      ],
+      en: [
+        'Both dotted and hyphenated Opus 5.5 model IDs can be entered manually and display consistently as Opus 5.5',
+        'Custom Claude 5.x mappings keep the official 1M context after editing instead of falling back to 200K',
+      ],
+    },
+  },
+  {
+    version: '0.14.80', date: '2026-09-23',
+    highlights: {
+      zh: [
+        'API 配置中的具体模型名恢复为完整宽度输入框，可直接手动填写并切换 Opus 5.5 等模型',
+        '模型上下文容量保持独立窄栏，自动识别官方 Claude 上下文的行为不变',
+      ],
+      en: [
+        'Concrete model names in API settings are editable at full width again, including manually entered models such as Opus 5.5',
+        'Context capacity remains a separate compact field while official Claude context detection continues automatically',
+      ],
+    },
+  },
+  {
+    version: '0.14.79', date: '2026-09-20',
+    highlights: {
+      zh: [
+        '带图片的用户消息在 Claude 持久化后继续复用原气泡，不再因原图路径被转存并生成高清切片而重复显示',
+        '图片切片读取说明不再被误识别为文件附件，附件区只展示真实文件',
+      ],
+      en: [
+        'Image prompts now reconcile with their original foreground bubble after Claude persists copied source and detail-crop paths',
+        'Image-crop reading instructions are no longer rendered as fake file attachments',
+      ],
+    },
+  },
+  {
+    version: '0.14.78', date: '2026-09-20',
+    highlights: {
+      zh: [
+        '对话文件引用会从消息运行目录逐级回溯到项目根，嵌套运行目录里的裸文件名和项目相对路径可直接打开',
+        '大工作区优先在最近项目范围内查找，路径引用不会因同名文件而误开；尚未生成的文件继续明确提示不存在',
+      ],
+      en: [
+        'Conversation file references now walk from the message working directory up to the project root, resolving bare names and project-relative paths from nested run directories',
+        'Large workspaces search the nearest project first, reject unrelated same-name files, and keep explicit not-found feedback for files that do not exist yet',
+      ],
+    },
+  },
+  {
+    version: '0.14.77', date: '2026-09-20',
+    highlights: {
+      zh: [
+        '待裁决任务可在处理后标记为已解决并转绿，状态会持久保存',
+        '要求完成凭证的排程若尚未完成会显示失败；历史黄色记录也会在启动时复核',
+        '排程汇报先说明结果、待决问题与建议，内部状态码和技术证据移到末尾',
+      ],
+      en: [
+        'Attention items can now be marked resolved and persist as completed',
+        'Scheduled work that requires a completion receipt is classified as failed when incomplete, including startup reconciliation for historical attention items',
+        'Automation reports now lead with outcomes, decisions, and recommendations while keeping internal codes and technical evidence last',
+      ],
+    },
+  },
+  {
+    version: '0.14.76', date: '2026-09-20',
+    highlights: {
+      zh: [
+        '历史回复中的裸文件名会继承同一回复已声明的落盘目录；缓存目录过宽时仍可直接打开目标文件',
+        '文件引用无法解析时显示明确错误，不再点击后静默无反应',
+      ],
+      en: [
+        'Bare filenames in historical replies now inherit output directories declared in the same reply, even when a cached cwd is too broad',
+        'Unresolved file references now show an explicit error instead of silently ignoring the click',
+      ],
+    },
+  },
+  {
+    version: '0.14.75', date: '2026-09-20',
+    highlights: {
+      zh: [
+        '会话结束时主动用 Claude 持久转写完成最后一次对账，回复中的相对文件名会保留生成它时的实际目录',
+        '终态对账采用有限重试覆盖落盘竞态，避免文件链接在后续开发或重启后再次失效',
+      ],
+      en: [
+        'Terminal turns now reconcile once more with Claude’s durable transcript so relative file links retain the directory where the answer was produced',
+        'Bounded terminal retries cover transcript flush races without polling completed conversations indefinitely',
+      ],
+    },
+  },
+  {
+    version: '0.14.74', date: '2026-09-20',
+    highlights: {
+      zh: [
+        'CLI 意外退出后不再把已经发送的用户消息重新放回输入框，避免恢复时产生第二条真实消息和重复执行',
+        '会话与可证实未发送的草稿仍会保留，恢复提示不再声称已发送回合属于未发送输入',
+      ],
+      en: [
+        'An unexpected CLI exit no longer puts an already-sent user turn back into the composer, preventing duplicate durable turns and repeated work on resume',
+        'The conversation and provably unsent drafts remain preserved, while recovery messaging no longer labels a sent turn as unsent input',
+      ],
+    },
+  },
+  {
+    version: '0.14.73', date: '2026-09-19',
+    highlights: {
+      zh: [
+        'Black Box 持久登记自己启动的 Claude 进程；应用异常退出后，下一次启动会清理失去宿主的旧进程',
+        '恢复同一会话前清除旧进程，避免多个 --resume 实例争用一份 JSONL 和重复恢复',
+      ],
+      en: [
+        'Black Box durably records its Claude children and reaps stale owned processes after an abnormal app exit',
+        'Old processes are removed before resuming a session, preventing multiple --resume instances from competing for one transcript',
+      ],
+    },
+  },
+  {
+    version: '0.14.72', date: '2026-09-19',
+    highlights: {
+      zh: [
+        '修复运行边界上的同一条输入被同时显示为“引导”和“普通消息”，造成双气泡的问题',
+        'Claude 落盘后会以持久记录纠正消息类型，界面只保留一个用户气泡',
+      ],
+      en: [
+        'Fixes one input appearing twice when it crosses the boundary between a live steer and the next ordinary turn',
+        'The durable Claude record now corrects the optimistic transport type while preserving a single user bubble',
+      ],
+    },
+  },
+  {
+    version: '0.14.71', date: '2026-09-19',
+    highlights: {
+      zh: [
+        '修复运行中会话同步造成的用户消息重复显示，并将本地消息与 Claude 持久化 UUID 对齐',
+        '内部续接指令不再显示成用户消息；后台 Agent 活跃时不再误发空回复续接',
+        'Provider API 错误不再算作正式答复，失败的后台 Agent 会从运行计数中结算',
+      ],
+      en: [
+        'Prevents duplicate user bubbles during live transcript sync and reconciles optimistic messages with Claude durable UUIDs',
+        'Hides internal recovery commands and blocks empty-response recovery while background Agents remain active',
+        'Provider API errors no longer count as lead answers, and failed background Agents settle out of the active count',
+      ],
+    },
+  },
+  {
+    version: '0.14.70', date: '2026-09-19',
+    highlights: {
+      zh: [
+        '会话文件增量同步只更新持久化字段，保留前台更完整的实时 Agent、回退点和引导状态',
+      ],
+      en: [
+        'Live transcript reconciliation updates durable fields only, preserving richer Agent, checkpoint, and steering telemetry from the foreground stream',
+      ],
+    },
+  },
+  {
+    version: '0.14.69', date: '2026-09-19',
+    highlights: {
+      zh: [
+        '运行中会话增量同步 Claude 已落盘但尚未送达 stdout 的主回复，异步 Agent 收尾时不再看似卡死',
+        '主回复已经结束且后台 Agent 仍工作时，状态栏显示后台 Agent 数量与真实阶段',
+        '同步前先检查 JSONL 大小与修改时间，未变化时不重复读取大型会话文件',
+      ],
+      en: [
+        'Live conversations now sync lead replies persisted by Claude before stdout yields them, avoiding apparent freezes while async Agents finish',
+        'The status line reports the active background Agent count after the lead reply has ended',
+        'Large transcripts are reloaded only after a cheap size and modification-time revision check',
+      ],
+    },
+  },
+  {
+    version: '0.14.68', date: '2026-09-19',
+    highlights: {
+      zh: [
+        '识别 Claude Code 内部 runner 异常重启，长任务恢复时保留原任务与自动重试计数',
+        'runner 重启后仅返回 No response requested 时继续同一会话，不再留下空白运行态',
+        '内部恢复提示不再覆盖用户消息的回退锚点，前台和后台对话统一显示为恢复中',
+      ],
+      en: [
+        'Recognizes Claude Code internal runner restarts and preserves the original task and retry budget during long-session recovery',
+        'Continues the same session when a restarted runner returns only No response requested instead of leaving an empty busy state',
+        'Internal recovery prompts no longer overwrite user rewind anchors, and foreground and background tabs share reconnecting state',
+      ],
+    },
+  },
+  {
+    version: '0.14.67', date: '2026-09-19',
+    highlights: {
+      zh: [
+        '运行中的 Agent 创建或删除文件时，右侧文件树只刷新受影响且已经展开的目录',
+        '目录刷新保留已加载子树和页面节点，避免右栏间歇闪烁、折叠及重复转圈',
+        '右栏重新挂载到同一工作目录时继续显示原文件树，不再短暂切回加载状态',
+      ],
+      en: [
+        'File create and remove events now refresh only affected folders that are already expanded',
+        'Directory refreshes preserve hydrated subtrees and rendered nodes, preventing intermittent panel flashes, collapses, and reload spinners',
+        'Remounting the file panel in the same workspace now keeps the existing tree visible instead of briefly returning to loading',
+      ],
+    },
+  },
+  {
+    version: '0.14.65', date: '2026-09-18',
+    highlights: {
+      zh: [
+        '新建、续接和分叉对话时，各自保存左侧阅读位置、右侧文件、文件阅读位置与文件树状态',
+        '新对话关闭文件预览不会再清掉原对话的文件；草稿转为正式会话后继续保留原视图',
+      ],
+      en: [
+        'New, continued, and forked conversations now keep independent chat, file preview, file reading, and explorer state',
+        'Closing a preview in a new conversation no longer clears the source conversation, and draft promotion preserves the same view',
+      ],
+    },
+  },
+  {
+    version: '0.14.64', date: '2026-09-18',
+    highlights: {
+      zh: [
+        '打开、关闭或拖动文件预览时锁定左侧对话的可见文字，分栏换行后仍停留在原阅读位置',
+        '接近对话底部时也按文字锚点恢复，避免右栏展开后被新增换行推走',
+      ],
+      en: [
+        'Opening, closing, or resizing file preview now pins the visible chat text through split-pane reflow',
+        'Near-bottom positions restore from the text anchor during layout changes instead of drifting as lines wrap',
+      ],
+    },
+  },
+  {
+    version: '0.14.63', date: '2026-09-18',
+    highlights: {
+      zh: [
+        '消息重复汇总时保留更具体的工作目录，文件链接不再被会话根目录覆盖',
+        '实时流与历史重载共用工作目录合并规则，迟到的最终回复会补正已有文件链接',
+      ],
+      en: [
+        'Duplicate message snapshots now retain the more specific working directory instead of replacing it with the session root',
+        'Live streams and disk hydration share the same cwd merge rule, and late final records repair existing file links',
+      ],
+    },
+  },
+  {
+    version: '0.14.62', date: '2026-09-17',
+    highlights: {
+      zh: [
+        '聊天里已解析的精确文件路径会先直接校验并打开，大工作区搜索达到上限时也不会点击无响应',
+        'Excel、Word、PowerPoint 等文件点击后直接显示文件卡片与“用默认应用打开”入口',
+      ],
+      en: [
+        'Exact file paths resolved from chat are now validated and opened directly, even when a large workspace search reaches its limit',
+        'Excel, Word, and PowerPoint links now open an immediate file card with an Open with default app action',
+      ],
+    },
+  },
+  {
+    version: '0.14.61', date: '2026-09-17',
+    highlights: {
+      zh: [
+        '消息里的相对文件链接现在使用该条消息生成时的工作目录，切换目录、重载会话或重启应用后仍能打开原文件',
+        '历史回复和实时回复共用同一 cwd 快照，裸文件名无需依赖全工作区深层搜索恢复',
+      ],
+      en: [
+        'Relative file links now use the working directory captured when each message was emitted, surviving directory switches, session reloads, and app restarts',
+        'Historical and live replies share the same cwd snapshot, so bare filenames no longer depend on a deep workspace search to recover the source file',
+      ],
+    },
+  },
+  {
+    version: '0.14.60', date: '2026-09-17',
+    highlights: {
+      zh: [
+        'Goal 顶栏状态改为读取 Claude Code 原生 goal_status 记录，持续区分进行中、已完成与已清除',
+        'Goal 状态可穿过 compact 与应用重启恢复；下拉面板显示目标正文、轮次和 Token 收据',
+        'Goal 输入长度与 Claude Code 原生 4,000 字符上限保持一致，避免前端接受后被 runtime 拒绝',
+      ],
+      en: [
+        'The Goal toolbar now reads Claude Code native goal_status records and distinguishes active, achieved, and cleared states',
+        'Goal state survives compaction and app restarts, with the objective, turns, and token receipt shown in the popover',
+        'Goal input now matches Claude Code native 4,000-character limit so the UI cannot accept a request the runtime rejects',
+      ],
+    },
+  },
+  {
     version: '0.14.59', date: '2026-09-16',
     highlights: {
       zh: [

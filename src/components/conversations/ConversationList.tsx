@@ -6,7 +6,7 @@ import {
   resetConversationFileState,
   restoreConversationFileState,
   saveConversationFileState,
-  useFileStore,
+  switchConversationFileState,
 } from '../../stores/fileStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { bridge, SessionListItem } from '../../lib/tauri-bridge';
@@ -565,7 +565,7 @@ export function ConversationList() {
       ) {
         return;
       }
-      const { messages, agents, contextInputTokens, contextOutputTokens } = parseSessionMessages(rawMessages);
+      const { messages, agents, contextInputTokens, contextOutputTokens, nativeGoal } = parseSessionMessages(rawMessages);
       setSessionMeta(sessionId, {
         // A durable disk transcript remains a valid resume target even when
         // its only visible assistant output is a tool card or its compact
@@ -574,6 +574,7 @@ export function ConversationList() {
           (message) => message.role === 'user' || message.role === 'assistant',
         ),
         contextInputTokens, contextOutputTokens,
+        nativeGoal,
         hydratingFromDisk: false,
         hydrationGeneration: undefined,
       });
@@ -783,6 +784,7 @@ export function ConversationList() {
     // roster even when the previous conversation keeps idle teammates cached.
     useAgentStore.getState().restoreFromCache(newDraftId);
     useSessionStore.getState().addDraftSession(newDraftId, realPath);
+    switchConversationFileState(currentTabId, newDraftId);
     return newDraftId;
   }, []);
 
@@ -843,6 +845,7 @@ export function ConversationList() {
 
       useForkStore.getState().createPendingFork(draftId, parentThreadId, parentTitle, cwd);
       useSessionStore.getState().addDraftSession(draftId, cwd);
+      switchConversationFileState(currentTabId, draftId);
       useSessionStore.getState().setCustomPreview(
         draftId,
         parentTitle ? `${parentTitle} · ${t('conv.fork')}` : t('conv.forkDefaultTitle'),
@@ -855,7 +858,6 @@ export function ConversationList() {
 
       useSettingsStore.getState().setMainView('chat');
       useSettingsStore.getState().setWorkingDirectory(cwd);
-      useFileStore.getState().closePreview();
       setConversationView('active');
     } catch (error) {
       if (draftId) {

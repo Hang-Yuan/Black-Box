@@ -253,6 +253,11 @@ export const __sessionLifecycleTesting = {
   setWarmIdleSince: (stdinId: string, timestamp: number) => {
     warmIdleSince.set(stdinId, timestamp);
   },
+  inspectSessionHealthSnapshot: (
+    active: Set<string>,
+    missing: Map<string, number>,
+    now: number,
+  ) => inspectSessionHealthSnapshot(active, missing, now),
 };
 
 /** Gracefully finish every persistent CLI child before the native app exits. */
@@ -860,6 +865,32 @@ export function handleProcessExitFinalize(stdinId: string, isTimeout = false): v
   });
 }
 
+function inspectSessionHealthSnapshot(
+  active: Set<string>,
+  missing: Map<string, number>,
+  now: number,
+): void {
+  for (const [tabId, tab] of useChatStore.getState().tabs) {
+    const stdinId = tab.sessionMeta.stdinId;
+    if (!stdinId || !isSessionBusy(tab.sessionStatus) || tab.sessionMeta.teardownReason) continue;
+    if (active.has(stdinId)) { missing.delete(stdinId); continue; }
+    const since = missing.get(stdinId);
+    if (since === undefined) { missing.set(stdinId, now); continue; }
+    if (now - since < 15_000) continue;
+    // Two independent native snapshots agree that ownership has ended.
+    // Reuse normal exit finalization; never spawn a concurrent recovery.
+    // `pendingTurnInput` is an already-sent turn and may already be durable in
+    // Claude's JSONL. Putting it back into the composer turns one crash into a
+    // duplicate user turn when the user resumes, so only the normal finalizer
+    // may restore input that was provably unsent (for example preflight work).
+    handleProcessExitFinalize(stdinId, true);
+    useChatStore.getState().addMessage(tabId, { id: generateInterruptedId('text'), role: 'system', type: 'text',
+      content: 'CLI 进程已退出；会话已保留，可继续原任务。 / The CLI process exited. The conversation is preserved; continue this task to resume.',
+      timestamp: now });
+    missing.delete(stdinId);
+  }
+}
+
 /** Read-only liveness observations never terminate a merely slow process. */
 export function startSessionHealthObserver(): () => void {
   const missing = new Map<string, number>();
@@ -871,25 +902,7 @@ export function startSessionHealthObserver(): () => void {
     try {
       const active = new Set(await bridge.listActiveProcesses());
       if (disposed) return;
-      const now = Date.now();
-      for (const [tabId, tab] of useChatStore.getState().tabs) {
-        const stdinId = tab.sessionMeta.stdinId;
-        if (!stdinId || !isSessionBusy(tab.sessionStatus) || tab.sessionMeta.teardownReason) continue;
-        if (active.has(stdinId)) { missing.delete(stdinId); continue; }
-        const since = missing.get(stdinId);
-        if (since === undefined) { missing.set(stdinId, now); continue; }
-        if (now - since < 15_000) continue;
-        // Two independent native snapshots agree that ownership has ended.
-        // Reuse normal exit finalization; never spawn a concurrent recovery.
-        const input = tab.sessionMeta.preflightPrompt || tab.sessionMeta.pendingTurnInput;
-        handleProcessExitFinalize(stdinId, true);
-        const store = useChatStore.getState();
-        if (input && !store.getTab(tabId)?.inputDraft) store.setInputDraft(tabId, input);
-        store.addMessage(tabId, { id: generateInterruptedId('text'), role: 'system', type: 'text',
-          content: 'CLI 进程已退出；会话与未发送输入已保留，可继续原任务。 / The CLI process exited. Conversation and unsent input are preserved; continue this task to resume.',
-          timestamp: now });
-        missing.delete(stdinId);
-      }
+      inspectSessionHealthSnapshot(active, missing, Date.now());
     } catch { /* A failed liveness query never counts as a dead process. */ }
     finally { pending = false; }
   };

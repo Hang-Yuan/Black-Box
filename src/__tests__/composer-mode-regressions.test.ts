@@ -63,12 +63,13 @@ describe('single task composer modes', () => {
     expect(input).toContain("new CustomEvent('blackbox:loop-submit'");
   });
 
-  it('keeps the Goal header visibly live for the foreground Goal turn', () => {
+  it('projects the transcript-owned Goal state into the header', () => {
     expect(input).toContain('submittedViaGoal = true;');
-    expect(input).toContain('goalRequestActive: submittedViaGoal,');
-    expect(chat).toContain('sessionMeta.goalRequestActive === true && isSessionBusy(sessionStatus)');
-    expect(chat).toContain('running={goalRequestRunning}');
+    expect(input).toContain('nativeGoal: submittedNativeGoal');
+    expect(chat).toContain('goal={sessionMeta.nativeGoal}');
     expect(goal).toContain('data-goal-live={running');
+    expect(goal).toContain("data-goal-status={goal?.status || 'none'}");
+    expect(goal).toContain('data-testid="goal-current"');
     expect(goal).toContain("'bg-accent animate-pulse-soft'");
   });
 

@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { bridge, FileNode, RecentProject } from '../lib/tauri-bridge';
 import {
   loadConversationPanelState,
+  moveConversationViewState,
   saveConversationPanelState,
 } from '../lib/conversation-view-state';
 import { useSettingsStore } from './settingsStore';
@@ -13,12 +14,14 @@ import {
   findNodeByPath,
   findUniqueNodeByBasename,
   normalizeFileReferencePath,
+  dirnamePath,
+  ancestorResolutionBases,
   parseFileReference,
   reconcilePathToRoot,
   type FileReferenceLocation,
   type ParsedFileReference,
 } from './fileReveal';
-import { hydrateFolderChildren } from './fileTreeHydration';
+import { hydrateFolderChildren, reconcileFileTree } from './fileTreeHydration';
 
 export type FileChangeKind = 'created' | 'modified' | 'removed';
 export type PreviewMode = 'preview' | 'source' | 'edit';
@@ -58,6 +61,11 @@ let _treeRequestGeneration = 0;
 // Deeper folders are hydrated by loadFolderChildren when the user expands
 // them. This keeps large workspaces out of a single Tauri IPC payload.
 export const FILE_TREE_READ_DEPTH = 0;
+const EXTERNAL_ONLY_FILE_EXTENSIONS = new Set([
+  'zip', 'tar', 'gz', 'rar', '7z', 'exe', 'dmg', 'pkg',
+  'woff', 'woff2', 'ttf', 'otf', 'eot',
+  'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'db', 'sqlite',
+]);
 
 function readTreeSingleFlight(path: string): Promise<FileNode[]> {
   const existing = _treeReadPromises.get(path);
@@ -113,6 +121,8 @@ interface FileState {
   loadTree: (path: string) => Promise<void>;
   /** Refresh the tree without clearing change markers. Optional path overrides rootPath. */
   refreshTree: (overridePath?: string) => Promise<void>;
+  /** Refresh only visible parents affected by watcher structure events. */
+  refreshChangedPaths: (paths: string[]) => Promise<void>;
   selectFile: (path: string, location?: FileReferenceLocation) => Promise<void>;
   clearSelection: () => void;
   closePreview: () => void;
@@ -181,6 +191,7 @@ export const useFileStore = create<FileState>()((set, get) => ({
     const requestGeneration = ++_treeRequestGeneration;
     const prevRoot = get().rootPath;
     const isNewDir = path !== prevRoot;
+    const showLoading = isNewDir || get().tree.length === 0;
     const expandedFolders = isNewDir
       ? new Set(
         Array.from(get().expandedFolders).filter(
@@ -188,18 +199,23 @@ export const useFileStore = create<FileState>()((set, get) => ({
         ),
       )
       : get().expandedFolders;
-    // Always show loading on first load or directory change
+    // Keep an already-rendered tree visible when the same panel remounts.
     set({
       rootPath: path,
-      isLoading: true,
+      isLoading: showLoading,
       // Clear stale tree immediately when switching directories
       ...(isNewDir ? { tree: [], expandedFolders, loadingFolders: new Set<string>() } : {}),
     });
     try {
-      const tree = await readTreeSingleFlight(path);
+      const incoming = await readTreeSingleFlight(path);
       // Guard against both directory switches and superseding refreshes.
       if (requestGeneration === _treeRequestGeneration && get().rootPath === path) {
-        set({ tree, isLoading: false, changedFiles: new Map(), directoryMissing: false });
+        set((state) => ({
+          tree: isNewDir ? incoming : reconcileFileTree(state.tree, incoming),
+          isLoading: false,
+          changedFiles: new Map(),
+          directoryMissing: false,
+        }));
       }
     } catch (err) {
       if (requestGeneration === _treeRequestGeneration && get().rootPath === path) {
@@ -214,13 +230,17 @@ export const useFileStore = create<FileState>()((set, get) => ({
     if (!dir) return;
     const requestGeneration = ++_treeRequestGeneration;
     try {
-      const tree = await readTreeSingleFlight(dir);
+      const incoming = await readTreeSingleFlight(dir);
       if (requestGeneration !== _treeRequestGeneration) return;
       // Sync rootPath if override was used and differs
       if (overridePath && overridePath !== get().rootPath) {
-        set({ tree, rootPath: overridePath, isLoading: false, directoryMissing: false });
+        set({ tree: incoming, rootPath: overridePath, isLoading: false, directoryMissing: false });
       } else {
-        set({ tree, isLoading: false, directoryMissing: false });
+        set((state) => ({
+          tree: reconcileFileTree(state.tree, incoming),
+          isLoading: false,
+          directoryMissing: false,
+        }));
       }
     } catch (err) {
       if (requestGeneration !== _treeRequestGeneration) return;
@@ -228,6 +248,52 @@ export const useFileStore = create<FileState>()((set, get) => ({
         set({ directoryMissing: true, tree: [], isLoading: false });
       }
     }
+  },
+
+  refreshChangedPaths: async (paths: string[]) => {
+    const rootAtStart = get().rootPath;
+    if (!rootAtStart || paths.length === 0) return;
+    const normalizedRoot = normalizeFileReferencePath(rootAtStart);
+    const visibleParents = Array.from(new Set(paths.map(dirnamePath)))
+      .filter((parent) => {
+        const normalizedParent = normalizeFileReferencePath(parent);
+        if (
+          normalizedParent !== normalizedRoot
+          && !normalizedParent.startsWith(`${normalizedRoot}/`)
+        ) return false;
+        if (normalizedParent === normalizedRoot) return true;
+        const node = findNodeByPath(get().tree, parent);
+        return !!node?.is_dir && node.children_truncated === false;
+      });
+    if (visibleParents.length === 0) return;
+
+    const refreshed = (await Promise.all(visibleParents.map(async (parent) => {
+      try {
+        return { parent, children: await readTreeSingleFlight(parent) };
+      } catch {
+        // A directory can disappear between the watcher event and this read.
+        // A later event (or the next expansion) will reconcile its parent.
+        return null;
+      }
+    }))).filter((entry): entry is { parent: string; children: FileNode[] } => entry !== null);
+    if (get().rootPath !== rootAtStart) return;
+
+    set((state) => {
+      let tree = state.tree;
+      for (const { parent, children } of refreshed) {
+        if (normalizeFileReferencePath(parent) === normalizedRoot) {
+          tree = reconcileFileTree(tree, children);
+          continue;
+        }
+        const folder = findNodeByPath(tree, parent);
+        if (!folder?.is_dir || folder.children_truncated !== false) continue;
+        const nextChildren = reconcileFileTree(folder.children || [], children);
+        if (nextChildren !== folder.children) {
+          tree = hydrateFolderChildren(tree, parent, nextChildren);
+        }
+      }
+      return tree === state.tree ? state : { ...state, tree };
+    });
   },
 
   selectFile: async (path: string, location?: FileReferenceLocation) => {
@@ -293,6 +359,11 @@ export const useFileStore = create<FileState>()((set, get) => ({
             set({ fileContent: null, isLoadingContent: false });
           }
         }
+      } else if (EXTERNAL_ONLY_FILE_EXTENSIONS.has(ext)) {
+        // Office/archive/database files render a local file card with an
+        // explicit "Open with default app" action. Avoid trying to decode the
+        // binary as UTF-8 and then probing directory landing files.
+        set({ fileContent: null, isLoadingContent: false });
       } else {
         try {
           const content = await bridge.readFileContent(path);
@@ -617,6 +688,37 @@ export const useFileStore = create<FileState>()((set, get) => ({
     let target = reconcilePathToRoot(parsedPath, rootPath);
     let targetNode = findNodeByPath(get().tree, target);
 
+    // A reference resolved from the message's own cwd is already an exact
+    // candidate. Validate that path directly before falling back to a whole
+    // workspace basename search. Large workspaces can hit the search entry
+    // limit before reaching the file, which previously made a valid chat chip
+    // appear clickable while silently doing nothing.
+    if (!targetNode) {
+      try {
+        if (parsed.kind === 'file') {
+          await bridge.getFileSize(target);
+          targetNode = {
+            name: normalizeFileReferencePath(target).split('/').pop() || target,
+            path: target,
+            is_dir: false,
+            children: null,
+          };
+        } else {
+          const children = await bridge.readFileTree(target, FILE_TREE_READ_DEPTH);
+          targetNode = {
+            name: normalizeFileReferencePath(target).split('/').pop() || target,
+            path: target,
+            is_dir: true,
+            children,
+            children_truncated: false,
+          };
+        }
+      } catch {
+        // The exact path may be stale; the scoped recovery search below can
+        // still locate a moved project file or a project-root-relative path.
+      }
+    }
+
     // Historical messages can outlive workspace/parent-folder renames, and a
     // bare filename is commonly deeper than the bounded startup tree. Ask the
     // backend for a complete basename search before considering the visible
@@ -625,13 +727,23 @@ export const useFileStore = create<FileState>()((set, get) => ({
       let deepSearchFailed = false;
       try {
         const basename = normalizeFileReferencePath(target).split('/').pop() || '';
-        const response = basename && rootPath
-          ? await bridge.searchFileTree(rootPath, basename, true, 500)
-          : null;
-        const recovered = response && !response.truncated
-          ? findBestWorkspaceSearchMatch(response.matches, target, parsed.kind)
-          : null;
-        if (recovered) {
+        const recoveryReference = parsed.displayPath.includes('/') || parsed.displayPath.includes('\\')
+          ? target
+          : basename;
+        const searchRoots = basename
+          ? ancestorResolutionBases(dirnamePath(target), rootPath)
+          : [];
+        if (rootPath && !searchRoots.includes(rootPath)) searchRoots.push(rootPath);
+        for (const searchRoot of searchRoots) {
+          const response = await bridge.searchFileTree(searchRoot, basename, true, 500);
+          const exactMatch = response.matches.find((match) => (
+            normalizeFileReferencePath(match.path) === normalizeFileReferencePath(target)
+            && match.is_dir === (parsed.kind === 'folder')
+          ));
+          const recovered = exactMatch || (!response.truncated
+            ? findBestWorkspaceSearchMatch(response.matches, recoveryReference, parsed.kind)
+            : null);
+          if (!recovered) continue;
           target = recovered.path;
           targetNode = {
             name: recovered.name,
@@ -639,6 +751,7 @@ export const useFileStore = create<FileState>()((set, get) => ({
             is_dir: recovered.is_dir,
             children: recovered.is_dir ? [] : null,
           };
+          break;
         }
       } catch {
         deepSearchFailed = true;
@@ -763,4 +876,37 @@ export function resetConversationFileState(): void {
   state.closePreview();
   state.restoreExplorerState('__blackbox_no_conversation__');
   useSettingsStore.getState().setSecondaryPanelState({ open: false, tab: 'files' });
+}
+
+/** Save the departing conversation and restore the arriving one as one UI action. */
+export function switchConversationFileState(
+  fromSessionId: string | null,
+  toSessionId: string | null,
+): void {
+  if (fromSessionId === toSessionId) return;
+  if (fromSessionId) saveConversationFileState(fromSessionId);
+  if (toSessionId) restoreConversationFileState(toSessionId);
+  else resetConversationFileState();
+}
+
+/** Keep preview, explorer and reading positions attached across draft promotion. */
+export function moveConversationFileState(
+  fromSessionId: string,
+  toSessionId: string,
+): void {
+  if (!fromSessionId || !toSessionId || fromSessionId === toSessionId) return;
+  useFileStore.setState((state) => {
+    const previewSnapshots = { ...state.previewSnapshots };
+    const explorerSnapshots = { ...state.explorerSnapshots };
+    if (previewSnapshots[fromSessionId]) {
+      previewSnapshots[toSessionId] = previewSnapshots[fromSessionId];
+      delete previewSnapshots[fromSessionId];
+    }
+    if (explorerSnapshots[fromSessionId]) {
+      explorerSnapshots[toSessionId] = explorerSnapshots[fromSessionId];
+      delete explorerSnapshots[fromSessionId];
+    }
+    return { previewSnapshots, explorerSnapshots };
+  });
+  moveConversationViewState(fromSessionId, toSessionId);
 }

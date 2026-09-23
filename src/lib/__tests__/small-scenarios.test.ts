@@ -5,6 +5,63 @@ import { projectExecutionEvent } from '../execution-state';
 import { classifySessionSilence } from '../context-recovery';
 import { parseSessionMessages } from '../session-loader';
 import { useChatStore } from '../../stores/chatStore';
+import { preferMessageCwd } from '../message-cwd';
+import { pinConversationViewport } from '../conversation-viewport';
+
+describe('conversation layout anchoring', () => {
+  it('pins the visible text through a split-panel reflow even near the bottom', () => {
+    expect(pinConversationViewport({
+      atBottom: true,
+      scrollTop: 900,
+      anchorId: 'message-answer',
+      textOffset: 120,
+      textViewportOffset: 18,
+    })).toEqual({
+      atBottom: false,
+      scrollTop: 900,
+      anchorId: 'message-answer',
+      textOffset: 120,
+      textViewportOffset: 18,
+    });
+  });
+});
+
+describe('message working-directory provenance', () => {
+  beforeEach(() => useChatStore.setState({ tabs: new Map(), sessionCache: new Map() }));
+
+  it('keeps the deeper cwd when a broad duplicate snapshot arrives later', () => {
+    const root = '/Users/test/workspace';
+    const deep = `${root}/Dev/project/streams/draft`;
+    expect(preferMessageCwd(deep, root)).toBe(deep);
+    expect(preferMessageCwd(root, deep)).toBe(deep);
+
+    const store = useChatStore.getState();
+    store.ensureTab('cwd-live');
+    store.addMessage('cwd-live', {
+      id: 'answer_text_0', role: 'assistant', type: 'text', content: 'Open `report.md`.',
+      timestamp: 1, cwd: deep,
+    });
+    store.addMessage('cwd-live', {
+      id: 'answer_text_0', role: 'assistant', type: 'text', content: 'Open `report.md`.',
+      timestamp: 2, cwd: root, isFinalResponse: true,
+    });
+    expect(store.getTab('cwd-live')?.messages[0].cwd).toBe(deep);
+  });
+
+  it('keeps the deeper cwd while merging duplicate disk records', () => {
+    const root = '/Users/test/workspace';
+    const deep = `${root}/Dev/project/streams/draft`;
+    const loaded = parseSessionMessages([
+      { type: 'assistant', cwd: deep, timestamp: 1, message: {
+        id: 'answer', content: [{ type: 'text', text: 'Open `report.md`.' }],
+      } },
+      { type: 'assistant', cwd: root, timestamp: 2, message: {
+        id: 'answer', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Open `report.md`.' }],
+      } },
+    ]);
+    expect(loaded.messages[0]).toMatchObject({ cwd: deep, isFinalResponse: true });
+  });
+});
 
 describe('execution ownership and delayed final delivery', () => {
   it('ignores duplicate terminal receipts after the next execution starts', () => {
@@ -111,5 +168,20 @@ describe('late final delivery during a newer execution', () => {
     expect(tab.sessionMeta.pendingCommandMsgId).toBe('new-command');
     expect(tab.messages[0].content).toBe('Old final with supplement');
     expect(tab.messages[0].isFinalResponse).toBe(true);
+  });
+
+  it('repairs a final answer cwd even when its text is already complete', async () => {
+    const { applyLateAssistantSupplement } = await import('../../hooks/useStreamProcessor');
+    const store = useChatStore.getState(); store.ensureTab('late-cwd');
+    store.addMessage('late-cwd', {
+      id: 'answer_text_0', role: 'assistant', type: 'text', content: 'Open `report.md`.',
+      timestamp: 1, cwd: '/Users/test/workspace', isFinalResponse: true,
+    });
+    applyLateAssistantSupplement('late-cwd', {
+      type: 'assistant', cwd: '/Users/test/workspace/Dev/project/draft',
+      message: { id: 'answer', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Open `report.md`.' }] },
+    });
+    expect(store.getTab('late-cwd')?.messages[0].cwd)
+      .toBe('/Users/test/workspace/Dev/project/draft');
   });
 });

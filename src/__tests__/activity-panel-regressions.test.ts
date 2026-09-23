@@ -48,7 +48,7 @@ describe('long-task activity panel', () => {
     expect(chatPanel).toContain("active={taskComposerMode === 'workflow'}");
     expect(chatPanel).toContain("active={taskComposerMode === 'loop'}");
     expect(chatPanel).toContain("active={taskComposerMode === 'goal'}");
-    expect(chatPanel).toContain('running={goalRequestRunning}');
+    expect(chatPanel).toContain('goal={sessionMeta.nativeGoal}');
     expect(chatPanel).not.toContain('compact={secondaryPanelOpen}');
     expect(chatPanel).not.toContain('iconOnly={secondaryPanelOpen}');
   });

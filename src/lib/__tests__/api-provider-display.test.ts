@@ -163,6 +163,7 @@ describe('provider model display options', () => {
 
   it('shows the concrete runtime model without hiding custom relay mappings', () => {
     expect(getResolvedModelDisplayName('claude-fable-5')).toBe('Fable 5');
+    expect(getResolvedModelDisplayName('claude-opus-5.5')).toBe('Opus 5.5');
     expect(getResolvedModelDisplayName('claude-opus-4-8[1m]')).toBe('Opus 4.8 (1M)');
     expect(getResolvedModelDisplayName('claude-haiku-4-5-20251001')).toBe('Haiku 4.5');
     expect(getResolvedModelDisplayName('gpt-5.6-terra')).toBe('GPT 5.6 Tera');

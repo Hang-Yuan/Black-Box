@@ -47,6 +47,12 @@ import {
 import { buildTaskComposerSubmission } from '../../lib/composer-mode';
 import { useAutomationSessionStore } from '../../stores/automationSessionStore';
 import { ensureConversationRuntimeReady } from '../../lib/conversation-runtime-preferences';
+import {
+  beginNativeGoal,
+  parseNativeGoalCommand,
+  settleNativeGoal,
+  type NativeGoalState,
+} from '../../lib/native-goal';
 // drag-state import removed — tree drag handled by ChatPanel
 
 /** Thinking effort level configuration data */
@@ -801,6 +807,7 @@ export function InputBar() {
     // other mode aliases are Black Box UI controls, not part of the prompt.
     let submittedUserText = rawInput.trim();
     let submittedViaGoal = false;
+    let submittedNativeGoal: NativeGoalState | undefined;
 
     // Plan approval shortcut: empty Enter triggers approve & execute flow
     const tabState = getActiveTabState();
@@ -919,6 +926,13 @@ export function InputBar() {
         }));
         return;
       }
+    }
+
+    const nativeGoalCommand = parseNativeGoalCommand(text);
+    if (nativeGoalCommand?.action === 'set' && nativeGoalCommand.condition) {
+      submittedNativeGoal = beginNativeGoal(nativeGoalCommand.condition);
+    } else if (nativeGoalCommand?.action === 'clear') {
+      submittedNativeGoal = settleNativeGoal(tabState.sessionMeta.nativeGoal, 'cleared');
     }
 
     // Intercept immediate (built-in) commands even when submitted directly
@@ -1065,10 +1079,14 @@ export function InputBar() {
           attachments: steerAttachments,
           isSteer: true,
           steerState: 'sending',
+          awaitingPersistence: true,
           timestamp: Date.now(),
         });
         try {
           await bridge.sendStdin(existingStdinId, text);
+          if (submittedNativeGoal) {
+            useChatStore.getState().setSessionMeta(tabId, { nativeGoal: submittedNativeGoal });
+          }
           useChatStore.getState().updateMessage(tabId, steerMessageId, { steerState: 'sent' });
           useChatStore.getState().setSessionMeta(tabId, { lastProgressAt: Date.now() });
         } catch (error) {
@@ -1105,6 +1123,9 @@ export function InputBar() {
           ? 'steer'
           : 'user',
       });
+      if (submittedNativeGoal) {
+        useChatStore.getState().setSessionMeta(tabId, { nativeGoal: submittedNativeGoal });
+      }
       return;
     }
 
@@ -1127,6 +1148,7 @@ export function InputBar() {
       pendingTurnInput?: string;
       pendingTurnAttachments?: FileAttachment[];
       goalRequestActive?: boolean;
+      nativeGoal?: NativeGoalState;
       activeTurnInput?: string;
       contextRecoveryAttempts?: number;
       awaitingVisibleAssistantResponse?: boolean;
@@ -1152,12 +1174,14 @@ export function InputBar() {
         content: submittedUserText,
         timestamp: Date.now(),
         attachments: userMsgAttachments,
+        awaitingPersistence: true,
       });
       pendingTurnMeta = {
         pendingTurnMessageId,
         pendingTurnInput: submittedUserText,
         pendingTurnAttachments: savedFiles,
         goalRequestActive: submittedViaGoal,
+        ...(submittedNativeGoal ? { nativeGoal: submittedNativeGoal } : {}),
         activeTurnInput: submittedUserText,
         contextRecoveryAttempts: 0,
         awaitingVisibleAssistantResponse: true,

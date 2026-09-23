@@ -1,6 +1,11 @@
 import { ConversationHandoff } from './ConversationHandoff';
 import { classifySessionSilence, projectContextPressure, resolveDisplayedContextWindow } from '../../lib/context-recovery';
-import { captureConversationViewport, restoreConversationViewport, type ConversationViewportSnapshot } from '../../lib/conversation-viewport';
+import {
+  captureConversationViewport,
+  pinConversationViewport,
+  restoreConversationViewport,
+  type ConversationViewportSnapshot,
+} from '../../lib/conversation-viewport';
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
 import { isSessionBusy, useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
@@ -11,7 +16,7 @@ import { InputBar } from './InputBar';
 import { ExportMenu } from '../conversations/ExportMenu';
 import { useSettingsStore, mapSessionModeToPermissionMode } from '../../stores/settingsStore';
 import { useSessionStore } from '../../stores/sessionStore';
-import { useFileStore } from '../../stores/fileStore';
+import { switchConversationFileState, useFileStore } from '../../stores/fileStore';
 import { isAgentActive, useAgentStore } from '../../stores/agentStore';
 import { AgentPanel } from '../agents/AgentPanel';
 // bridge import removed — spawn goes through sessionLifecycle module
@@ -56,6 +61,7 @@ import {
   buildConversationDisplayItems,
   isFirstVisibleAssistantTextInTurn,
 } from '../../lib/conversation-presentation';
+import { hasLeadResponseAfterLatestUser } from '../../lib/live-transcript';
 
 /** Shared plan panel toggle — used by ChatPanel (panel) and InputBar (button) */
 export const usePlanPanelStore = create<{
@@ -732,10 +738,18 @@ function formatApiRetryText(retry: ApiRetryStatus, t: (key: string) => string): 
 }
 
 /** Activity indicator with elapsed time and token count */
-function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
+function ActivityIndicator({
+  activityStatus,
+  sessionMeta,
+  sessionStatus,
+  activeBackgroundCount,
+  leadResponseFinished,
+}: {
   activityStatus: { phase: string; toolName?: string };
   sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; contextInputTokens?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus; recoveryPhase?: string; contextRemaining?: number; spawnedModel?: string; model?: string };
   sessionStatus?: string;
+  activeBackgroundCount: number;
+  leadResponseFinished: boolean;
 }) {
   const t = useT();
   const [now, setNow] = useState(Date.now());
@@ -750,11 +764,18 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   const isStarting = sessionStatus === 'running'
     && activityStatus.phase === 'idle';
   const retryText = retryStatus ? formatApiRetryText(retryStatus, t) : null;
+  const backgroundFinishedText = t('agents.backgroundTurnFinished')
+    .replace('{count}', String(activeBackgroundCount));
+  const backgroundRunningText = t('agents.backgroundRunning')
+    .replace('{count}', String(activeBackgroundCount));
   const phaseText = isStopping ? t('chat.stopping')
     : sessionMeta.recoveryPhase === 'compacting' ? t('chat.autoCompacting')
     : sessionMeta.recoveryPhase === 'resuming' ? t('chat.reconnecting')
     : sessionMeta.recoveryPhase === 'first_event' ? t('chat.startingAgent')
     : retryText ? retryText
+    : activeBackgroundCount > 0 && leadResponseFinished ? backgroundFinishedText
+    : activeBackgroundCount > 0 && activityStatus.phase === 'tool'
+      ? `${backgroundRunningText}${activityStatus.toolName ? ` · ${activityStatus.toolName}` : ''}`
     : isStarting ? t('chat.startingAgent')
     : activityStatus.phase === 'thinking' ? t('chat.thinking')
     : activityStatus.phase === 'writing' ? t('chat.writing')
@@ -880,7 +901,6 @@ export function ChatPanel() {
   const taskComposerMode = useComposerModeStore((state) => (
     selectedSessionId ? state.tabs[selectedSessionId]?.taskMode || null : null
   ));
-  const goalRequestRunning = sessionMeta.goalRequestActive === true && isSessionBusy(sessionStatus);
   const selectTaskComposerMode = useComposerModeStore((state) => state.selectTaskMode);
   const sessions = useSessionStore((s) => s.sessions);
   const isFilePreviewMode = !!useFileStore((s) => s.selectedFile);
@@ -893,26 +913,46 @@ export function ChatPanel() {
     () => agentList.filter(isAgentActive).length,
     [agentList],
   );
+  const activeBackgroundCount = useMemo(
+    () => agentList.filter((agent) => !agent.isMain && agent.background && isAgentActive(agent)).length,
+    [agentList],
+  );
+  const leadResponseFinished = useMemo(
+    () => hasLeadResponseAfterLatestUser(messages),
+    [messages],
+  );
   const totalAgentCount = agentList.length;
   const agentRuntimeActive = isSessionBusy(sessionStatus) || activeAgentCount > 0;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const viewportSnapshotRef = useRef<ConversationViewportSnapshot | null>(null);
   const layoutRestoreUntilRef = useRef(0);
+  const layoutRestoreTimerRef = useRef<number | null>(null);
 
   const captureViewportBeforeLayoutChange = useCallback(() => {
     const container = scrollRef.current;
-    if (container && !viewportSnapshotRef.current) viewportSnapshotRef.current = captureConversationViewport(container);
-    layoutRestoreUntilRef.current = performance.now() + 400;
+    if (container) {
+      viewportSnapshotRef.current = pinConversationViewport(captureConversationViewport(container));
+    }
+    layoutRestoreUntilRef.current = performance.now() + 500;
   }, []);
 
   const restoreViewportAfterLayoutChange = useCallback(() => {
-    const snapshot = viewportSnapshotRef.current;
-    const container = scrollRef.current;
-    if (container && snapshot) {
-      layoutRestoreUntilRef.current = performance.now() + 100;
-      restoreConversationViewport(container, snapshot);
-    }
+    const restore = () => {
+      const snapshot = viewportSnapshotRef.current;
+      const container = scrollRef.current;
+      if (container && snapshot) restoreConversationViewport(container, snapshot);
+    };
+    layoutRestoreUntilRef.current = performance.now() + 500;
+    restore();
+    if (layoutRestoreTimerRef.current !== null) window.clearTimeout(layoutRestoreTimerRef.current);
+    layoutRestoreTimerRef.current = window.setTimeout(() => {
+      restore();
+      const container = scrollRef.current;
+      if (container) viewportSnapshotRef.current = captureConversationViewport(container);
+      layoutRestoreUntilRef.current = 0;
+      layoutRestoreTimerRef.current = null;
+    }, 360);
   }, []);
 
   const runWithPreservedViewport = useCallback((change: () => void) => {
@@ -974,6 +1014,19 @@ export function ChatPanel() {
       window.removeEventListener('blackbox:chat-layout-did-change', restore);
     };
   }, [captureViewportBeforeLayoutChange, restoreViewportAfterLayoutChange]);
+
+  // Zustand subscribers run before React commits the preview layout, which is
+  // the last reliable moment to capture the old chat width. Keep restoring the
+  // same text anchor through the 300 ms AppShell width transition.
+  useEffect(() => useFileStore.subscribe((state, previous) => {
+    if (state.selectedFile === previous.selectedFile) return;
+    captureViewportBeforeLayoutChange();
+    requestAnimationFrame(() => requestAnimationFrame(restoreViewportAfterLayoutChange));
+  }), [captureViewportBeforeLayoutChange, restoreViewportAfterLayoutChange]);
+
+  useEffect(() => () => {
+    if (layoutRestoreTimerRef.current !== null) window.clearTimeout(layoutRestoreTimerRef.current);
+  }, []);
 
   // Listen for internal file tree drag-drop (mouse-based, not HTML5 drag-and-drop)
   // HTML5 drag events don't work in Tauri because dragDropEnabled: true intercepts them.
@@ -1045,6 +1098,21 @@ export function ChatPanel() {
   const pendingScrollRestoreRef = useRef<string | null>(null);
   // Show "scroll to bottom" button when user is far from bottom
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+
+  // Capture the departing conversation before React replaces its DOM. This
+  // covers programmatic switches that do not emit a final scroll event.
+  useEffect(() => useSessionStore.subscribe((state, previous) => {
+    if (state.selectedSessionId === previous.selectedSessionId) return;
+    const departingSessionId = previous.selectedSessionId;
+    const el = scrollRef.current;
+    if (!departingSessionId || !el) return;
+    const viewport = captureConversationViewport(el);
+    saveChatScrollPosition(departingSessionId, {
+      top: el.scrollTop,
+      atBottom: viewport.atBottom,
+      viewport,
+    });
+  }), []);
 
   // Track whether user is near the bottom of the scroll container
   const handleScroll = useCallback(() => {
@@ -1256,7 +1324,7 @@ export function ChatPanel() {
         />
         <GoalControl
           active={taskComposerMode === 'goal'}
-          running={goalRequestRunning}
+          goal={sessionMeta.nativeGoal}
           onSelect={() => selectTaskMode('goal')}
         />
         <TaskLocationControl />
@@ -1345,6 +1413,7 @@ export function ChatPanel() {
                     <ProcessUpdateGroup
                       messages={liveMessage ? [...item.msgs, liveMessage] : item.msgs}
                       active={item.active}
+                      basePath={sessionMeta.cwdSnapshot}
                     />
                   </div>
                 );
@@ -1365,7 +1434,11 @@ export function ChatPanel() {
                   data-conversation-anchor-id={`message-${msg.id}`}
                   data-conversation-turn-key={conversationTurnKeys[idx]}
                 >
-                  <MessageBubble message={msg} isFirstInGroup={isFirstInGroup} />
+                  <MessageBubble
+                    message={msg}
+                    isFirstInGroup={isFirstInGroup}
+                    basePath={sessionMeta.cwdSnapshot}
+                  />
                 </div>
               );
             })}
@@ -1427,6 +1500,7 @@ export function ChatPanel() {
                 <MessageBubble
                   message={partialMessage}
                   isFirstInGroup={liveAssistantTextIsFirstInTurn}
+                  basePath={sessionMeta.cwdSnapshot}
                 />
               </div>
               );
@@ -1456,7 +1530,13 @@ export function ChatPanel() {
             ))}
             {/* Inline activity status indicator — like Claude Desktop App */}
             {(sessionStatus === 'running' || sessionStatus === 'reconnecting' || sessionStatus === 'stopping' || activityStatus.phase === 'awaiting') && (
-              <ActivityIndicator activityStatus={activityStatus} sessionMeta={sessionMeta} sessionStatus={sessionStatus} />
+              <ActivityIndicator
+                activityStatus={activityStatus}
+                sessionMeta={sessionMeta}
+                sessionStatus={sessionStatus}
+                activeBackgroundCount={activeBackgroundCount}
+                leadResponseFinished={leadResponseFinished}
+              />
             )}
           </div>
         )}
@@ -1553,6 +1633,7 @@ async function startDraftSession(folderPath: string) {
     // No draft selected — create a new one
     draftId = `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     useSessionStore.getState().addDraftSession(draftId, folderPath);
+    switchConversationFileState(currentTabId, draftId);
   }
 
   const providerState = useProviderStore.getState();

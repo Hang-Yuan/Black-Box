@@ -228,7 +228,7 @@ const AUTOMATION_ACTIVITY_SUMMARY_SQL: &str = r#"
          FROM automation_runs unread
         WHERE unread.automation_id = a.id
           AND unread.read_at IS NULL
-          AND unread.status IN ('SUCCEEDED', 'NEEDS_ATTENTION', 'FAILED', 'RECOVERED', 'PENDING_REVIEW')) AS unread_runs,
+          AND unread.status IN ('SUCCEEDED', 'NEEDS_ATTENTION', 'RESOLVED', 'FAILED', 'RECOVERED', 'PENDING_REVIEW')) AS unread_runs,
       a.updated_at
     FROM automations a
     ORDER BY a.updated_at DESC, a.name COLLATE NOCASE ASC, a.id ASC
@@ -288,6 +288,8 @@ pub struct AutomationRun {
     pub recovered_by_run_id: Option<String>,
     pub recovered_at: Option<i64>,
     pub recovery_evidence: Option<String>,
+    pub attention_resolved_at: Option<i64>,
+    pub attention_resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,7 +884,9 @@ fn open_database() -> Result<Connection, String> {
               retry_of_run_id TEXT,
               recovered_by_run_id TEXT,
               recovered_at INTEGER,
-              recovery_evidence TEXT
+              recovery_evidence TEXT,
+              attention_resolved_at INTEGER,
+              attention_resolution TEXT
             );
             CREATE TABLE IF NOT EXISTS automation_recovery_plans (
               original_run_id TEXT PRIMARY KEY,
@@ -1042,6 +1046,29 @@ fn open_database() -> Result<Connection, String> {
             connection
                 .execute(sql, [])
                 .map_err(|e| format!("Cannot add automation worktree lifecycle storage: {e}"))?;
+        }
+    }
+    for (column, sql) in [
+        (
+            "attention_resolved_at",
+            "ALTER TABLE automation_runs ADD COLUMN attention_resolved_at INTEGER",
+        ),
+        (
+            "attention_resolution",
+            "ALTER TABLE automation_runs ADD COLUMN attention_resolution TEXT",
+        ),
+    ] {
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('automation_runs') WHERE name=?1",
+                params![column],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Cannot inspect automations database: {e}"))?;
+        if present == 0 {
+            connection
+                .execute(sql, [])
+                .map_err(|e| format!("Cannot add automation decision lifecycle storage: {e}"))?;
         }
     }
     for (column, sql) in [
@@ -1754,6 +1781,7 @@ fn reconcile_all() -> Result<(), String> {
         validate_definition(&definition)?;
         reconcile_definition(&connection, &definition)?;
     }
+    reconcile_incomplete_attention_probes(&connection, &definitions)?;
     reconcile_failed_completion_probes(&connection, &definitions)?;
     Ok(())
 }
@@ -1772,7 +1800,7 @@ fn query_summary(
             .map_err(|e| e.to_string())?;
     let unread_runs: u32 = connection
         .query_row(
-            "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1 AND read_at IS NULL AND status IN ('SUCCEEDED','NEEDS_ATTENTION','FAILED','RECOVERED','PENDING_REVIEW')",
+            "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1 AND read_at IS NULL AND status IN ('SUCCEEDED','NEEDS_ATTENTION','RESOLVED','FAILED','RECOVERED','PENDING_REVIEW')",
             params![definition.id],
             |row| row.get(0),
         )
@@ -3312,7 +3340,7 @@ fn automation_prompt(
     } else {
         String::new()
     };
-    let result_contract = "\n<automation_result_contract>Before the control directive, write a self-contained user-facing completion report that states what happened, the durable outcome, and any decision or follow-up required. Never return a directive by itself. If every required step completes and no user action is required, end with ::inbox-item{title=\"short title\" summary=\"short factual summary\"} on its own final line. If every required step completes but an explicit user decision or follow-up action is required, end with ::automation-needs-attention{title=\"short title\" summary=\"short factual next action\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, end with ::automation-failed{summary=\"short factual reason\"} on its own final line and do not emit a success or needs-attention directive.</automation_result_contract>";
+    let result_contract = "\n<automation_result_contract>Before the control directive, write a self-contained user-facing report in plain language. Lead with what happened and its practical impact. When a decision is required, add one clearly named decision at a time, the recommended option and reason, what approval versus rejection changes, and the shortest reply the user can send. Put internal status codes, field names, locks, hashes, receipts, stages, commands, and paths in a final technical-evidence section; explain any unavoidable term on first use. Titles and directive summaries must be understandable without source code or an internal glossary. Never return a directive by itself. If every required step completes and no user action is required, end with ::inbox-item{title=\"short plain-language title\" summary=\"short factual outcome\"} on its own final line. If every required step completes but an explicit user decision or follow-up action is required, end with ::automation-needs-attention{title=\"short plain-language decision title\" summary=\"the exact decision or next action\"} on its own final line. If any required step is blocked, skipped, rejected, or fails, state the stopping point, any effects already made, and the recovery entrypoint, then end with ::automation-failed{summary=\"short factual reason\"} on its own final line. Do not emit a success or needs-attention directive for incomplete work.</automation_result_contract>";
     Ok(prepend_native_skill_invocation(native_skill_invocation, format!(
         "Automation: {name}\nAutomation ID: {id}\nAutomation memory: {memory}\nScheduled at: {scheduled}\n\n{prompt}\n\n{memory_block}{team_contract}{result_contract}",
         name = definition.name,
@@ -3341,7 +3369,7 @@ fn automation_completion_recovery_prompt(
     attempt: usize,
 ) -> String {
     format!(
-        "<automation_completion_recovery>\nRecovery attempt {attempt}/{limit}. The scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. Write a self-contained user-facing completion report before exactly one final directive: ::inbox-item{{title=\"short title\" summary=\"short factual summary\"}}, ::automation-needs-attention{{title=\"short title\" summary=\"short factual next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}. Never return a directive by itself.\n</automation_completion_recovery>",
+        "<automation_completion_recovery>\nRecovery attempt {attempt}/{limit}. The scheduled run for automation {id} returned control before producing a trustworthy terminal result. Resume the SAME durable session. Inspect the completed Agent/subagent results and any durable receipts already written by this run, finish any remaining required steps, and synthesize one final result. Do not repeat completed work, do not end with progress narration, and do not claim success from intent alone. Write a self-contained plain-language report: outcome and impact first; when a decision remains, state the exact question, recommended option and reason, approval/rejection consequences, and shortest reply; put internal codes and technical evidence last. Then emit exactly one final directive: ::inbox-item{{title=\"short plain-language title\" summary=\"short factual outcome\"}}, ::automation-needs-attention{{title=\"short plain-language decision title\" summary=\"the exact decision or next action\"}}, or ::automation-failed{{summary=\"short factual reason\"}}. Never return a directive by itself, and never use success or needs-attention for incomplete work.\n</automation_completion_recovery>",
         id = definition.id,
         limit = AUTOMATION_COMPLETION_RECOVERY_LIMIT,
     )
@@ -4640,6 +4668,97 @@ fn reconcile_failed_completion_probes(
     Ok(recovered)
 }
 
+fn reconcile_incomplete_attention_probes_at(
+    connection: &Connection,
+    definitions: &[AutomationDefinition],
+    data_directory: &Path,
+) -> Result<u64, String> {
+    let mut reclassified = 0_u64;
+    for definition in definitions
+        .iter()
+        .filter(|definition| definition.completion_probe.is_some())
+    {
+        let attention_runs: Vec<(String, i64, i64)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT run_id,scheduled_at,started_at FROM automation_runs WHERE automation_id=?1 AND status='NEEDS_ATTENTION' AND scheduled_at IS NOT NULL AND retry_of_run_id IS NULL",
+                )
+                .map_err(|error| format!("Cannot inspect attention automation runs: {error}"))?;
+            let rows = statement
+                .query_map(params![definition.id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|error| format!("Cannot query attention automation runs: {error}"))?;
+            rows.filter_map(Result::ok).collect()
+        };
+        for (run_id, scheduled_at, started_at) in attention_runs {
+            match probe_completion_receipt_at(
+                definition,
+                scheduled_at,
+                started_at,
+                data_directory,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let summary = "This scheduled task stopped before producing its required completion receipt. Resume it from the saved recovery point.";
+                    let title = format!("{} failed", definition.name);
+                    let updated = connection
+                        .execute(
+                            "UPDATE automation_runs SET status='FAILED',read_at=NULL,title=?2,summary=?3,error=?3 WHERE run_id=?1 AND status='NEEDS_ATTENTION'",
+                            params![run_id, title, summary],
+                        )
+                        .map_err(|error| {
+                            format!("Cannot reclassify incomplete attention run: {error}")
+                        })?;
+                    if updated == 1 {
+                        connection
+                            .execute(
+                                "UPDATE inbox_items SET title=?2,description=?3,read_at=NULL WHERE run_id=?1",
+                                params![run_id, title, summary],
+                            )
+                            .map_err(|error| {
+                                format!("Cannot update incomplete attention inbox item: {error}")
+                            })?;
+                        reclassified += 1;
+                    }
+                }
+                Err(error) => eprintln!(
+                    "[BLACKBOX AUTOMATIONS] attention completion probe {} could not be verified: {error}",
+                    definition.id
+                ),
+            }
+        }
+    }
+    Ok(reclassified)
+}
+
+fn reconcile_incomplete_attention_probes(
+    connection: &Connection,
+    definitions: &[AutomationDefinition],
+) -> Result<u64, String> {
+    let data_directory = automation_data_dir()?;
+    reconcile_incomplete_attention_probes_at(connection, definitions, &data_directory)
+}
+
+fn attention_completion_failure(
+    definition: &AutomationDefinition,
+    scheduled_at: Option<i64>,
+    started_at: i64,
+) -> Option<String> {
+    definition.completion_probe.as_ref()?;
+    let probe_time = scheduled_at.unwrap_or(started_at);
+    match probe_completion_receipt(definition, probe_time, started_at) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(
+            "The task requested a decision before its required completion receipt existed. The run is incomplete and must resume from its recorded recovery point."
+                .to_string(),
+        ),
+        Err(error) => Some(format!(
+            "The task requested a decision, but its completion evidence could not be verified: {error}"
+        )),
+    }
+}
+
 async fn execute_automation(
     definition: AutomationDefinition,
     run_id: String,
@@ -4795,9 +4914,15 @@ async fn execute_automation(
             Ok(execution) => {
                 let trace_json =
                     serde_json::to_string(&execution.trace).unwrap_or_else(|_| "[]".to_string());
-                if let Some(reason) =
-                    automation_reported_failure(&execution, definition.kind == "cron")
-                {
+                let attention =
+                    parse_automation_attention_directive(&execution.output, &definition.name);
+                let failure = automation_reported_failure(&execution, definition.kind == "cron")
+                    .or_else(|| {
+                        attention.as_ref().and_then(|_| {
+                            attention_completion_failure(&definition, scheduled_at, started_at)
+                        })
+                    });
+                if let Some(reason) = failure {
                     let title = format!("{} failed", definition.name);
                     let _ = connection.execute(
                         "UPDATE automation_runs SET status='FAILED',title=?2,summary=?3,output=?4,error=?3,trace_json=?5,finished_at=?6 WHERE run_id=?1",
@@ -4807,9 +4932,7 @@ async fn execute_automation(
                         "INSERT OR REPLACE INTO inbox_items (id,title,description,run_id,created_at) VALUES (?1,?2,?3,?1,?4)",
                         params![run_id, title, reason, finished_at],
                     );
-                } else if let Some((title, summary)) =
-                    parse_automation_attention_directive(&execution.output, &definition.name)
-                {
+                } else if let Some((title, summary)) = attention {
                     let _ = connection.execute(
                         "UPDATE automation_runs SET status='NEEDS_ATTENTION',title=?2,summary=?3,output=?4,trace_json=?5,finished_at=?6 WHERE run_id=?1",
                         params![run_id, title, summary, execution.output, trace_json, finished_at],
@@ -4936,10 +5059,18 @@ async fn scheduler_tick() {
     }
     let recovery_runs = match recovery::claim_ready() {
         Ok(runs) => runs,
-        Err(error) => { eprintln!("[BLACKBOX AUTOMATIONS] recovery plan failed closed: {error}"); return; }
+        Err(error) => {
+            eprintln!("[BLACKBOX AUTOMATIONS] recovery plan failed closed: {error}");
+            return;
+        }
     };
     for (definition, run_id, scheduled_at) in recovery_runs {
-        tauri::async_runtime::spawn(execute_automation(definition, run_id, Some(scheduled_at), None));
+        tauri::async_runtime::spawn(execute_automation(
+            definition,
+            run_id,
+            Some(scheduled_at),
+            None,
+        ));
     }
     match claim_due_automations() {
         Ok(claimed) => {
@@ -5132,7 +5263,10 @@ pub fn retry_automation_run(run_id: String, catch_up: Option<bool>) -> Result<St
     let (definition, recovery_run_id) = claim_manual_run(&automation_id)?;
     if catch_up.unwrap_or(false) {
         if let Err(error) = recovery::authorize(&definition, &run_id, &recovery_run_id) {
-            let _ = open_database()?.execute("UPDATE automations SET active_run_id=NULL WHERE id=?1 AND active_run_id=?2", params![automation_id, recovery_run_id]);
+            let _ = open_database()?.execute(
+                "UPDATE automations SET active_run_id=NULL WHERE id=?1 AND active_run_id=?2",
+                params![automation_id, recovery_run_id],
+            );
             return Err(error);
         }
     }
@@ -5226,9 +5360,9 @@ fn query_automation_runs(
 ) -> Result<Vec<AutomationRun>, String> {
     let limit = limit.unwrap_or(100).min(500);
     let sql = if automation_id.is_some() {
-        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason,retry_of_run_id,recovered_by_run_id,recovered_at,recovery_evidence FROM automation_runs WHERE automation_id=?1 ORDER BY started_at DESC LIMIT ?2"
+        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason,retry_of_run_id,recovered_by_run_id,recovered_at,recovery_evidence,attention_resolved_at,attention_resolution FROM automation_runs WHERE automation_id=?1 ORDER BY started_at DESC LIMIT ?2"
     } else {
-        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason,retry_of_run_id,recovered_by_run_id,recovered_at,recovery_evidence FROM automation_runs ORDER BY started_at DESC LIMIT ?1"
+        "SELECT run_id,automation_id,session_id,status,read_at,title,summary,output,trace_json,error,source_cwd,execution_cwd,base_commit,source_head_commit,worktree_input_snapshot_ref,worktree_input_snapshot_at,worktree_included_files,worktree_cleaned_at,worktree_snapshot_ref,worktree_snapshot_commit,worktree_snapshot_at,worktree_branch_name,worktree_branch_at,scheduled_at,started_at,finished_at,archived_reason,retry_of_run_id,recovered_by_run_id,recovered_at,recovery_evidence,attention_resolved_at,attention_resolution FROM automation_runs ORDER BY started_at DESC LIMIT ?1"
     };
     let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
     let mapper = |row: &rusqlite::Row<'_>| {
@@ -5268,6 +5402,8 @@ fn query_automation_runs(
             recovered_by_run_id: row.get(28)?,
             recovered_at: row.get(29)?,
             recovery_evidence: row.get(30)?,
+            attention_resolved_at: row.get(31)?,
+            attention_resolution: row.get(32)?,
         })
     };
     let rows = if let Some(id) = automation_id {
@@ -5995,18 +6131,62 @@ pub fn mark_all_automation_runs_read() -> Result<u64, String> {
     let now = now_ms();
     let updated = transaction
         .execute(
-            "UPDATE automation_runs SET read_at=?1 WHERE read_at IS NULL AND status IN ('SUCCEEDED','NEEDS_ATTENTION','FAILED','RECOVERED','PENDING_REVIEW')",
+            "UPDATE automation_runs SET read_at=?1 WHERE read_at IS NULL AND status IN ('SUCCEEDED','NEEDS_ATTENTION','RESOLVED','FAILED','RECOVERED','PENDING_REVIEW')",
             params![now],
         )
         .map_err(|e| e.to_string())?;
     transaction
         .execute(
-            "UPDATE inbox_items SET read_at=?1 WHERE read_at IS NULL AND run_id IN (SELECT run_id FROM automation_runs WHERE status IN ('SUCCEEDED','NEEDS_ATTENTION','FAILED','RECOVERED','PENDING_REVIEW'))",
+            "UPDATE inbox_items SET read_at=?1 WHERE read_at IS NULL AND run_id IN (SELECT run_id FROM automation_runs WHERE status IN ('SUCCEEDED','NEEDS_ATTENTION','RESOLVED','FAILED','RECOVERED','PENDING_REVIEW'))",
             params![now],
         )
         .map_err(|e| e.to_string())?;
     transaction.commit().map_err(|e| e.to_string())?;
     Ok(updated as u64)
+}
+
+fn resolve_automation_attention_in(
+    connection: &mut Connection,
+    run_id: &str,
+    resolved_at: i64,
+    resolution: &str,
+) -> Result<(), String> {
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    let updated = transaction
+        .execute(
+            "UPDATE automation_runs SET status='RESOLVED',read_at=?2,attention_resolved_at=?2,attention_resolution=?3 WHERE run_id=?1 AND status='NEEDS_ATTENTION'",
+            params![run_id, resolved_at, resolution],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated != 1 {
+        return Err("Only a run currently awaiting a decision can be marked resolved".to_string());
+    }
+    transaction
+        .execute(
+            "UPDATE inbox_items SET read_at=?2 WHERE run_id=?1",
+            params![run_id, resolved_at],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "UPDATE automation_recovery_plans SET governance_pending=0,phase=CASE WHEN phase='VERDICT_PENDING' THEN 'COMPLETE' ELSE phase END WHERE original_run_id=?1 OR recovery_run_id=?1 OR catchup_run_id=?1",
+            params![run_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn resolve_automation_attention(
+    run_id: String,
+    resolution: Option<String>,
+) -> Result<(), String> {
+    let mut connection = open_database()?;
+    let resolution = resolution
+        .map(|value| value.trim().chars().take(500).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "user_confirmed".to_string());
+    resolve_automation_attention_in(&mut connection, &run_id, now_ms(), &resolution)
 }
 
 #[tauri::command]
@@ -6569,6 +6749,7 @@ mod tests {
                 VALUES
                   ('run-success','auto-1','SUCCEEDED',NULL,100,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
                   ('run-attention','auto-1','NEEDS_ATTENTION',NULL,110,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
+                  ('run-resolved','auto-1','RESOLVED',NULL,115,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
                   ('run-failed','auto-1','FAILED',NULL,120,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
                   ('run-recovered','auto-1','RECOVERED',NULL,125,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
                   ('run-legacy','auto-1','PENDING_REVIEW',NULL,130,'SUMMARY_SECRET','OUTPUT_SECRET','TRACE_SECRET','ERROR_SECRET'),
@@ -6589,7 +6770,7 @@ mod tests {
         assert_eq!(summaries[0].schedule_kind, "cron");
         assert_eq!(summaries[0].active_run_id.as_deref(), Some("run-active"));
         assert!(summaries[0].running);
-        assert_eq!(summaries[0].unread_runs, 5);
+        assert_eq!(summaries[0].unread_runs, 6);
 
         let active_sessions = query_active_automation_sessions(&connection).unwrap();
         assert_eq!(active_sessions.len(), 1);
@@ -6666,6 +6847,63 @@ mod tests {
                 )
                 .unwrap(),
             "NEEDS_ATTENTION"
+        );
+    }
+
+    #[test]
+    fn attention_resolution_is_a_durable_one_way_transition() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE automation_runs (
+                  run_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL,
+                  read_at INTEGER,
+                  attention_resolved_at INTEGER,
+                  attention_resolution TEXT
+                );
+                CREATE TABLE inbox_items (run_id TEXT PRIMARY KEY, read_at INTEGER);
+                CREATE TABLE automation_recovery_plans (
+                  original_run_id TEXT PRIMARY KEY,
+                  recovery_run_id TEXT NOT NULL,
+                  catchup_run_id TEXT,
+                  phase TEXT NOT NULL,
+                  governance_pending INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO automation_runs (run_id,status) VALUES ('attention','NEEDS_ATTENTION');
+                INSERT INTO inbox_items (run_id,read_at) VALUES ('attention',NULL);
+                INSERT INTO automation_recovery_plans
+                  (original_run_id,recovery_run_id,catchup_run_id,phase,governance_pending)
+                VALUES ('attention','retry',NULL,'VERDICT_PENDING',1);
+                "#,
+            )
+            .unwrap();
+
+        resolve_automation_attention_in(&mut connection, "attention", 1234, "user_confirmed")
+            .unwrap();
+        let resolved: (String, Option<i64>, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT status,read_at,attention_resolved_at,attention_resolution FROM automation_runs WHERE run_id='attention'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(resolved.0, "RESOLVED");
+        assert_eq!(resolved.1, Some(1234));
+        assert_eq!(resolved.2, Some(1234));
+        assert_eq!(resolved.3.as_deref(), Some("user_confirmed"));
+        let plan: (String, bool) = connection
+            .query_row(
+                "SELECT phase,governance_pending FROM automation_recovery_plans WHERE original_run_id='attention'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plan, ("COMPLETE".to_string(), false));
+        assert!(
+            resolve_automation_attention_in(&mut connection, "attention", 5678, "duplicate",)
+                .is_err()
         );
     }
 
@@ -6823,6 +7061,27 @@ mod tests {
     }
 
     #[test]
+    fn attention_requires_the_configured_completion_receipt() {
+        let project = tempfile::tempdir().unwrap();
+        let scheduled_at = Local
+            .with_ymd_and_hms(2026, 8, 16, 6, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let definition = receipt_probe_definition(project.path());
+        assert!(attention_completion_failure(&definition, Some(scheduled_at), 0).is_some());
+
+        let receipts = project.path().join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(
+            receipts.join("2026-08-15.json"),
+            br#"{"logical_date":"2026-08-15","status":"COMMITTED"}"#,
+        )
+        .unwrap();
+        assert!(attention_completion_failure(&definition, Some(scheduled_at), 0).is_none());
+    }
+
+    #[test]
     fn completion_probe_requires_matching_bundle_and_released_lock() {
         let project = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -6964,6 +7223,93 @@ mod tests {
             result.3.as_deref(),
             Some("completion-receipt:receipts/2026-08-15.json")
         );
+    }
+
+    #[test]
+    fn historical_attention_without_completion_receipt_is_reclassified_as_failed() {
+        let project = tempfile::tempdir().unwrap();
+        let receipts = project.path().join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(
+            receipts.join("2026-08-15.json"),
+            br#"{"logical_date":"2026-08-15","status":"COMMITTED"}"#,
+        )
+        .unwrap();
+        let completed_at = Local
+            .with_ymd_and_hms(2026, 8, 16, 6, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let incomplete_at = Local
+            .with_ymd_and_hms(2026, 8, 17, 6, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE automation_runs (
+                  run_id TEXT PRIMARY KEY,
+                  automation_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  read_at INTEGER,
+                  title TEXT,
+                  summary TEXT,
+                  error TEXT,
+                  scheduled_at INTEGER,
+                  started_at INTEGER NOT NULL,
+                  retry_of_run_id TEXT
+                );
+                CREATE TABLE inbox_items (
+                  run_id TEXT PRIMARY KEY,
+                  title TEXT,
+                  description TEXT,
+                  read_at INTEGER
+                );
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO automation_runs (run_id,automation_id,status,title,summary,scheduled_at,started_at) VALUES ('complete','daily-review-dream','NEEDS_ATTENTION','complete','decision',?1,0),('incomplete','daily-review-dream','NEEDS_ATTENTION','incomplete','decision',?2,0)",
+                params![completed_at, incomplete_at],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO inbox_items (run_id,title,description) VALUES ('complete','complete','decision'),('incomplete','incomplete','decision')",
+                [],
+            )
+            .unwrap();
+
+        let reclassified = reconcile_incomplete_attention_probes_at(
+            &connection,
+            &[receipt_probe_definition(project.path())],
+            project.path(),
+        )
+        .unwrap();
+        assert_eq!(reclassified, 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM automation_runs WHERE run_id='complete'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "NEEDS_ATTENTION"
+        );
+        let incomplete: (String, String, String) = connection
+            .query_row(
+                "SELECT status,title,summary FROM automation_runs WHERE run_id='incomplete'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(incomplete.0, "FAILED");
+        assert_eq!(incomplete.1, "daily-dream failed");
+        assert!(incomplete.2.contains("completion receipt"));
     }
 
     #[test]
@@ -7327,7 +7673,8 @@ mod tests {
         assert!(prompt.starts_with("Automation:"));
         assert!(prompt.contains("Inspect the latest build."));
         assert!(prompt.contains("<automation_result_contract>"));
-        assert!(prompt.contains("self-contained user-facing completion report"));
+        assert!(prompt.contains("self-contained user-facing report in plain language"));
+        assert!(prompt.contains("the shortest reply the user can send"));
         assert!(prompt.contains("Never return a directive by itself"));
         assert!(prompt.contains("::automation-needs-attention{title="));
         assert!(prompt.contains("::automation-failed{summary="));
@@ -7500,7 +7847,8 @@ mod tests {
         );
         assert!(prompt.contains("Resume the SAME durable session"));
         assert!(prompt.contains("do not end with progress narration"));
-        assert!(prompt.contains("self-contained user-facing completion report"));
+        assert!(prompt.contains("self-contained plain-language report"));
+        assert!(prompt.contains("approval/rejection consequences"));
         assert!(prompt.contains("Never return a directive by itself"));
         assert!(prompt.contains("::automation-failed"));
         assert!(prompt.contains("Recovery attempt 1/3"));

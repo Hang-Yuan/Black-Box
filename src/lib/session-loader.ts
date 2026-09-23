@@ -1,4 +1,4 @@
-import { effectiveContextInputTokens } from './context-recovery';
+import { effectiveContextInputTokens, isInternalRecoveryPrompt } from './context-recovery';
 import type { ChatMessage } from '../stores/chatStore';
 import { generateMessageId } from '../stores/chatStore';
 import type { AgentActivityEntry, AgentKind, AgentPhase } from '../stores/agentStore';
@@ -15,6 +15,8 @@ import {
   sanitizeToolResultForDisplay,
 } from './presentation-sanitizer';
 import { unwrapInterruptedContinuationPrompt } from './interrupted-continuation';
+import { deriveNativeGoalState, type NativeGoalState } from './native-goal';
+import { preferMessageCwd } from './message-cwd';
 
 export interface AgentData {
   id: string;
@@ -39,6 +41,7 @@ export interface LoadedSession {
   mainAgentStartTime: number;
   contextInputTokens?: number;
   contextOutputTokens?: number;
+  nativeGoal?: NativeGoalState;
 }
 
 /** Claude JSONL timestamps may be epoch numbers or ISO strings. Chat UI needs epoch ms. */
@@ -72,6 +75,7 @@ function isSystemText(text: string): boolean {
 export function parseSessionMessages(rawMessages: any[]): LoadedSession {
   const messages: ChatMessage[] = [];
   const agents: AgentData[] = [];
+  const nativeGoal = deriveNativeGoalState(rawMessages);
 
   // Create main agent with session start time
   const firstMsg = rawMessages[0];
@@ -213,13 +217,19 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       && typeof msg.attachment?.prompt === 'string'
     ) {
       const content = msg.attachment.prompt.trim();
-      if (content && !isSystemText(content) && !isCliPlaceholder(content)) {
+      if (
+        content
+        && !isInternalRecoveryPrompt(content)
+        && !isSystemText(content)
+        && !isCliPlaceholder(content)
+      ) {
         messages.push({
           id: msg.uuid || generateMessageId(),
           role: 'user',
           type: 'text',
           content,
           timestamp: normalizeSessionTimestamp(msg.attachment.timestamp ?? msg.timestamp),
+          cwd: typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined,
           isSteer: true,
           steerState: 'sent',
         });
@@ -306,12 +316,21 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
         const text = typeof rawText === 'string'
           ? unwrapInterruptedContinuationPrompt(rawText)
           : '';
-        if (text && !isSystemText(text) && !isCliPlaceholder(text)) userTexts.push(text);
+        if (
+          text
+          && !isInternalRecoveryPrompt(text)
+          && !isSystemText(text)
+          && !isCliPlaceholder(text)
+        ) userTexts.push(text);
       }
       // Fallback for plain string content
       if (blocks.length === 0 && typeof msg.message?.content === 'string') {
         const text = unwrapInterruptedContinuationPrompt(msg.message.content);
-        if (!isSystemText(text) && !isCliPlaceholder(text)) userTexts.push(text);
+        if (
+          !isInternalRecoveryPrompt(text)
+          && !isSystemText(text)
+          && !isCliPlaceholder(text)
+        ) userTexts.push(text);
       }
       let content = userTexts.join('');
       // Extract file attachments from text
@@ -320,7 +339,18 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
       const attachMatch = content.match(attachRegex);
       if (attachMatch) {
         content = content.slice(0, attachMatch.index!).trimEnd();
-        const paths = attachMatch[1].split('\n').map(p => p.trim()).filter(Boolean);
+        // The image pipeline inserts a prose instruction between the copied
+        // source image and its detail crops. Only filesystem-shaped lines are
+        // attachments; rendering the instruction as a file card creates the
+        // misleading "coordinates in filenames" attachment.
+        const paths = attachMatch[1]
+          .split(/\r?\n/)
+          .map(p => p.trim())
+          .filter(p => (
+            p.startsWith('/')
+            || /^[A-Za-z]:[\\/]/.test(p)
+            || p.startsWith('\\\\')
+          ));
         for (const p of paths) {
           const name = p.split(/[\\/]/).pop() || p;
           const ext = name.split('.').pop()?.toLowerCase() || '';
@@ -335,6 +365,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
           type: 'text',
           content,
           timestamp: normalizeSessionTimestamp(msg.timestamp),
+          cwd: typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined,
           // Claude's replayed user UUID is the native file-checkpoint key.
           // Preserve it across reload so restore_all / restore_code remain
           // available for durable history, not only for the live stream.
@@ -376,14 +407,18 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
               role: 'assistant',
               type: 'text',
               content: displayText,
-              isFinalResponse: msg.message?.stop_reason === 'end_turn',
+              isFinalResponse: msg.isApiErrorMessage !== true
+                && msg.message?.stop_reason === 'end_turn',
+              isApiErrorMessage: msg.isApiErrorMessage === true,
               timestamp: normalizeSessionTimestamp(msg.timestamp),
+              cwd: typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined,
             };
             const existingTextIndex = messages.findIndex((message) => message.id === textId);
             if (existingTextIndex >= 0) {
               const existing = messages[existingTextIndex];
               messages[existingTextIndex] = {
                 ...textMessage,
+                cwd: preferMessageCwd(existing.cwd, textMessage.cwd),
                 content: existing.isFinalResponse && existing.content.startsWith(textMessage.content)
                   ? existing.content : textMessage.content,
                 timestamp: existing.timestamp,
@@ -434,6 +469,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 questions: block.input.questions,
                 resolved: true,
                 timestamp: normalizeSessionTimestamp(msg.timestamp),
+                cwd: typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined,
               };
             } else if (block.name === 'TodoWrite' && block.input?.todos) {
               chatMsg = {
@@ -445,6 +481,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 toolInput: block.input,
                 todoItems: block.input.todos,
                 timestamp: normalizeSessionTimestamp(msg.timestamp),
+                cwd: typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined,
               };
             } else {
               chatMsg = {
@@ -455,6 +492,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
                 toolName: block.name,
                 toolInput: block.input,
                 timestamp: normalizeSessionTimestamp(msg.timestamp),
+                cwd: typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined,
               };
             }
             // Record tool_use_id for later result binding
@@ -494,6 +532,7 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     && !record.parent_tool_use_id && record.message?.usage)?.message.usage;
   return { messages, agents, mainAgentStartTime: sessionStartTime,
     contextInputTokens: lastUsage ? effectiveContextInputTokens(lastUsage) : undefined,
-    contextOutputTokens: lastUsage?.output_tokens };
+    contextOutputTokens: lastUsage?.output_tokens,
+    nativeGoal };
 
 }

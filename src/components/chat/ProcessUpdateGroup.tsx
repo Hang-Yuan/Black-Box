@@ -7,9 +7,10 @@ import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 interface Props {
   messages: readonly ChatMessage[];
   active: boolean;
+  basePath?: string;
 }
 
-export function ProcessUpdateGroup({ messages, active }: Props) {
+export function ProcessUpdateGroup({ messages, active, basePath }: Props) {
   const t = useT();
   const preview = useMemo(
     () => processUpdatePreview(messages[messages.length - 1]?.content ?? ''),
@@ -45,7 +46,7 @@ export function ProcessUpdateGroup({ messages, active }: Props) {
       <div className="ml-4 mt-1 space-y-4 border-l border-border-subtle pl-4 text-sm text-text-muted">
         {messages.map((message) => (
           <div key={message.id} className="leading-relaxed">
-            <MarkdownRenderer content={message.content} />
+            <MarkdownRenderer content={message.content} basePath={message.cwd || basePath} />
           </div>
         ))}
       </div>

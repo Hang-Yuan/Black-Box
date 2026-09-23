@@ -24,7 +24,7 @@ describe('task composer modes', () => {
       ok: true,
       value: { kind: 'goal', command: '/goal Ship verified release' },
     });
-    expect(buildTaskComposerSubmission('goal', 'x'.repeat(12_001), base))
+    expect(buildTaskComposerSubmission('goal', 'x'.repeat(4_001), base))
       .toEqual({ ok: false, error: 'goal_too_long' });
   });
 

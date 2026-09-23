@@ -69,6 +69,7 @@ describe('continuation draft identity', () => {
     });
     expect(useSessionStore.getState().sessions.find((session) => session.id === source.id)).toEqual(source);
     expect(useSessionStore.getState().customPreviews.source).toBe('项目v1开发');
+    expect(useSessionStore.getState().previousSessionId).toBe(source.id);
   });
 
   it('keeps an ungrouped source ungrouped and uses its visible preview', () => {

@@ -220,7 +220,7 @@ function automationStatus(automation: AutomationActivitySummary): TaskActivitySt
   if (runStatus === 'NEEDS_ATTENTION') return 'waiting_user';
   if (runStatus === 'FAILED') return 'failed';
   if (automation.definitionStatus.toUpperCase() === 'PAUSED') return 'paused';
-  if (runStatus === 'SUCCEEDED' || runStatus === 'RECOVERED' || runStatus === 'PENDING_REVIEW'
+  if (runStatus === 'SUCCEEDED' || runStatus === 'RECOVERED' || runStatus === 'RESOLVED' || runStatus === 'PENDING_REVIEW'
     || runStatus === 'CANCELLED' || runStatus === 'ARCHIVED') return 'completed';
   if (automation.nextRunAt !== null) return 'queued';
   return automation.lastRunAt !== null ? 'completed' : 'queued';

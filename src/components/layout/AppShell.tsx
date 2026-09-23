@@ -59,6 +59,14 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
   const previewOwner = useRef<{ sessionId: string; sidebar: boolean } | null>(null);
   useEffect(() => {
     if (isFilePreviewMode && selectedSessionId && previewOwner.current?.sessionId !== selectedSessionId) {
+      // A tab switch can restore another open file without ever leaving preview
+      // mode, and draft promotion renames the current owner. In both cases the
+      // destination state was restored by the conversation transaction; only
+      // transfer shell ownership here.
+      if (previewOwner.current) {
+        previewOwner.current = { ...previewOwner.current, sessionId: selectedSessionId };
+        return;
+      }
       setPreviewWidth(Math.round(window.innerWidth * 0.5));
       saveConversationPanelState(selectedSessionId, {
         open: secondaryPanelOpen,
@@ -74,11 +82,14 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
     if (!isFilePreviewMode && previewOwner.current) {
       const owner = previewOwner.current;
       previewOwner.current = null;
+      // Preview mode hides the application sidebar globally. Restore it after
+      // leaving preview even when the user reached the blank view by switching
+      // conversations.
+      if (owner.sidebar && !sidebarOpen) toggleSidebar();
       // Restore only when the same conversation closed its own preview. A tab
       // switch has already restored the destination conversation atomically.
       if (selectedSessionId === owner.sessionId) {
         const panel = loadConversationPanelState(owner.sessionId);
-        if (owner.sidebar && !sidebarOpen) toggleSidebar();
         if (panel) {
           useSettingsStore.getState().setSecondaryPanelState({
             open: panel.open,
@@ -111,6 +122,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
     e.preventDefault();
     e.stopPropagation();
     isRightDragging.current = true;
+    window.dispatchEvent(new Event('blackbox:chat-layout-will-change'));
     rightStartX.current = e.clientX;
     rightStartWidth.current = isFilePreviewModeRef.current
       ? previewWidthRef.current
@@ -156,6 +168,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
       isRightDragging.current = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
+      window.dispatchEvent(new Event('blackbox:chat-layout-did-change'));
     };
 
     window.addEventListener('mousemove', handleMouseMove);
@@ -183,6 +196,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
     e.preventDefault();
     e.stopPropagation();
     isSidebarDragging.current = true;
+    window.dispatchEvent(new Event('blackbox:chat-layout-will-change'));
     sidebarStartX.current = e.clientX;
     sidebarStartW.current = sidebarWidthRef.current;
     document.body.style.cursor = 'col-resize';
@@ -212,6 +226,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
       isSidebarDragging.current = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
+      window.dispatchEvent(new Event('blackbox:chat-layout-did-change'));
     };
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleUp);

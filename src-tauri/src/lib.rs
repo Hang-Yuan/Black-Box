@@ -1,10 +1,10 @@
+mod app_update;
 mod automations;
 mod auxiliary_model_hook;
 mod client_runtime;
-mod app_update;
 mod commands;
-mod conversation_projection;
 mod conversation_handoff;
+mod conversation_projection;
 mod debug_runtime_guard;
 mod desktop_pet;
 pub mod env_manager;
@@ -1761,6 +1761,192 @@ fn provider_error_indicates_auth_failure(status: u16, response_text: &str) -> bo
             || text.contains("unauthenticated"))
 }
 
+fn provider_model_list_urls(protocol: ProviderProtocol, base_url: &str) -> Vec<String> {
+    let base = base_url.trim().trim_end_matches('/');
+    let versioned_suffix = match protocol {
+        ProviderProtocol::GeminiGenerateContent => "/v1beta",
+        ProviderProtocol::AnthropicMessages | ProviderProtocol::OpenAiChatCompletions => "/v1",
+    };
+    let mut urls = Vec::new();
+
+    if base.ends_with("/v1") || base.ends_with("/v1beta") {
+        urls.push(format!("{base}/models"));
+    } else {
+        urls.push(format!("{base}{versioned_suffix}/models"));
+        urls.push(format!("{base}/models"));
+    }
+
+    // Relays commonly put the message endpoint below /anthropic or /openai
+    // while exposing their model catalogue at the same origin's /v1/models.
+    if let Ok(mut origin) = reqwest::Url::parse(base) {
+        origin.set_path(&format!("{versioned_suffix}/models"));
+        origin.set_query(None);
+        origin.set_fragment(None);
+        urls.push(origin.to_string().trim_end_matches('/').to_string());
+    }
+
+    let mut deduplicated = Vec::new();
+    for url in urls {
+        if !deduplicated.contains(&url) {
+            deduplicated.push(url);
+        }
+    }
+    deduplicated
+}
+
+fn extract_provider_model_ids(payload: &Value) -> Vec<String> {
+    let items = payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .and_then(Value::as_array)
+        .or_else(|| payload.as_array());
+    let mut ids = items
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.as_str().map(str::to_string).or_else(|| {
+                item.get("id")
+                    .or_else(|| item.get("name"))
+                    .or_else(|| item.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .map(|id| id.trim().trim_start_matches("models/").to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[tauri::command]
+async fn discover_provider_models(
+    base_url: String,
+    api_format: String,
+    auth_scheme: Option<String>,
+    api_key: Option<String>,
+    provider_id: Option<String>,
+    proxy_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    let stored_provider = if let Some(provider_id) = provider_id.as_deref() {
+        let providers = read_providers_file()?;
+        Some(
+            providers
+                .providers
+                .into_iter()
+                .find(|provider| provider.id == provider_id)
+                .ok_or_else(|| format!("Provider '{provider_id}' not found"))?,
+        )
+    } else {
+        None
+    };
+    let supplied_key = api_key
+        .map(|secret| secret.trim().to_string())
+        .filter(|secret| !secret.is_empty());
+    let stored_key = if supplied_key.is_none() {
+        if let Some(provider) = stored_provider.as_ref() {
+            resolve_provider_secret(provider)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let api_key = supplied_key
+        .or(stored_key)
+        .ok_or_else(|| "Provider credential is missing".to_string())?;
+    let protocol = ProviderProtocol::parse(&api_format)?;
+    let auth_scheme = ProviderAuthScheme::parse(&resolve_provider_auth_scheme_parts(
+        protocol.id(),
+        auth_scheme
+            .as_deref()
+            .or_else(|| stored_provider.as_ref()?.auth_scheme.as_deref()),
+        stored_provider
+            .as_ref()
+            .and_then(|provider| provider.preset.as_deref()),
+    )?)?;
+
+    let client = if let Some(ref purl) = proxy_url {
+        if !purl.is_empty() {
+            if let Ok(proxy) = reqwest::Proxy::all(purl) {
+                if is_proxy_reachable(purl).await {
+                    reqwest::Client::builder()
+                        .connect_timeout(std::time::Duration::from_secs(10))
+                        .timeout(std::time::Duration::from_secs(30))
+                        .no_proxy()
+                        .proxy(proxy)
+                        .build()
+                        .unwrap_or_default()
+                } else {
+                    build_smart_http_client(
+                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                }
+            } else {
+                build_smart_http_client(
+                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            }
+        } else {
+            build_smart_http_client(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        }
+    } else {
+        build_smart_http_client(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    };
+
+    let mut failures = Vec::new();
+    for url in provider_model_list_urls(protocol, &base_url) {
+        let request = client
+            .get(&url)
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(15));
+        let response = match apply_provider_connection_auth(request, auth_scheme, &api_key)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{}: request failed ({})", url, error));
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        if provider_error_indicates_auth_failure(status, &text) {
+            return Err(format!("Model discovery authentication failed (HTTP {status})"));
+        }
+        if !(200..300).contains(&status) {
+            failures.push(format!("{}: HTTP {}", url, status));
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("Model catalogue returned invalid JSON: {error}"))?;
+        let ids = extract_provider_model_ids(&payload);
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        failures.push(format!("{}: empty model list", url));
+    }
+
+    Err(format!(
+        "No supported model catalogue was found ({})",
+        failures.join("; ")
+    ))
+}
+
 #[tauri::command]
 async fn test_provider_connection(
     base_url: String,
@@ -2333,16 +2519,16 @@ fn normalize_cli_model_id(model: &str) -> String {
 #[cfg(test)]
 mod provider_capability_tests {
     use super::{
-        apply_provider_connection_auth, enforce_provider_loopback_child_env,
-        configured_context_window_env, effective_model_context_window,
+        apply_provider_connection_auth, configured_context_window_env,
+        effective_model_context_window, enforce_provider_loopback_child_env,
         merge_provider_extra_env, model_mapping_context_window, normalize_cli_model_id,
-        official_claude_context_window, parse_bool_override,
-        provider_connection_probe_body, provider_connection_probe_url,
-        provider_error_indicates_auth_failure, provider_inherited_env_removals,
-        redacted_env_for_log, resolve_provider_auth_scheme, resolve_provider_auth_scheme_parts,
-        resolve_provider_capabilities, should_inject_login_shell_provider_env, ApiProvider,
-        ModelMapping, ProviderAuthScheme, ProviderProtocol, MAIN_CLI_NESTED_GUARDS,
-        PARTIAL_MESSAGES_OVERRIDE_ENV,
+        official_claude_context_window, parse_bool_override, provider_connection_probe_body,
+        extract_provider_model_ids, provider_connection_probe_url,
+        provider_error_indicates_auth_failure, provider_model_list_urls,
+        provider_inherited_env_removals, redacted_env_for_log, resolve_provider_auth_scheme,
+        resolve_provider_auth_scheme_parts, resolve_provider_capabilities,
+        should_inject_login_shell_provider_env, ApiProvider, ModelMapping, ProviderAuthScheme,
+        ProviderProtocol, MAIN_CLI_NESTED_GUARDS, PARTIAL_MESSAGES_OVERRIDE_ENV,
     };
     use std::collections::HashMap;
 
@@ -2628,6 +2814,56 @@ mod provider_capability_tests {
             400,
             "invalid max output token value",
         ));
+    }
+
+    #[test]
+    fn provider_model_catalogue_urls_follow_each_protocol_base() {
+        assert_eq!(
+            provider_model_list_urls(
+                ProviderProtocol::AnthropicMessages,
+                "https://global.example.com/"
+            )[0],
+            "https://global.example.com/v1/models"
+        );
+        assert_eq!(
+            provider_model_list_urls(
+                ProviderProtocol::OpenAiChatCompletions,
+                "https://api.openai.com/v1"
+            )[0],
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            provider_model_list_urls(
+                ProviderProtocol::GeminiGenerateContent,
+                "https://generativelanguage.googleapis.com/v1beta"
+            )[0],
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn provider_model_catalogue_parser_accepts_common_shapes() {
+        let openai = serde_json::json!({
+            "data": [
+                {"id": "claude-opus-5-5"},
+                {"id": "claude-sonnet-5"}
+            ]
+        });
+        assert_eq!(
+            extract_provider_model_ids(&openai),
+            vec!["claude-opus-5-5", "claude-sonnet-5"]
+        );
+
+        let gemini = serde_json::json!({
+            "models": [
+                {"name": "models/gemini-3.1-pro-preview"},
+                {"name": "models/gemini-3.5-flash"}
+            ]
+        });
+        assert_eq!(
+            extract_provider_model_ids(&gemini),
+            vec!["gemini-3.1-pro-preview", "gemini-3.5-flash"]
+        );
     }
 
     #[test]
@@ -3881,9 +4117,8 @@ async fn start_claude_session(
             );
         } else {
             let model = selected_model.to_lowercase();
-            let is_1m_alias = model.contains("mimo")
-                || model.contains("[1m]")
-                || model.ends_with("-1m");
+            let is_1m_alias =
+                model.contains("mimo") || model.contains("[1m]") || model.ends_with("-1m");
             if is_1m_alias {
                 resolved_env.insert(
                     "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
@@ -4263,9 +4498,16 @@ async fn start_claude_session(
         kill_tx: Some(kill_tx),
         exit_tx,
     };
+    if let Err(error) =
+        commands::register_managed_cli_process(pid, &sid, &cli_session_id, &generation)
+    {
+        stdin_mgr.remove(&sid).await;
+        return Err(error);
+    }
     if let Err(error) = session_reservation.commit(managed_process).await {
         // Dropping the uncommitted ManagedProcess closes kill_tx, which selects
         // the waiter kill branch. Remove the published stdin handle as well.
+        let _ = commands::unregister_managed_cli_process(pid, &generation);
         stdin_mgr.remove(&sid).await;
         return Err(error);
     }
@@ -4292,7 +4534,8 @@ async fn start_claude_session(
         let reader = BufReader::with_capacity(1024 * 1024, stdout);
         let mut lines = reader.lines();
         let mut line_count: u64 = 0;
-        let mut execution_projection = conversation_projection::ExecutionProjection::new(generation.clone());
+        let mut execution_projection =
+            conversation_projection::ExecutionProjection::new(generation.clone());
         let mut emit_fail_count: u32 = 0;
         let spawn_time = std::time::Instant::now();
         loop {
@@ -4310,7 +4553,11 @@ async fn start_claude_session(
             line_count += 1;
             // Log first 10 lines with timing to diagnose startup delay
             if line_count <= 10 {
-                eprintln!("[BLACKBOX:stdout] #{} @{}ms", line_count, spawn_time.elapsed().as_millis());
+                eprintln!(
+                    "[BLACKBOX:stdout] #{} @{}ms",
+                    line_count,
+                    spawn_time.elapsed().as_millis()
+                );
             }
             // Parse every line as a JSON Value first (avoids serde enum pitfalls)
             let mut json = match serde_json::from_str::<Value>(&line) {
@@ -4649,6 +4896,9 @@ async fn start_claude_session(
         // Phase 4 §5.4 (S10): remove the per-session MCP scratch config.
         cleanup_mcp_scratch_config(&sid_clone);
         state_clone.finish_if_current(&sid_clone, &generation).await;
+        if let Err(error) = commands::unregister_managed_cli_process(pid, &generation) {
+            eprintln!("[BLACKBOX] failed to clear managed CLI ledger entry: {error}");
+        }
     });
 
     // Spawn stderr reader
@@ -5152,12 +5402,8 @@ struct CliUpdateBlockers {
 async fn cli_update_blockers_inner(
     processes: &ProcessManager,
 ) -> Result<CliUpdateBlockers, String> {
-    let (
-        maintenance_downloaded,
-        maintenance_total,
-        maintenance_percent,
-        maintenance_phase,
-    ) = cli_update_progress_snapshot();
+    let (maintenance_downloaded, maintenance_total, maintenance_percent, maintenance_phase) =
+        cli_update_progress_snapshot();
     Ok(CliUpdateBlockers {
         active_session_ids: processes.active_ids().await,
         running_automation: automations::has_running_automation()?,
@@ -6243,6 +6489,33 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
         }
     }
     Ok(messages)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionFileRevision {
+    bytes: u64,
+    modified_ms: u64,
+}
+
+/// Cheap revision probe for a live Claude transcript. The frontend uses this
+/// before loading JSONL so long-running sessions are read only after the file
+/// actually changes (for example when Claude persists a lead reply while an
+/// asynchronous Agent still owns the CLI process).
+#[tauri::command]
+async fn get_session_file_revision(path: String) -> Result<SessionFileRevision, String> {
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("Failed to inspect session transcript: {error}"))?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default();
+    Ok(SessionFileRevision {
+        bytes: metadata.len(),
+        modified_ms,
+    })
 }
 
 #[tauri::command]
@@ -10939,7 +11212,11 @@ async fn native_owner_release_size(version: &str) -> Option<u64> {
         .send()
         .await
         .ok()?;
-    response.status().is_success().then(|| response_length(&response)).flatten()
+    response
+        .status()
+        .is_success()
+        .then(|| response_length(&response))
+        .flatten()
 }
 
 #[cfg(test)]
@@ -13035,6 +13312,13 @@ pub fn run() {
     client_runtime::initialize().unwrap_or_else(|error| {
         panic!("Black Box cannot initialize its Claude environment: {error}")
     });
+    match commands::reap_stale_managed_cli_processes() {
+        Ok(reaped) if !reaped.is_empty() => {
+            eprintln!("[BLACKBOX] reaped stale managed CLI processes: {reaped:?}");
+        }
+        Err(error) => eprintln!("[BLACKBOX] failed to reconcile managed CLI ledger: {error}"),
+        _ => {}
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -13229,6 +13513,7 @@ pub fn run() {
             handoff_task,
             search_sessions,
             load_session,
+            get_session_file_revision,
             load_fork_lineage,
             save_fork_lineage,
             load_review_comments,
@@ -13403,6 +13688,7 @@ pub fn run() {
             clear_provider_credential,
             delete_provider,
             test_provider_connection,
+            discover_provider_models,
             respond_permission,
             send_control_request,
             commands::feedback::submit_feedback,
@@ -13426,6 +13712,7 @@ pub fn run() {
             automations::create_automation_worktree_branch,
             automations::mark_automation_run_read,
             automations::mark_all_automation_runs_read,
+            automations::resolve_automation_attention,
             automations::archive_automation_run,
             automations::cleanup_automation_worktree,
             automations::restore_automation_worktree,

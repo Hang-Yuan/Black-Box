@@ -5,6 +5,7 @@ import {
   loadConversationPanelState,
   loadFileScrollPosition,
   loadFileTreeScrollPosition,
+  moveConversationViewState,
   saveChatScrollPosition,
   saveConversationPanelState,
   saveFileScrollPosition,
@@ -13,6 +14,8 @@ import {
 import {
   restoreConversationFileState,
   saveConversationFileState,
+  moveConversationFileState,
+  switchConversationFileState,
   useFileStore,
 } from '../stores/fileStore';
 import { useSettingsStore } from '../stores/settingsStore';
@@ -191,5 +194,67 @@ describe('conversation reading position', () => {
       secondaryPanelTab: 'activity',
       secondaryPanelWidth: 410,
     });
+  });
+
+  it('starts a fresh conversation without leaking or deleting the source preview', () => {
+    useFileStore.setState({
+      selectedFile: '/tmp/project-a/report.md',
+      fileContent: 'source document',
+      previewMode: 'preview',
+      editContent: null,
+      revealTarget: '/tmp/project-a/report.md',
+      rootPath: '/tmp/project-a',
+      expandedFolders: new Set(['/tmp/project-a/docs']),
+    });
+
+    switchConversationFileState('session-a', 'draft-new');
+    expect(useFileStore.getState().selectedFile).toBeNull();
+
+    // Closing the empty draft must not overwrite session-a's saved document.
+    useFileStore.getState().closePreview();
+    switchConversationFileState('draft-new', 'session-a');
+    expect(useFileStore.getState()).toMatchObject({
+      selectedFile: '/tmp/project-a/report.md',
+      fileContent: 'source document',
+      rootPath: '/tmp/project-a',
+    });
+    expect(Array.from(useFileStore.getState().expandedFolders)).toEqual([
+      '/tmp/project-a/docs',
+    ]);
+  });
+
+  it('moves every reading surface from a draft id to its durable session id', () => {
+    saveChatScrollPosition('draft-a', { top: 720, atBottom: false });
+    saveFileScrollPosition('draft-a', '/tmp/report.md', 'preview', 380);
+    saveFileTreeScrollPosition('draft-a', '/tmp/project', 144);
+    saveConversationPanelState('draft-a', { open: true, tab: 'files', width: 440 });
+    useFileStore.setState({
+      selectedFile: '/tmp/report.md',
+      fileContent: '# report',
+      previewMode: 'preview',
+      editContent: null,
+      revealTarget: '/tmp/report.md',
+      rootPath: '/tmp/project',
+      expandedFolders: new Set(['/tmp/project/docs']),
+    });
+    saveConversationFileState('draft-a');
+
+    moveConversationFileState('draft-a', 'session-real');
+
+    expect(loadChatScrollPosition('session-real')).toEqual({ top: 720, atBottom: false });
+    expect(loadFileScrollPosition('session-real', '/tmp/report.md', 'preview')).toBe(380);
+    expect(loadFileTreeScrollPosition('session-real', '/tmp/project')).toBe(144);
+    expect(loadConversationPanelState('session-real')).toEqual({
+      open: true,
+      tab: 'files',
+      width: 440,
+    });
+    restoreConversationFileState('session-real');
+    expect(useFileStore.getState().selectedFile).toBe('/tmp/report.md');
+    expect(useFileStore.getState().rootPath).toBe('/tmp/project');
+
+    // The lower-level mover is idempotent for callers that only own view maps.
+    moveConversationViewState('session-real', 'session-real');
+    expect(loadChatScrollPosition('session-real')?.top).toBe(720);
   });
 });

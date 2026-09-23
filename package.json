@@ -1,7 +1,7 @@
 {
   "name": "blackbox",
   "private": true,
-  "version": "0.14.59",
+  "version": "0.14.82",
   "packageManager": "pnpm@9.15.9",
   "type": "module",
   "scripts": {
@@ -20,6 +20,7 @@
     "test:permission-profile-smoke": "bash scripts/run-isolated.sh node scripts/permission-profile-smoke.mjs",
     "test:steer-smoke": "bash scripts/run-isolated.sh node scripts/steer-smoke.mjs",
     "test:extension-navigation-smoke": "bash scripts/run-isolated.sh node scripts/extension-navigation-smoke.mjs",
+    "test:file-reference-smoke": "bash scripts/run-isolated.sh node scripts/file-reference-smoke.mjs",
     "test:resume-reliability-smoke": "bash scripts/run-isolated.sh node scripts/resume-reliability-smoke.mjs",
     "test:native-close-resume-smoke": "bash scripts/run-isolated.sh node scripts/native-close-resume-smoke.mjs",
     "test:fork-lifecycle-smoke": "bash scripts/run-isolated.sh node scripts/fork-lifecycle-smoke.mjs",

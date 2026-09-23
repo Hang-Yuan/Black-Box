@@ -9,6 +9,7 @@ import { SettingsPanel } from './components/settings/SettingsPanel';
 import { ExtensionCenter } from './components/extensions/ExtensionCenter';
 import { AutomationCenter } from './components/automations/AutomationCenter';
 import { AutomationSessionMonitor } from './components/automations/AutomationSessionMonitor';
+import { LiveSessionTranscriptMonitor } from './components/chat/LiveSessionTranscriptMonitor';
 import { TaskCenterView } from './components/activity/TaskCenterView';
 import { ImageLightbox } from './components/shared/ImageLightbox';
 import { ChangelogModal } from './components/shared/ChangelogModal';
@@ -66,7 +67,7 @@ function App() {
   const setLastSeenVersion = useSettingsStore((s) => s.setLastSeenVersion);
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
   const loadTree = useFileStore((s) => s.loadTree);
-  const refreshTree = useFileStore((s) => s.refreshTree);
+  const refreshChangedPaths = useFileStore((s) => s.refreshChangedPaths);
   const markFileChanged = useFileStore((s) => s.markFileChanged);
   const fileTreeActive = mainView === 'chat'
     && secondaryPanelOpen
@@ -488,8 +489,8 @@ function App() {
           if (useSessionStore.getState().selectedSessionId !== sessionId) {
             return { switchedTo: sessionId, aborted: true, note: 'User switched away during load' };
           }
-          const { messages, agents, contextInputTokens, contextOutputTokens } = parseSessionMessages(rawMessages);
-          setSessionMeta(sessionId, { contextInputTokens, contextOutputTokens });
+          const { messages, agents, contextInputTokens, contextOutputTokens, nativeGoal } = parseSessionMessages(rawMessages);
+          setSessionMeta(sessionId, { contextInputTokens, contextOutputTokens, nativeGoal });
           for (const agent of agents) useAgentStore.getState().upsertAgent(agent);
           for (const message of messages) {
             if ((message as any).toolResultContent) {
@@ -884,6 +885,7 @@ function App() {
   // Listen for file change events from the watcher
   // Debounce tree refresh for created/removed events (structure changes)
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const structuralChangePathsRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (!fileTreeActive) return;
@@ -901,9 +903,12 @@ function App() {
       // When files are created or removed, the tree structure changes —
       // debounce a full tree reload (300ms to batch rapid changes)
       if (event.kind === 'created' || event.kind === 'removed') {
+        for (const filePath of filtered) structuralChangePathsRef.current.add(filePath);
         if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = setTimeout(() => {
-          refreshTree();
+          const changedPaths = Array.from(structuralChangePathsRef.current);
+          structuralChangePathsRef.current.clear();
+          void refreshChangedPaths(changedPaths);
           refreshTimerRef.current = null;
         }, 300);
       }
@@ -911,12 +916,14 @@ function App() {
     return () => {
       unlisten.then((fn) => fn());
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      structuralChangePathsRef.current.clear();
     };
-  }, [fileTreeActive, markFileChanged, refreshTree]);
+  }, [fileTreeActive, markFileChanged, refreshChangedPaths]);
 
   return (
     <>
       <AutomationSessionMonitor />
+      <LiveSessionTranscriptMonitor />
       <AppShell
         sidebar={<Sidebar />}
         main={mainView === 'extensions'

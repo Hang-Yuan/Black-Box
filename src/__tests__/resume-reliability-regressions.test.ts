@@ -182,6 +182,35 @@ describe('durable resume reliability regressions', () => {
     expect(recovery).toContain("| 'resume_after_compact'");
   });
 
+  it('recovers Claude internal runner restarts without losing the active task', () => {
+    const stream = read('hooks/useStreamProcessor.ts');
+    const recovery = read('lib/context-recovery.ts');
+    expect(recovery).toContain("const INTERNAL_RUNNER_RECOVERY_PREFIX = 'Continue from where you left off.'");
+    expect(stream).toContain('projectInternalRunnerRecovery(currentMeta)');
+    expect(stream).toContain("setSessionStatus('reconnecting')");
+    expect(stream).toContain("store.setSessionStatus(tabId, 'reconnecting')");
+    expect(stream).toContain('!internalRunnerRecovery');
+  });
+
+  it('hydrates persisted lead replies while async agents still own stdout', () => {
+    const app = read('App.tsx');
+    const monitor = read('components/chat/LiveSessionTranscriptMonitor.tsx');
+    const sync = read('lib/live-transcript-sync.ts');
+    const stream = read('hooks/useStreamProcessor.ts');
+    const bridge = read('lib/tauri-bridge.ts');
+    const rust = read('../src-tauri/src/lib.rs');
+    const chat = read('components/chat/ChatPanel.tsx');
+    expect(app).toContain('<LiveSessionTranscriptMonitor />');
+    expect(monitor).toContain('getSessionFileRevision');
+    expect(monitor).toContain('reconcileDurableSessionTranscript(selectedSessionId, revision)');
+    expect(sync).toContain('parseSessionMessages(rawMessages)');
+    expect(sync).toContain('preferMessageCwd(current.cwd, message.cwd)');
+    expect(stream).toContain('scheduleTerminalTranscriptReconciliation(tabId)');
+    expect(bridge).toContain("invoke<SessionFileRevision>('get_session_file_revision'");
+    expect(rust).toContain('async fn get_session_file_revision');
+    expect(chat).toContain("t('agents.backgroundTurnFinished')");
+  });
+
   it('uses graceful process settlement for internal restart paths', () => {
     const source = read('lib/sessionLifecycle.ts');
     expect(source).toContain("const stopProcess = reason === 'stop'");

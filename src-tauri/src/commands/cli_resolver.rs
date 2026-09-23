@@ -363,7 +363,10 @@ fn cli_cmd_with_timeout(path: &Path, args: &[&str], timeout_secs: u64) -> String
                 .arg(&path_string)
                 .args(args)
                 .env("PATH", crate::build_enriched_path())
-                .env(crate::client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1")
+                .env(
+                    crate::client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV,
+                    "1",
+                )
                 .env_remove("CLAUDECODE")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -382,7 +385,10 @@ fn cli_cmd_with_timeout(path: &Path, args: &[&str], timeout_secs: u64) -> String
     let mut child = match std::process::Command::new(&path_string)
         .args(args)
         .env("PATH", crate::build_enriched_path())
-        .env(crate::client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1")
+        .env(
+            crate::client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV,
+            "1",
+        )
         .env_remove("CLAUDECODE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -397,7 +403,10 @@ fn cli_cmd_with_timeout(path: &Path, args: &[&str], timeout_secs: u64) -> String
     let mut child = match std::process::Command::new(&path_string)
         .args(args)
         .env("PATH", crate::build_enriched_path())
-        .env(crate::client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV, "1")
+        .env(
+            crate::client_runtime::DISABLE_BACKGROUND_AUTOUPDATER_ENV,
+            "1",
+        )
         .env_remove("CLAUDECODE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -11,12 +11,14 @@ import { useSettingsStore } from '../../stores/settingsStore';
 import { useFileStore } from '../../stores/fileStore';
 import {
   KNOWN_FILE_EXTENSIONS,
+  ancestorResolutionBases,
   parseFileReference,
   slugifyHeading,
   type ParsedFileReference,
 } from '../../stores/fileReveal';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
+import { showToast } from './Toast';
 
 /* ================================================================
    AsyncImage — loads local files via Rust base64 bridge
@@ -387,13 +389,67 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
     };
   }, []);
 
-  const openReference = useCallback((reference: ParsedFileReference) => {
+  // Claude often emits a workspace-relative directory once, followed by bare
+  // filenames. Prepare those directory citations once for this message, like
+  // Codex's FileCitations pass, so a cached/stale cwd cannot strand every
+  // later chip in a large workspace search.
+  const contextualBases = useMemo(() => {
+    const bases: string[] = [];
+    const seen = new Set<string>();
+    const add = (value?: string) => {
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      bases.push(value);
+    };
+    for (const match of content.matchAll(/`([^`\r\n]+[/\\])`/g)) {
+      const raw = match[1].trim();
+      for (const candidateBase of [workingDirectory, resolveBase]) {
+        const reference = parseFileReference(raw, { basePath: candidateBase, explicit: true });
+        if (reference?.kind === 'folder') add(reference.path);
+      }
+    }
+    return bases;
+  }, [content, resolveBase, workingDirectory]);
+
+  const resolutionBases = useMemo(() => {
+    const bases = ancestorResolutionBases(resolveBase, workingDirectory);
+    if (workingDirectory && !bases.includes(workingDirectory)) bases.push(workingDirectory);
+    return bases;
+  }, [resolveBase, workingDirectory]);
+
+  const openReference = useCallback(async (reference: ParsedFileReference) => {
     window.dispatchEvent(new Event('blackbox:chat-layout-will-change'));
     useSettingsStore.getState().setSecondaryTab('files');
     requestAnimationFrame(() => requestAnimationFrame(() => window.dispatchEvent(new Event('blackbox:chat-layout-did-change'))));
     const rootHint = workingDirectory || useFileStore.getState().rootPath;
-    void useFileStore.getState().openFileReference(reference, rootHint);
-  }, [workingDirectory]);
+    const isBare = !reference.displayPath.includes('/') && !reference.displayPath.includes('\\');
+    const candidates: ParsedFileReference[] = [];
+    const seen = new Set<string>();
+    const add = (candidate: ParsedFileReference | null) => {
+      if (!candidate) return;
+      const key = `${candidate.kind}:${candidate.path}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push(candidate);
+    };
+
+    // Bare names inherit the closest explicit directory citations before the
+    // cached message/session roots. Path-like references retain their primary
+    // parse first, then get the same bounded recovery candidates.
+    if (!isBare) add(reference);
+    for (const candidateBase of contextualBases) {
+      add(parseFileReference(reference.raw, { basePath: candidateBase, sourcePath, explicit: true }));
+    }
+    add(reference);
+    for (const candidateBase of resolutionBases) {
+      add(parseFileReference(reference.raw, { basePath: candidateBase, sourcePath, explicit: true }));
+    }
+
+    for (const candidate of candidates) {
+      if (await useFileStore.getState().openFileReference(candidate, rootHint)) return;
+    }
+    showToast(t('files.referenceNotFound').replace('{path}', reference.displayPath), 'error');
+  }, [contextualBases, resolutionBases, sourcePath, t, workingDirectory]);
 
   // Pre-process: wrap bare file paths in backticks so `code` handler makes them clickable
   const artifactProjection = useMemo(() => sourcePath ? { markdown: content, artifacts: [] } : extractResponseArtifacts(content), [content, sourcePath]);

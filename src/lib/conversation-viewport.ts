@@ -8,6 +8,13 @@ export interface ConversationViewportSnapshot {
   textViewportOffset?: number;
 }
 
+/** Explicit split-panel changes must keep the visible text in place even when
+ * the reader happened to be near the bottom. Reflowing a narrower column can
+ * add many lines, so bottom pinning would move the original reading anchor. */
+export function pinConversationViewport(snapshot: ConversationViewportSnapshot): ConversationViewportSnapshot {
+  return { ...snapshot, atBottom: false };
+}
+
 function textNodes(root: Node): Text[] {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   const nodes: Text[] = [];

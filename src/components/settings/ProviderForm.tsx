@@ -10,6 +10,11 @@ import {
 } from '../../lib/provider-presets';
 import { getProviderConnectionTestModel } from '../../lib/api-provider';
 import { getOfficialClaudeContextWindow } from '../../lib/model-context-window';
+import {
+  CLAUDE_MODEL_TIERS,
+  mergeDiscoveredClaudeMappings,
+  selectHighestClaudeModels,
+} from '../../lib/provider-model-discovery';
 
 const MODEL_TIERS: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; labelKey: string; placeholderKey: string }[] = [
   { tier: 'fable', labelKey: 'provider.fableModel', placeholderKey: 'provider.fablePlaceholder' },
@@ -18,7 +23,8 @@ const MODEL_TIERS: { tier: 'fable' | 'opus' | 'sonnet' | 'haiku'; labelKey: stri
   { tier: 'haiku', labelKey: 'provider.haikuModel', placeholderKey: 'provider.haikuPlaceholder' },
 ];
 
-const INPUT_CLASS = 'w-full px-3 py-2 text-[13px] bg-bg-chat border border-border-subtle rounded-md text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent';
+const INPUT_BASE_CLASS = 'px-3 py-2 text-[13px] bg-bg-chat border border-border-subtle rounded-md text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent';
+const INPUT_CLASS = `w-full ${INPUT_BASE_CLASS}`;
 
 export function parseContextWindowInput(value: string): number | undefined {
   const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*([km])?$/i);
@@ -57,6 +63,7 @@ function EyeClosedIcon() {
 }
 
 export type TestStatus = 'idle' | 'testing' | 'success' | 'auth_error' | 'failed';
+type DiscoveryStatus = 'idle' | 'discovering' | 'success' | 'failed';
 
 interface ProviderFormProps {
   provider: ApiProvider;
@@ -92,6 +99,8 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [clearKeyConfirm, setClearKeyConfirm] = useState(false);
   const [credentialError, setCredentialError] = useState('');
+  const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus>('idle');
+  const [discoveryMessage, setDiscoveryMessage] = useState('');
 
   const setTestStatus = useCallback((status: TestStatus) => {
     _setTestStatus(status);
@@ -221,21 +230,71 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
     setExtraEnv({ ...extraEnv, [key]: '' });
   };
 
+  const discoverHighestModels = useCallback(async (): Promise<ModelMapping[] | null> => {
+    if (!apiKey && (!provider.credentialState || provider.credentialState === 'missing')) {
+      setDiscoveryStatus('failed');
+      setDiscoveryMessage(t('provider.testNoKey'));
+      return null;
+    }
+
+    setDiscoveryStatus('discovering');
+    setDiscoveryMessage('');
+    try {
+      const modelIds = await bridge.discoverProviderModels(
+        baseUrl,
+        apiFormat,
+        apiKey || undefined,
+        proxyUrl || undefined,
+        provider.id,
+        provider.authScheme,
+      );
+      const discovered = selectHighestClaudeModels(modelIds);
+      const foundTiers = CLAUDE_MODEL_TIERS.filter((tier) => discovered[tier]);
+      if (foundTiers.length === 0) {
+        setDiscoveryStatus('failed');
+        setDiscoveryMessage(t('provider.modelDiscoveryNoClaude'));
+        return null;
+      }
+
+      const persistedMappings = useProviderStore.getState().providers
+        .find((candidate) => candidate.id === provider.id)?.modelMappings ?? mappings;
+      const updated = mergeDiscoveredClaudeMappings(persistedMappings, discovered);
+      setMappings(updated);
+      setContextInputs((current) => {
+        const next = { ...current };
+        for (const tier of foundTiers) next[tier] = '';
+        return next;
+      });
+      updateProvider(provider.id, { modelMappings: updated });
+      await flushSave();
+      setDiscoveryStatus('success');
+      setDiscoveryMessage(foundTiers
+        .map((tier) => `${tier[0].toUpperCase()}${tier.slice(1)}: ${discovered[tier]}`)
+        .join(' · '));
+      return updated;
+    } catch (error) {
+      setDiscoveryStatus('failed');
+      setDiscoveryMessage(`${t('provider.modelDiscoveryFailed')}: ${String(error)}`);
+      return null;
+    }
+  }, [apiFormat, apiKey, baseUrl, flushSave, mappings, provider.authScheme, provider.credentialState, provider.id, proxyUrl, t, updateProvider]);
+
   const handleTestConnection = useCallback(async () => {
     setTestStatus('testing');
     setTestError('');
     setTestTimeMs(null);
     setTestResult(null);
     try {
-      const testModel = getProviderConnectionTestModel(mappings);
-      if (!testModel) {
-        setTestStatus('failed');
-        setTestError(t('provider.testNoModel'));
-        return;
-      }
       if (!apiKey && (!provider.credentialState || provider.credentialState === 'missing')) {
         setTestStatus('failed');
         setTestError(t('provider.testNoKey'));
+        return;
+      }
+      const discoveredMappings = await discoverHighestModels();
+      const testModel = getProviderConnectionTestModel(discoveredMappings ?? mappings);
+      if (!testModel) {
+        setTestStatus('failed');
+        setTestError(t('provider.testNoModel'));
         return;
       }
       const start = Date.now();
@@ -265,7 +324,7 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
       setTestStatus('failed');
       setTestError(String(e));
     }
-  }, [baseUrl, apiFormat, apiKey, mappings, provider.authScheme, provider.credentialState, provider.id, proxyUrl, t]);
+  }, [baseUrl, apiFormat, apiKey, discoverHighestModels, mappings, provider.authScheme, provider.credentialState, provider.id, proxyUrl, t]);
 
   // Auto-trigger test when opened via card test button
   const autoTestDone = useRef(false);
@@ -476,8 +535,27 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
 
       {/* Model Mappings */}
       <div>
-        <label className="text-xs text-text-muted mb-1 block">{t('provider.modelMappings')}</label>
+        <div className="mb-1 flex items-center justify-between gap-3">
+          <label className="text-xs text-text-muted">{t('provider.modelMappings')}</label>
+          <button
+            type="button"
+            onClick={() => { void discoverHighestModels(); }}
+            disabled={!baseUrl || discoveryStatus === 'discovering' || testStatus === 'testing'}
+            className="shrink-0 text-xs text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {discoveryStatus === 'discovering'
+              ? t('provider.modelDiscoveryRunning')
+              : t('provider.modelDiscoveryAction')}
+          </button>
+        </div>
         <p className="text-xs text-text-tertiary mb-1.5">{t('provider.modelMappingsHint')}</p>
+        {discoveryMessage && (
+          <p className={`mb-1.5 break-words text-xs ${
+            discoveryStatus === 'success' ? 'text-green-500' : 'text-amber-400'
+          }`}>
+            {discoveryMessage}
+          </p>
+        )}
         <div className="space-y-1.5">
           {MODEL_TIERS.map(({ tier, labelKey, placeholderKey }, index) => {
             const officialContextWindow = getOfficialContextWindow(getMapping(tier));
@@ -486,11 +564,11 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
               <span className="text-xs text-text-muted w-14 shrink-0">
                 {provider.preset === 'anthropic' ? t(labelKey) : `${t('provider.modelChoice')} ${index + 1}`}
               </span>
-              <input className={INPUT_CLASS}
+              <input className={`flex-1 min-w-0 ${INPUT_BASE_CLASS}`}
                 value={getMapping(tier)}
                 onChange={(e) => updateMapping(tier, e.target.value)}
                 placeholder={t(placeholderKey)} />
-              <input className={`${INPUT_CLASS} w-28 shrink-0`}
+              <input className={`w-32 shrink-0 ${INPUT_BASE_CLASS}`}
                 value={officialContextWindow ? String(officialContextWindow) : getContextWindow(tier)}
                 inputMode="decimal"
                 disabled={officialContextWindow !== undefined}
@@ -511,7 +589,7 @@ export function ProviderForm({ provider, onClose, onDelete, autoTest, onTestStat
                 value={m.providerModel}
                 onChange={(e) => updateExtraModel(m.tier, e.target.value)}
                 placeholder={t('provider.extraModelPlaceholder')} />
-              <input className={`${INPUT_CLASS} w-28 shrink-0`}
+              <input className={`w-32 shrink-0 ${INPUT_BASE_CLASS}`}
                 value={officialContextWindow ? String(officialContextWindow) : getContextWindow(m.tier)}
                 inputMode="decimal"
                 disabled={officialContextWindow !== undefined}

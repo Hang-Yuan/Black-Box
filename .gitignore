@@ -40,6 +40,7 @@ src-tauri/target/
 
 # Release artifacts (local build outputs — not tracked)
 release-artifacts/
+.install-backups/
 
 # Environment / secrets
 .env

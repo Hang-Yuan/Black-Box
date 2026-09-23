@@ -53,11 +53,18 @@ describe('compact switch geometry', () => {
 
 describe('markdown code block wrapping', () => {
   const markdown = source('components/shared/MarkdownRenderer.tsx');
+  const bubble = source('components/chat/MessageBubble.tsx');
+  const chat = source('components/chat/ChatPanel.tsx');
 
   it('soft-wraps long fenced-code lines instead of requiring horizontal scrolling', () => {
     expect(markdown).toContain('min-w-0 max-w-full overflow-x-hidden');
     expect(markdown).toContain('whitespace-pre-wrap break-words [overflow-wrap:anywhere]');
     expect(markdown).not.toContain('border border-border-subtle overflow-x-auto">\n            {children}');
+  });
+
+  it('resolves relative assistant file links from the message-time cwd', () => {
+    expect(bubble).toContain('basePath={message.cwd || basePath}');
+    expect(chat).toContain('basePath={sessionMeta.cwdSnapshot}');
   });
 });
 

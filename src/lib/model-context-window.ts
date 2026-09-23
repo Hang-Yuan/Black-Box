@@ -21,7 +21,7 @@ export function getOfficialClaudeContextWindow(modelId: string): number | undefi
 
   // Claude 5 frontier models use a 1M context window. Accept dated and minor
   // aliases such as claude-fable-5-1 without requiring provider-specific data.
-  if (/^claude-(?:fable|opus|sonnet)-5(?:-|$)/u.test(model)) {
+  if (/^claude-(?:fable|opus|sonnet)-5(?:(?:-|\.)\d+)?(?:-|$)/u.test(model)) {
     return CLAUDE_EXTENDED_CONTEXT_WINDOW;
   }
 

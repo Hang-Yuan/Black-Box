@@ -185,6 +185,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     return {
       sessions: [draft, ...state.sessions],
       selectedSessionId: id,
+      previousSessionId: state.selectedSessionId !== id
+        ? state.selectedSessionId
+        : state.previousSessionId,
     };
   }),
 

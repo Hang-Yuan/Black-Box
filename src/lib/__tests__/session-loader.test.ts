@@ -5,6 +5,27 @@ import { __streamThinkingTesting } from '../../hooks/useStreamProcessor';
 import { buildInterruptedContinuationPrompt } from '../interrupted-continuation';
 
 describe('session-loader tool result recovery', () => {
+  it('preserves the emitting cwd for relative file links after disk hydration', () => {
+    const cwd = '/Users/test/project/streams/08-l3-cells-draft';
+    const loaded = parseSessionMessages([{
+      type: 'assistant',
+      uuid: 'answer-with-file',
+      cwd,
+      timestamp: 10,
+      message: {
+        id: 'answer-with-file',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Open `q-01-questionnaire.xlsx`.' }],
+      },
+    }]);
+
+    expect(loaded.messages[0]).toMatchObject({
+      role: 'assistant',
+      cwd,
+      content: 'Open `q-01-questionnaire.xlsx`.',
+    });
+  });
+
   it('keeps a completed answer and its reading anchor when a stale prefix arrives after final', () => {
     const loaded = parseSessionMessages([
       { type: 'assistant', uuid: 'final', timestamp: 10, message: {
@@ -53,6 +74,48 @@ describe('session-loader tool result recovery', () => {
     expect(loaded.messages[0].checkpointUuid).toBeUndefined();
   });
 
+  it('hides Black Box recovery control traffic from the conversation', () => {
+    const recovery = 'Continue the unfinished task from the current durable session. The previous turn returned without a user-visible final response. Do not repeat completed work. Inspect the latest tool results and durable receipts, finish the pending steps, and end with a concise user-visible result.';
+    const loaded = parseSessionMessages([
+      {
+        type: 'attachment',
+        uuid: 'internal-recovery-attachment',
+        attachment: {
+          type: 'queued_command',
+          commandMode: 'prompt',
+          prompt: recovery,
+          timestamp: 10,
+        },
+      },
+      {
+        type: 'user',
+        uuid: 'internal-recovery-user',
+        timestamp: 11,
+        message: { role: 'user', content: recovery },
+      },
+    ]);
+    expect(loaded.messages).toEqual([]);
+  });
+
+  it('marks provider API errors without treating them as lead finals', () => {
+    const loaded = parseSessionMessages([{
+      type: 'assistant',
+      uuid: 'provider-error',
+      timestamp: 20,
+      isApiErrorMessage: true,
+      error: 'server_error',
+      message: {
+        id: 'provider-error',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'API Error: Connection refused' }],
+      },
+    }]);
+    expect(loaded.messages[0]).toMatchObject({
+      isApiErrorMessage: true,
+      isFinalResponse: false,
+    });
+  });
+
   it('restores replayed user UUIDs as native file-checkpoint keys', () => {
     const uuid = '11111111-1111-4111-8111-111111111111';
     const loaded = parseSessionMessages([{
@@ -68,6 +131,39 @@ describe('session-loader tool result recovery', () => {
       role: 'user',
       content: 'restore me',
     });
+  });
+
+  it('keeps image detail crops as attachments without rendering the crop instruction as a file', () => {
+    const loaded = parseSessionMessages([{
+      type: 'user',
+      uuid: 'image-prompt',
+      timestamp: '2026-09-20T09:17:10.365Z',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: [
+            '继续企业大脑的开发。看一下天璇那边的情况。',
+            '',
+            '[附加的文件]',
+            '/workspace/.blackbox/tmp/image_17898958180320.png',
+            'Read the original for layout. For small text, read only the relevant original-resolution detail crops (source x/y coordinates in filenames):',
+            '/workspace/.blackbox/tmp/image-detail-1-x0-y0_17898958180671.png',
+            '/workspace/.blackbox/tmp/image-detail-2-x960-y0_17898958180792.png',
+          ].join('\n'),
+        }],
+      },
+    }]);
+
+    expect(loaded.messages[0]).toMatchObject({
+      id: 'image-prompt',
+      content: '继续企业大脑的开发。看一下天璇那边的情况。',
+    });
+    expect(loaded.messages[0].attachments?.map((attachment) => attachment.name)).toEqual([
+      'image_17898958180320.png',
+      'image-detail-1-x0-y0_17898958180671.png',
+      'image-detail-2-x960-y0_17898958180792.png',
+    ]);
   });
 
   it('projects only user-authored text from interrupted continuation payloads', () => {

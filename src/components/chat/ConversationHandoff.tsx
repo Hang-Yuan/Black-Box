@@ -7,6 +7,7 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useProviderStore } from '../../stores/providerStore';
 import { useAgentStore } from '../../stores/agentStore';
+import { switchConversationFileState } from '../../stores/fileStore';
 import { inheritContinuationRuntimePreference } from '../../lib/conversation-runtime-preferences';
 
 export function ConversationHandoff({ sourceId, model }: { sourceId: string; model: string }) {
@@ -90,6 +91,7 @@ export function ConversationHandoff({ sourceId, model }: { sourceId: string; mod
       // Preserve the source composer and attachments; a new draft owns its input.
       chat.saveToCache(sourceId); chat.ensureTab(id); chat.setInputDraft(id, text);
       useSessionStore.getState().addContinuationDraft(id, generated.sourceCwd, sourceId, t('conv.newChat'));
+      switchConversationFileState(sourceId, id);
       useAgentStore.getState().clearAgents();
     } catch (err) {
       if (alive.current) { showError(err); setPhase('ready'); }

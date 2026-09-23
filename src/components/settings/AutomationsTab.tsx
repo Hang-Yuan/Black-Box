@@ -74,6 +74,12 @@ function runStatusPresentation(status: string, t: (key: string) => string) {
         className: 'bg-success/15 text-success',
         dotClassName: 'bg-success',
       };
+    case 'RESOLVED':
+      return {
+        label: t('automations.status.resolved'),
+        className: 'bg-success/15 text-success',
+        dotClassName: 'bg-success',
+      };
     case 'NEEDS_ATTENTION':
       return {
         label: t('automations.status.needsAttention'),
@@ -114,7 +120,7 @@ function runStatusPresentation(status: string, t: (key: string) => string) {
 }
 
 function isUnreadAutomationResult(run: AutomationRun): boolean {
-  return !run.readAt && ['SUCCEEDED', 'NEEDS_ATTENTION', 'FAILED', 'RECOVERED', 'PENDING_REVIEW']
+  return !run.readAt && ['SUCCEEDED', 'NEEDS_ATTENTION', 'RESOLVED', 'FAILED', 'RECOVERED', 'PENDING_REVIEW']
     .includes(run.status.toUpperCase());
 }
 
@@ -201,6 +207,7 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
   const [worktreeActionRunId, setWorktreeActionRunId] = useState<string | null>(null);
   const [continuingRunId, setContinuingRunId] = useState<string | null>(null);
   const [retryingRunId, setRetryingRunId] = useState<string | null>(null);
+  const [resolvingRunId, setResolvingRunId] = useState<string | null>(null);
   const [branchEditor, setBranchEditor] = useState<{ runId: string; name: string } | null>(null);
   const [worktreeReviews, setWorktreeReviews] = useState<Record<string, {
     loading: boolean;
@@ -270,6 +277,20 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
       setError(String(reason));
     }
   }, [load]);
+
+  const resolveAttention = useCallback(async (run: AutomationRun) => {
+    if (resolvingRunId || !window.confirm(t('automations.resolveConfirm'))) return;
+    setResolvingRunId(run.runId);
+    setError('');
+    try {
+      await bridge.resolveAutomationAttention(run.runId);
+      await load();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setResolvingRunId(null);
+    }
+  }, [load, resolvingRunId, t]);
 
   useEffect(() => {
     load();
@@ -1074,6 +1095,29 @@ export function AutomationsTab({ standalone = false, onClose }: AutomationsTabPr
                   {t('automations.recoveredDetail').replace(
                     '{time}',
                     run.recoveredAt ? formatTime(run.recoveredAt, locale) : '—',
+                  )}
+                </div>
+              )}
+              {run.status === 'NEEDS_ATTENTION' && (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-warning/25 bg-warning/5 px-3 py-2">
+                  <p className="text-[10px] leading-4 text-text-muted">{t('automations.resolveHint')}</p>
+                  <button
+                    type="button"
+                    disabled={resolvingRunId === run.runId}
+                    onClick={() => { void resolveAttention(run); }}
+                    className="shrink-0 rounded-md bg-success px-2.5 py-1 text-[10px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-50"
+                  >
+                    {resolvingRunId === run.runId
+                      ? t('automations.resolving')
+                      : t('automations.markResolved')}
+                  </button>
+                </div>
+              )}
+              {run.status === 'RESOLVED' && (
+                <div className="mt-3 rounded-md border border-success/20 bg-success/5 px-3 py-2 text-[10px] text-text-muted">
+                  {t('automations.resolvedDetail').replace(
+                    '{time}',
+                    run.attentionResolvedAt ? formatTime(run.attentionResolvedAt, locale) : '—',
                   )}
                 </div>
               )}

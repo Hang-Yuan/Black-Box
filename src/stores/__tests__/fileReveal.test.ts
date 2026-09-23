@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  ancestorResolutionBases,
   classifyPathToken,
   computeRevealExpansions,
   findBestWorkspaceSearchMatch,
@@ -25,6 +26,21 @@ describe('normalizePath', () => {
   });
   it('根斜杠保留', () => {
     expect(normalizePath('/')).toBe('/');
+  });
+});
+
+describe('ancestorResolutionBases', () => {
+  it('从消息 cwd 逐级回溯到工作区边界', () => {
+    expect(ancestorResolutionBases(
+      '/workspace/Dev/enterprise-brain-v1/runs/20260920-c-repair',
+      '/workspace',
+    )).toEqual([
+      '/workspace/Dev/enterprise-brain-v1/runs/20260920-c-repair',
+      '/workspace/Dev/enterprise-brain-v1/runs',
+      '/workspace/Dev/enterprise-brain-v1',
+      '/workspace/Dev',
+      '/workspace',
+    ]);
   });
 });
 
@@ -335,6 +351,22 @@ describe('全工作区裸文件名恢复', () => {
       { name: 'README.md', path: '/root/b/README.md', relative_dir: 'b', is_dir: false },
     ], '/root/README.md', 'file')).toBe(null);
     expect(findBestWorkspaceSearchMatch(matches, '/root/00.memory_agent.md', 'folder')).toBe(null);
+  });
+
+  it('多段路径没有目录后缀重合时拒绝打开同名无关文件', () => {
+    expect(findBestWorkspaceSearchMatch([
+      { name: 'RESULT.md', path: '/root/unrelated/RESULT.md', relative_dir: 'unrelated', is_dir: false },
+    ], '/root/runs/20260920-gates/RESULT.md', 'file')).toBe(null);
+
+    expect(findBestWorkspaceSearchMatch([
+      {
+        name: 'RESULT.md',
+        path: '/root/project/runs/20260920-gates/RESULT.md',
+        relative_dir: 'project/runs/20260920-gates',
+        is_dir: false,
+      },
+    ], '/old/project/runs/20260920-gates/RESULT.md', 'file')?.path)
+      .toBe('/root/project/runs/20260920-gates/RESULT.md');
   });
 });
 

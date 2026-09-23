@@ -27,6 +27,46 @@ export const EMPTY_TERMINAL_RECOVERY_PROMPT = [
   'finish the pending steps, and end with a concise user-visible result.',
 ].join(' ');
 
+const INTERNAL_RUNNER_RECOVERY_PREFIX = 'Continue from where you left off.';
+
+/**
+ * Claude Code emits this synthetic user turn when its internal runner is
+ * replaced after an unexpected exit. It is runtime control traffic, not a
+ * message authored by the user.
+ */
+export function isInternalRunnerRecoveryPrompt(value: unknown): boolean {
+  return typeof value === 'string'
+    && value.trimStart().startsWith(INTERNAL_RUNNER_RECOVERY_PREFIX);
+}
+
+/** Black Box recovery control traffic must never be projected as a user turn. */
+export function isInternalRecoveryPrompt(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim();
+  return normalized === EMPTY_TERMINAL_RECOVERY_PROMPT
+    || isInternalRunnerRecoveryPrompt(normalized);
+}
+
+export interface InternalRunnerRecoveryState {
+  activeTurnInput?: string;
+  contextRecoveryAttempts?: number;
+}
+
+/** Preserve an existing retry budget and seed one when the runner restarts
+ * after the user turn has already been cleared from live metadata. */
+export function projectInternalRunnerRecovery(
+  state: InternalRunnerRecoveryState,
+) {
+  return {
+    activeTurnInput: state.activeTurnInput?.trim()
+      ? state.activeTurnInput
+      : EMPTY_TERMINAL_RECOVERY_PROMPT,
+    contextRecoveryAttempts: state.contextRecoveryAttempts ?? 0,
+    awaitingVisibleAssistantResponse: true as const,
+    recoveryPhase: 'resuming' as const,
+  };
+}
+
 export type EmptyTerminalRecoveryAction =
   | 'none'
   | 'retry'
@@ -42,6 +82,7 @@ export interface EmptyTerminalRecoveryCandidate {
   stdinAvailable?: boolean;
   pendingCommand?: boolean;
   recoveryCompactPending?: boolean;
+  activeBackgroundAgent?: boolean;
 }
 
 const GENERIC_GREETING_RESPONSES = new Set([
@@ -143,6 +184,7 @@ export function decideEmptyTerminalRecovery(
     || !candidate.awaitingVisibleAssistantResponse
     || candidate.resultAddsVisibleText
     || candidate.pendingCommand
+    || candidate.activeBackgroundAgent
   ) {
     return 'none';
   }

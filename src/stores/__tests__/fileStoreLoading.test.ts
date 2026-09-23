@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const bridgeMock = vi.hoisted(() => ({
   readFileTree: vi.fn(),
+  getFileSize: vi.fn(),
+  readFileContent: vi.fn(),
+  searchFileTree: vi.fn(),
 }));
 
 vi.mock('../../lib/tauri-bridge', () => ({ bridge: bridgeMock }));
@@ -59,6 +62,34 @@ describe('file tree bounded loading', () => {
     });
   });
 
+  it('keeps a hydrated tree visible when the same file panel remounts', async () => {
+    const loadedFolder = {
+      name: 'Dev',
+      path: '/workspace/Dev',
+      is_dir: true,
+      children: [{ name: 'note.md', path: '/workspace/Dev/note.md', is_dir: false, children: null }],
+      children_truncated: false,
+    };
+    useFileStore.setState({ rootPath: '/workspace', tree: [loadedFolder] });
+    const read = deferred<Array<{ name: string; path: string; is_dir: boolean; children: never[]; children_truncated: boolean }>>();
+    bridgeMock.readFileTree.mockReturnValue(read.promise);
+
+    const loading = useFileStore.getState().loadTree('/workspace');
+    expect(useFileStore.getState().isLoading).toBe(false);
+    expect(useFileStore.getState().tree[0]).toBe(loadedFolder);
+
+    read.resolve([{
+      name: 'Dev',
+      path: '/workspace/Dev',
+      is_dir: true,
+      children: [],
+      children_truncated: true,
+    }]);
+    await loading;
+
+    expect(useFileStore.getState().tree[0]).toBe(loadedFolder);
+  });
+
   it('discards a late tree result after the root changes', async () => {
     const first = deferred<Array<{ name: string; path: string; is_dir: boolean }>>();
     const second = deferred<Array<{ name: string; path: string; is_dir: boolean }>>();
@@ -77,5 +108,66 @@ describe('file tree bounded loading', () => {
     expect(useFileStore.getState().tree).toEqual([
       { name: 'current', path: '/second/current', is_dir: false },
     ]);
+  });
+
+  it('refreshes only the visible parent affected by a structural event', async () => {
+    const nestedFile = { name: 'old.md', path: '/workspace/Dev/old.md', is_dir: false, children: null };
+    useFileStore.setState({
+      rootPath: '/workspace',
+      tree: [{
+        name: 'Dev',
+        path: '/workspace/Dev',
+        is_dir: true,
+        children: [nestedFile],
+        children_truncated: false,
+      }],
+    });
+    const added = { name: 'new.md', path: '/workspace/Dev/new.md', is_dir: false, children: null };
+    bridgeMock.readFileTree.mockResolvedValue([nestedFile, added]);
+
+    await useFileStore.getState().refreshChangedPaths(['/workspace/Dev/new.md']);
+
+    expect(bridgeMock.readFileTree).toHaveBeenCalledWith('/workspace/Dev', 0);
+    expect(useFileStore.getState().tree[0].children).toEqual([nestedFile, added]);
+    expect(useFileStore.getState().loadingFolders.size).toBe(0);
+  });
+
+  it('does not scan an unexpanded parent after a structural event', async () => {
+    useFileStore.setState({
+      rootPath: '/workspace',
+      tree: [{
+        name: 'Dev',
+        path: '/workspace/Dev',
+        is_dir: true,
+        children: [],
+        children_truncated: true,
+      }],
+    });
+
+    await useFileStore.getState().refreshChangedPaths(['/workspace/Dev/new.md']);
+
+    expect(bridgeMock.readFileTree).not.toHaveBeenCalled();
+  });
+
+  it('opens an exact cwd-resolved file without a workspace-wide search', async () => {
+    bridgeMock.readFileTree.mockResolvedValue([]);
+    bridgeMock.getFileSize.mockResolvedValue(4096);
+    bridgeMock.readFileContent.mockRejectedValue(new Error('binary file'));
+
+    const opened = await useFileStore.getState().openFileReference({
+      raw: 'q-01-袁黎明问卷.xlsx',
+      displayPath: 'q-01-袁黎明问卷.xlsx',
+      path: '/workspace/streams/08-l3-cells-draft/q-01-袁黎明问卷.xlsx',
+      kind: 'file',
+    }, '/workspace');
+
+    expect(opened).toBe(true);
+    expect(bridgeMock.getFileSize).toHaveBeenCalledWith(
+      '/workspace/streams/08-l3-cells-draft/q-01-袁黎明问卷.xlsx',
+    );
+    expect(bridgeMock.searchFileTree).not.toHaveBeenCalled();
+    expect(useFileStore.getState().selectedFile).toBe(
+      '/workspace/streams/08-l3-cells-draft/q-01-袁黎明问卷.xlsx',
+    );
   });
 });

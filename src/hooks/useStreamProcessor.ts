@@ -17,6 +17,7 @@ import {
   registerCachedTeamTask,
   resolveCachedTeamTask,
   updateCachedTeamTask,
+  isAgentActive,
 } from '../stores/agentStore';
 import type { AgentNode, TeamTask } from '../stores/agentStore';
 import { runtimeInventoryFromMessage, useCommandStore } from '../stores/commandStore';
@@ -35,6 +36,8 @@ import {
   EMPTY_TERMINAL_RECOVERY_PROMPT,
   isGenericContextGreeting,
   isGreetingOnlyPrompt,
+  isInternalRunnerRecoveryPrompt,
+  projectInternalRunnerRecovery,
   shouldRetryContextDrop,
 } from '../lib/context-recovery';
 import {
@@ -67,6 +70,15 @@ import {
   parseAsyncAgentLaunch,
   type AsyncAgentLaunch,
 } from '../lib/agent-lifecycle';
+import { applyNativeGoalAttachment, settleNativeGoal } from '../lib/native-goal';
+import { isHumanPromptStreamEvent, preferMessageCwd } from '../lib/message-cwd';
+import { scheduleTerminalTranscriptReconciliation } from '../lib/live-transcript-sync';
+
+function resolvedStreamMessageCwd(tabId: string, msg: any): string | undefined {
+  const meta = useChatStore.getState().getTab(tabId)?.sessionMeta;
+  const incoming = typeof msg?.cwd === 'string' ? msg.cwd : undefined;
+  return preferMessageCwd(meta?.turnCwd ?? meta?.cwdSnapshot, incoming);
+}
 
 function syncNativeTaskPlan(tabId: string, tasks: Iterable<TeamTask>): void {
   const items = Array.from(tasks)
@@ -283,9 +295,18 @@ export function applyLateAssistantSupplement(tabId: string, msg: any): void {
     if (!content.trim() || isCliPlaceholder(block.text)) continue;
     const id = `${messageId}_text_${index}`;
     const existing = store.getTab(tabId)?.messages.find((item) => item.id === id);
-    if (existing?.isFinalResponse && existing.content.startsWith(content)) continue;
+    const cwd = resolvedStreamMessageCwd(tabId, msg);
+    if (existing?.isFinalResponse && existing.content.startsWith(content)) {
+      const repairedCwd = preferMessageCwd(existing.cwd, cwd);
+      if (repairedCwd && repairedCwd !== existing.cwd) {
+        store.updateMessage(tabId, id, { cwd: repairedCwd });
+      }
+      continue;
+    }
     store.addMessage(tabId, { id, role: 'assistant', type: 'text', content,
-      isFinalResponse: msg.message?.stop_reason === 'end_turn', timestamp: existing?.timestamp ?? Date.now() });
+      isFinalResponse: msg.message?.stop_reason === 'end_turn',
+      timestamp: existing?.timestamp ?? Date.now(),
+      cwd });
   }
 }
 
@@ -390,6 +411,13 @@ function handleEmptyTerminalRecoveryResult({
   const store = useChatStore.getState();
   const tab = store.getTab(tabId);
   const meta = tab?.sessionMeta ?? {};
+  const selected = useSessionStore.getState().selectedSessionId === tabId;
+  const trackedAgents = selected
+    ? useAgentStore.getState().agents
+    : useAgentStore.getState().agentCache.get(tabId) ?? new Map();
+  const activeBackgroundAgent = Array.from(trackedAgents.values()).some(
+    (agent) => !agent.isMain && agent.background && isAgentActive(agent),
+  );
   const safeResult = resultDisplayText.trim();
   const resultAddsVisibleText = Boolean(
     safeResult
@@ -409,6 +437,7 @@ function handleEmptyTerminalRecoveryResult({
     stdinAvailable: Boolean(stdinId),
     pendingCommand: Boolean(meta.pendingCommandMsgId),
     recoveryCompactPending: meta.emptyTerminalRecoveryAfterCompact,
+    activeBackgroundAgent,
   });
   if (action === 'none') return false;
 
@@ -1315,7 +1344,18 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
     const now = Date.now();
     const last = lastProgressWriteRef.current[tabId] ?? 0;
     const tab = useChatStore.getState().getTab(tabId);
+    const incomingCwd = !msg.parent_tool_use_id && typeof msg.cwd === 'string' && msg.cwd.trim()
+      ? msg.cwd
+      : undefined;
+    const turnCwd = incomingCwd
+      ? (isHumanPromptStreamEvent(msg)
+        ? incomingCwd
+        : preferMessageCwd(tab?.sessionMeta.turnCwd ?? tab?.sessionMeta.cwdSnapshot, incomingCwd))
+      : tab?.sessionMeta.turnCwd;
     const execution = projectExecutionEvent(tab?.sessionMeta ?? {}, msg);
+    if (turnCwd !== tab?.sessionMeta.turnCwd) {
+      useChatStore.getState().setSessionMeta(tabId, { turnCwd });
+    }
     if (execution.duplicate) return false;
     useChatStore.getState().setSessionMeta(tabId, execution.next);
     if (!execution.progress && msg.type === 'assistant' && msg.__executionId) {
@@ -1658,9 +1698,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           // The lead conversation waits for the main agent's synthesis.
           break;
         }
+        const bgApiErrorMessage = msg.isApiErrorMessage === true;
         store.setSessionMeta(tabId, {
-          awaitingVisibleAssistantResponse:
-            !assistantContentHasVisibleTerminalResponse(content),
+          awaitingVisibleAssistantResponse: bgApiErrorMessage
+            || !assistantContentHasVisibleTerminalResponse(content),
         });
         const bgBufferedThinking = bgStdinId
           ? streamController.peekBufferedThinking(bgStdinId)
@@ -1716,9 +1757,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               id: textId,
               role: 'assistant', type: 'text',
               content: displayText,
-              isFinalResponse: msg.message?.stop_reason === 'end_turn',
+              isFinalResponse: !bgApiErrorMessage
+                && msg.message?.stop_reason === 'end_turn',
+              isApiErrorMessage: bgApiErrorMessage,
               subAgentDepth: bgAgentDepth,
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
             updateCachedAgentPhase(tabId, bgAgentId, 'writing');
           } else if (block.type === 'tool_use') {
@@ -1870,8 +1914,27 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
         break;
       }
+      case 'attachment': {
+        const currentGoal = useChatStore.getState().getTab(tabId)?.sessionMeta.nativeGoal;
+        const nativeGoal = applyNativeGoalAttachment(currentGoal, msg.attachment, msg.timestamp);
+        if (nativeGoal !== currentGoal) store.setSessionMeta(tabId, { nativeGoal });
+        break;
+      }
+
       case 'user':
       case 'human': {
+        const bgStreamedUserText = messageTextContent(msg);
+        const bgInternalRunnerRecovery = isInternalRunnerRecoveryPrompt(bgStreamedUserText);
+        if (bgInternalRunnerRecovery) {
+          const currentMeta = store.getTab(tabId)?.sessionMeta ?? {};
+          store.setSessionMeta(tabId, {
+            ...projectInternalRunnerRecovery(currentMeta),
+            turnStartTime: currentMeta.turnStartTime ?? Date.now(),
+            lastProgressAt: Date.now(),
+          });
+          store.setSessionStatus(tabId, 'reconnecting');
+          store.setActivityStatus(tabId, { phase: 'reconnecting' });
+        }
         const bgLaunch = parseAsyncAgentLaunch(msg);
         if (bgLaunch) {
           const bgAgents = useAgentStore.getState().agentCache.get(tabId) ?? new Map();
@@ -2099,6 +2162,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               content: '检测到会话上下文未载入，自动重试失败。原消息已放回输入框。',
               commandType: 'error',
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
           });
           break;
@@ -2124,6 +2188,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           } : undefined,
         });
         store.setSessionStatus(tabId, msg.subtype === 'success' ? 'completed' : 'error');
+        scheduleTerminalTranscriptReconciliation(tabId);
         settleCachedTurn(
           tabId,
           msg.subtype !== 'success',
@@ -2168,6 +2233,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               content: bgResultDisplayText,
               isFinalResponse: true,
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
           }
         }
@@ -2652,6 +2718,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               toolInput: {},
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
           }
         }
@@ -2751,6 +2818,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               planContent: planContent,
               resolved: false,
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
             setActivityStatus({ phase: 'awaiting' });
           }
@@ -2906,9 +2974,10 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           break;
         }
 
+        const apiErrorMessage = msg.isApiErrorMessage === true;
         setSessionMeta({
-          awaitingVisibleAssistantResponse:
-            !assistantContentHasVisibleTerminalResponse(content),
+          awaitingVisibleAssistantResponse: apiErrorMessage
+            || !assistantContentHasVisibleTerminalResponse(content),
         });
 
         // With --include-partial-messages, intermediate assistant messages arrive
@@ -3001,9 +3070,12 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               role: 'assistant',
               type: 'text',
               content: displayText,
-              isFinalResponse: msg.message?.stop_reason === 'end_turn',
+              isFinalResponse: !apiErrorMessage
+                && msg.message?.stop_reason === 'end_turn',
+              isApiErrorMessage: apiErrorMessage,
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
           } else if (block.type === 'tool_use') {
             // Code mode: EnterPlanMode/ExitPlanMode are transparent — CLI handles internally.
@@ -3207,8 +3279,27 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
 
+      case 'attachment': {
+        const currentGoal = useChatStore.getState().getTab(tabId)?.sessionMeta.nativeGoal;
+        const nativeGoal = applyNativeGoalAttachment(currentGoal, msg.attachment, msg.timestamp);
+        if (nativeGoal !== currentGoal) setSessionMeta({ nativeGoal });
+        break;
+      }
+
       case 'user':
       case 'human': {
+        const streamedUserText = messageTextContent(msg);
+        const internalRunnerRecovery = isInternalRunnerRecoveryPrompt(streamedUserText);
+        if (internalRunnerRecovery) {
+          const currentMeta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
+          setSessionMeta({
+            ...projectInternalRunnerRecovery(currentMeta),
+            turnStartTime: currentMeta.turnStartTime ?? Date.now(),
+            lastProgressAt: Date.now(),
+          });
+          setSessionStatus('reconnecting');
+          setActivityStatus({ phase: 'reconnecting' });
+        }
         // Store CLI checkpoint UUID on the most recent user message (for rewind).
         // Only store from genuine user-input messages, NOT tool-result messages.
         // Tool-result user messages have content with tool_result blocks and their
@@ -3217,12 +3308,15 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const content = msg.message?.content;
           const isToolResult = Array.isArray(content)
             && content.some((b: any) => b.type === 'tool_result');
-          if (msg.uuid && !isToolResult) {
+          if (msg.uuid && !isToolResult && !internalRunnerRecovery) {
             const allMsgs = useChatStore.getState().getTab(tabId)?.messages ?? [];
             for (let i = allMsgs.length - 1; i >= 0; i--) {
               if (allMsgs[i].role === 'user') {
                 console.log('[stream] Storing checkpointUuid:', msg.uuid, 'on msg:', allMsgs[i].id);
-                useChatStore.getState().updateMessage(tabId, allMsgs[i].id, { checkpointUuid: msg.uuid });
+                useChatStore.getState().updateMessage(tabId, allMsgs[i].id, {
+                  checkpointUuid: msg.uuid,
+                  awaitingPersistence: false,
+                });
                 break;
               }
             }
@@ -3710,13 +3804,22 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               isFinalResponse: true,
               subAgentDepth: agentDepth,
               timestamp: Date.now(),
+              cwd: resolvedStreamMessageCwd(tabId, msg),
             });
+          }
+        }
+
+        if (msg.subtype === 'success') {
+          const currentGoal = useChatStore.getState().getTab(tabId)?.sessionMeta.nativeGoal;
+          if (currentGoal?.status === 'active') {
+            setSessionMeta({ nativeGoal: settleNativeGoal(currentGoal, 'achieved') });
           }
         }
 
         setSessionStatus(
           msg.subtype === 'success' ? 'completed' : 'error'
         );
+        scheduleTerminalTranscriptReconciliation(tabId);
 
         // S11 (v3 §4.2): surface a visible error when the turn failed mid-way
         // (e.g. network drop, 500 from provider). Previously this was gated

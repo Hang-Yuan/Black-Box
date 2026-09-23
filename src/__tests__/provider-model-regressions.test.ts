@@ -104,6 +104,26 @@ describe('provider editing regressions', () => {
     expect(parseContextWindowInput('20 bananas')).toBeUndefined();
   });
 
+  it('keeps the editable model name wide while context capacity stays compact', () => {
+    expect(providerForm).toContain('flex-1 min-w-0 ${INPUT_BASE_CLASS}');
+    expect(providerForm).toContain('w-32 shrink-0 ${INPUT_BASE_CLASS}');
+    expect(providerForm).not.toContain('${INPUT_CLASS} w-28 shrink-0');
+  });
+
+  it('refreshes the four Claude tiers from the provider catalogue before testing', () => {
+    expect(providerForm).toContain('bridge.discoverProviderModels(');
+    expect(providerForm).toContain('selectHighestClaudeModels(modelIds)');
+    expect(providerForm).toContain('mergeDiscoveredClaudeMappings(persistedMappings, discovered)');
+    expect(providerForm).toContain("t('provider.modelDiscoveryAction')");
+
+    const discovery = providerForm.indexOf('const discoveredMappings = await discoverHighestModels();');
+    const modelSelection = providerForm.indexOf(
+      'const testModel = getProviderConnectionTestModel(discoveredMappings ?? mappings);',
+    );
+    expect(discovery).toBeGreaterThan(-1);
+    expect(modelSelection).toBeGreaterThan(discovery);
+  });
+
   it('uses the configured proxy in both form and card connection tests', () => {
     expect(providerForm).toContain('proxyUrl || undefined,');
     expect(providerForm).toContain('provider.id,');

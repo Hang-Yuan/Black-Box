@@ -16,6 +16,19 @@ const filePositions = new Map<string, number>();
 const fileTreePositions = new Map<string, number>();
 const panelStates = new Map<string, ConversationPanelState>();
 
+function movePrefixedEntries<T>(
+  entries: Map<string, T>,
+  fromSessionId: string,
+  toSessionId: string,
+): void {
+  const prefix = `${fromSessionId}\u0000`;
+  for (const [key, value] of Array.from(entries.entries())) {
+    if (!key.startsWith(prefix)) continue;
+    entries.set(`${toSessionId}\u0000${key.slice(prefix.length)}`, value);
+    entries.delete(key);
+  }
+}
+
 function filePositionKey(sessionId: string, filePath: string, mode: string): string {
   return `${sessionId}\u0000${filePath}\u0000${mode}`;
 }
@@ -84,6 +97,37 @@ export function loadConversationPanelState(
 ): ConversationPanelState | null {
   const state = panelStates.get(sessionId);
   return state ? { ...state } : null;
+}
+
+/**
+ * A draft_* id is replaced by the CLI's durable session id after the first
+ * accepted turn. View state belongs to the conversation, so the identity
+ * change must rename every key instead of making the promoted conversation
+ * look like an unrelated tab.
+ */
+export function moveConversationViewState(
+  fromSessionId: string,
+  toSessionId: string,
+): void {
+  if (!fromSessionId || !toSessionId || fromSessionId === toSessionId) return;
+
+  const chat = chatPositions.get(fromSessionId);
+  if (chat) chatPositions.set(toSessionId, chat);
+  chatPositions.delete(fromSessionId);
+
+  movePrefixedEntries(filePositions, fromSessionId, toSessionId);
+  movePrefixedEntries(fileTreePositions, fromSessionId, toSessionId);
+
+  const panel = panelStates.get(fromSessionId);
+  if (panel) panelStates.set(toSessionId, panel);
+  panelStates.delete(fromSessionId);
+
+  try {
+    const fromKey = `blackbox:reading:${fromSessionId}`;
+    const stored = sessionStorage.getItem(fromKey);
+    if (stored !== null) sessionStorage.setItem(`blackbox:reading:${toSessionId}`, stored);
+    sessionStorage.removeItem(fromKey);
+  } catch { /* Storage pressure must not break identity promotion. */ }
 }
 
 export function clearConversationViewStateForTests(): void {

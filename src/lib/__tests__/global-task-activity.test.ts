@@ -158,6 +158,11 @@ describe('global task activity', () => {
         running: false, unreadRuns: 1, nextRunAt: 38, lastRunAt: 20, updatedAt: 22,
       },
       {
+        id: 'resolved', title: 'Resolved', definitionStatus: 'ACTIVE',
+        runStatus: 'RESOLVED', scheduleKind: 'cron', activeRunId: null,
+        running: false, unreadRuns: 0, nextRunAt: 39, lastRunAt: 20, updatedAt: 21,
+      },
+      {
         id: 'failed', title: 'Failed', definitionStatus: 'ACTIVE',
         runStatus: 'FAILED', scheduleKind: 'heartbeat', activeRunId: null,
         running: false, unreadRuns: 0, nextRunAt: 40, lastRunAt: 20, updatedAt: 26,
@@ -178,6 +183,7 @@ describe('global task activity', () => {
       succeeded: 'completed',
       legacy: 'completed',
       recovered: 'completed',
+      resolved: 'completed',
     });
   });
 

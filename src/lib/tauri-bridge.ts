@@ -86,6 +86,11 @@ export interface SessionListItem {
   cliResumeId: string | null;
 }
 
+export interface SessionFileRevision {
+  bytes: number;
+  modifiedMs: number;
+}
+
 export interface ConversationRewindResult {
   retainedLines: number;
   removedLines: number;
@@ -662,7 +667,7 @@ export interface AutomationRun {
   runId: string;
   automationId: string;
   sessionId: string | null;
-  status: 'RUNNING' | 'SUCCEEDED' | 'NEEDS_ATTENTION' | 'FAILED' | 'RECOVERED' | 'CANCELLED' | 'ARCHIVED' | 'PENDING_REVIEW';
+  status: 'RUNNING' | 'SUCCEEDED' | 'NEEDS_ATTENTION' | 'RESOLVED' | 'FAILED' | 'RECOVERED' | 'CANCELLED' | 'ARCHIVED' | 'PENDING_REVIEW';
   readAt: number | null;
   title: string;
   summary: string;
@@ -690,6 +695,8 @@ export interface AutomationRun {
   recoveredByRunId: string | null;
   recoveredAt: number | null;
   recoveryEvidence: string | null;
+  attentionResolvedAt: number | null;
+  attentionResolution: string | null;
 }
 
 export interface AutomationWorktreeReview {
@@ -824,6 +831,9 @@ export const bridge = {
     await applyDevLoadDelay();
     return invoke<any[]>('load_session', { path });
   },
+
+  getSessionFileRevision: (path: string) =>
+    invoke<SessionFileRevision>('get_session_file_revision', { path }),
 
   openInVscode: (path: string) =>
     invoke<void>('open_in_vscode', { path }),
@@ -1291,6 +1301,16 @@ export const bridge = {
       proxyUrl: proxyUrl || null,
     }),
 
+  discoverProviderModels: (baseUrl: string, apiFormat: ProviderApiFormat, apiKey: string | undefined, proxyUrl?: string, providerId?: string, authScheme?: ProviderAuthScheme) =>
+    invoke<string[]>('discover_provider_models', {
+      baseUrl,
+      apiFormat,
+      authScheme: authScheme || null,
+      apiKey: apiKey || null,
+      providerId: providerId || null,
+      proxyUrl: proxyUrl || null,
+    }),
+
   // --- Scheduled tasks ---
 
   listAutomations: () =>
@@ -1348,6 +1368,9 @@ export const bridge = {
 
   markAllAutomationRunsRead: () =>
     invoke<number>('mark_all_automation_runs_read'),
+
+  resolveAutomationAttention: (runId: string, resolution = 'user_confirmed') =>
+    invoke<void>('resolve_automation_attention', { runId, resolution }),
 
   archiveAutomationRun: (runId: string, reason = 'user') =>
     invoke<void>('archive_automation_run', { runId, reason }),

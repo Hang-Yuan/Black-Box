@@ -68,6 +68,7 @@ const mockClearPendingMessages = vi.fn();
 const mockSetActivityStatus = vi.fn();
 const mockRemoveMessage = vi.fn();
 const mockSetPendingAttachments = vi.fn();
+let mockTabs = new Map<string, any>();
 
 vi.mock('../stores/chatStore', () => ({
   useChatStore: {
@@ -82,6 +83,7 @@ vi.mock('../stores/chatStore', () => ({
       setActivityStatus: mockSetActivityStatus,
       removeMessage: mockRemoveMessage,
       setPendingAttachments: mockSetPendingAttachments,
+      tabs: mockTabs,
     }),
   },
   generateInterruptedId: (kind: string) => `interrupted_${kind}_${Date.now()}`,
@@ -751,5 +753,49 @@ describe('handleProcessExitFinalize', () => {
 
     expect(mockSetSessionStatus).toHaveBeenCalledWith('tab-1', 'stopped');
     clearFinalized('desk_123');
+  });
+});
+
+describe('session health recovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearFinalized('desk_123');
+    const tab = {
+      tabId: 'tab-1',
+      messages: [{ id: 'user-1', role: 'user', type: 'text', content: 'already sent' }],
+      partialText: '',
+      partialThinking: '',
+      pendingUserMessages: [],
+      pendingAttachments: [],
+      inputDraft: '',
+      sessionMeta: {
+        stdinId: 'desk_123',
+        pendingTurnMessageId: 'user-1',
+        pendingTurnInput: 'already sent',
+      },
+      sessionStatus: 'running',
+    };
+    mockTabs = new Map([['tab-1', tab]]);
+    mockGetTabForStdin.mockReturnValue('tab-1');
+    mockGetTab.mockReturnValue(tab);
+  });
+
+  afterEach(() => {
+    mockTabs = new Map();
+    clearFinalized('desk_123');
+  });
+
+  it('does not put an already-sent turn back into the composer after process loss', () => {
+    const missing = new Map([['desk_123', 1_000]]);
+
+    __sessionLifecycleTesting.inspectSessionHealthSnapshot(new Set(), missing, 16_001);
+
+    expect(mockSetInputDraft).not.toHaveBeenCalledWith('tab-1', 'already sent');
+    expect(mockSetSessionStatus).toHaveBeenCalledWith('tab-1', 'error');
+    expect(mockAddMessage).toHaveBeenCalledWith(
+      'tab-1',
+      expect.objectContaining({ content: expect.stringContaining('会话已保留') }),
+    );
+    expect(missing.has('desk_123')).toBe(false);
   });
 });

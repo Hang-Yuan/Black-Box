@@ -240,7 +240,7 @@ export function getResolvedModelDisplayName(modelId: string): string {
   const withoutContextSuffix = raw.replace(/(?:-1m|\[1m\])$/i, '');
   const normalized = withoutContextSuffix.toLowerCase();
   const match = normalized.match(
-    /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?(?:-\d{8})?$/,
+    /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:[.-](\d+))?(?:-\d{8})?$/,
   );
   if (!match) {
     return `${formatKnownProviderModel(withoutContextSuffix)}${oneMillion ? ' (1M)' : ''}`;

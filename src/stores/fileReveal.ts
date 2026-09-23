@@ -108,6 +108,33 @@ export function dirnamePath(path: string): string {
   return normalized.slice(0, index);
 }
 
+/**
+ * Resolve chat references against the directory where the message was emitted,
+ * then walk upward to the visible workspace boundary. Claude frequently changes
+ * cwd during a long turn while continuing to print project-root-relative paths
+ * such as `runs/...`; the JSONL cwd alone is therefore insufficient.
+ */
+export function ancestorResolutionBases(path: string, boundary?: string): string[] {
+  const start = normalizeFileReferencePath(path);
+  const stop = boundary ? normalizeFileReferencePath(boundary) : '';
+  if (!start || start === '.') return [];
+
+  const bases: string[] = [];
+  let current = start;
+  for (let depth = 0; current && current !== '.' && depth < 16; depth += 1) {
+    bases.push(current);
+    if (stop && current === stop) break;
+    const parent = dirnamePath(current);
+    if (!parent || parent === current || parent === '/') break;
+    if (stop && current.startsWith(`${stop}/`) && !parent.startsWith(`${stop}/`) && parent !== stop) {
+      bases.push(stop);
+      break;
+    }
+    current = parent;
+  }
+  return Array.from(new Set(bases));
+}
+
 /** GitHub-like stable heading id shared by Markdown rendering and anchor navigation. */
 export function slugifyHeading(value: string): string {
   return value
@@ -378,6 +405,11 @@ export function findBestWorkspaceSearchMatch(
 
   const best = ranked[0];
   if (!best) return null;
+  const referencedSegments = normalizePath(referencedPath).split('/').filter(Boolean);
+  // A multi-segment citation may recover after a parent directory moved, but
+  // matching only its basename is unsafe (`runs/x/RESULT.md` must not open an
+  // unrelated RESULT.md elsewhere in the workspace).
+  if (referencedSegments.length > 2 && best.overlap < 2) return null;
   const tied = ranked[1]
     && ranked[1].overlap === best.overlap
     && ranked[1].residue === best.residue

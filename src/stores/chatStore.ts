@@ -5,6 +5,8 @@ import type { ApiRetryStatus } from '../lib/api-retry';
 import type { FileAttachment } from '../hooks/useFileAttachments';
 import { sanitizeAssistantTextForDisplay } from '../lib/presentation-sanitizer';
 import type { PermissionUpdate } from '../lib/permission-suggestions';
+import type { NativeGoalState } from '../lib/native-goal';
+import { preferMessageCwd } from '../lib/message-cwd';
 
 // --- Types ---
 
@@ -65,7 +67,13 @@ export interface ChatMessage {
   /** Native provider terminal boundary for a user-facing lead response.
    *  Progress grouping must never fold a message carrying this receipt. */
   isFinalResponse?: boolean;
+  /** Provider-generated terminal error. It is visible diagnostic text, not a
+   * successful lead answer and must not close the user's turn. */
+  isApiErrorMessage?: boolean;
   timestamp: number;
+  /** Working directory that was authoritative when this message was emitted.
+   *  Relative file references must resolve against this snapshot after reload. */
+  cwd?: string;
   // Interactive message fields
   permissionTool?: string;         // tool requesting permission
   permissionDescription?: string;  // what the tool wants to do
@@ -92,6 +100,8 @@ export interface ChatMessage {
   subAgentDepth?: number;
   // CLI checkpoint UUID for file restoration (from --replay-user-messages)
   checkpointUuid?: string;
+  /** Optimistic user bubble waiting for Claude's durable JSONL UUID. */
+  awaitingPersistence?: boolean;
   /** Guidance injected into the currently running Claude turn through
    * streaming input. It does not start a separate Goal turn. */
   isSteer?: boolean;
@@ -131,6 +141,10 @@ export interface SessionMeta {
   /** Snapshot of the working directory at session spawn time — used by Rewind and
    *  other features that need the original cwd rather than the current global value */
   cwdSnapshot?: string;
+  /** Most specific cwd observed during the current lead turn. Some Claude
+   *  stream envelopes fall back to the session root after tools have entered
+   *  a deeper directory, so final messages resolve files from this value. */
+  turnCwd?: string;
   /** Snapshot of config at session spawn time — used for config-mismatch detection */
   configSnapshot?: {
     model: string;
@@ -219,6 +233,9 @@ export interface SessionMeta {
    *  composer entry point. This is a display signal for the live turn, not a
    *  separate Goal lifecycle or durable Goal state. */
   goalRequestActive?: boolean;
+  /** Projection of Claude Code's transcript-owned `goal_status` attachments.
+   *  Black Box displays this state but never evaluates or advances the Goal. */
+  nativeGoal?: NativeGoalState;
   pendingTurnInput?: string;
   pendingTurnAttachments?: FileAttachment[];
   /** Original text for the active turn. Kept through the result boundary so a
@@ -607,7 +624,12 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         // a complete assistant message that was previously delivered partially.
         const existingIdx = tab.messages.findIndex((m) => m.id === displayMessage.id);
         const messages = existingIdx !== -1
-          ? tab.messages.map((m, i) => i === existingIdx ? { ...m, ...displayMessage, isFinalResponse: m.isFinalResponse || displayMessage.isFinalResponse } : m)
+          ? tab.messages.map((m, i) => i === existingIdx ? {
+            ...m,
+            ...displayMessage,
+            cwd: preferMessageCwd(m.cwd, displayMessage.cwd),
+            isFinalResponse: m.isFinalResponse || displayMessage.isFinalResponse,
+          } : m)
           : [...tab.messages, displayMessage];
         return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
         // NOTE: partialText/isStreaming are NOT cleared here. Clearing is handled
@@ -630,7 +652,12 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     set((state) => {
       const result = updateTab(state.tabs, tabId, (tab) => {
         const messages = tab.messages.map((m) =>
-          m.id === id ? { ...m, ...updates, isFinalResponse: m.isFinalResponse || updates.isFinalResponse } : m,
+          m.id === id ? {
+            ...m,
+            ...updates,
+            cwd: preferMessageCwd(m.cwd, updates.cwd),
+            isFinalResponse: m.isFinalResponse || updates.isFinalResponse,
+          } : m,
         );
         return { ...tab, messages, waitingFor: deriveLiveWaitingFor(tab.sessionStatus, messages) };
       });

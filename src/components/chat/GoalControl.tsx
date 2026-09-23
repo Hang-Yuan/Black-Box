@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useCommandStore } from '../../stores/commandStore';
 import { useT } from '../../lib/i18n';
 import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-popover';
+import type { NativeGoalState } from '../../lib/native-goal';
 
 /**
  * Thin entry point for Claude Code's runtime-owned `/goal` command.
@@ -10,12 +11,12 @@ import { announceHeaderPopover, subscribeHeaderPopover } from '../../lib/header-
  */
 export function GoalControl({
   active = false,
-  running = false,
+  goal,
   disabled = false,
   onSelect,
 }: {
   active?: boolean;
-  running?: boolean;
+  goal?: NativeGoalState;
   disabled?: boolean;
   onSelect: () => void;
 }) {
@@ -28,6 +29,11 @@ export function GoalControl({
   ));
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const running = goal?.status === 'active';
+  const achieved = goal?.status === 'achieved';
+  const goalStatusLabel = goal
+    ? t(goal.status === 'achieved' ? 'goal.status.completed' : `goal.status.${goal.status}`)
+    : t('goal.none');
 
   useEffect(() => {
     if (!open) return;
@@ -54,6 +60,7 @@ export function GoalControl({
         data-testid="goal-button"
         data-active={active ? 'true' : 'false'}
         data-goal-live={running ? 'true' : 'false'}
+        data-goal-status={goal?.status || 'none'}
         data-runtime-available={nativeAvailable ? 'true' : 'false'}
         aria-busy={running}
         onClick={selectMode}
@@ -63,13 +70,17 @@ export function GoalControl({
             ? 'border-accent/40 bg-accent/15 text-accent'
             : running
             ? 'border-accent/25 bg-accent/10 text-accent'
+            : achieved
+            ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-400'
             : 'border-border-subtle text-text-tertiary hover:bg-bg-secondary hover:text-text-primary'
           }`}
         title={nativeAvailable ? t('goal.nativeHint') : t('goal.unavailable')}
       >
         <span className={`h-1.5 w-1.5 rounded-full ${running
           ? 'bg-accent animate-pulse-soft'
-          : active ? 'bg-accent' : 'bg-text-tertiary/40'}`} />
+          : active ? 'bg-accent'
+          : achieved ? 'bg-emerald-400'
+          : 'bg-text-tertiary/40'}`} />
         <span className="blackbox-toolbar-full-label">Goal</span>
         <span className="blackbox-toolbar-compact-label" aria-hidden="true">G</span>
       </button>
@@ -96,10 +107,31 @@ export function GoalControl({
       {open && (
         <div className="absolute right-0 top-full z-50 mt-2 w-[400px] rounded-xl border
           border-border-subtle bg-bg-card p-3 shadow-xl" data-testid="goal-popover">
-          <div className="text-sm font-semibold text-text-primary">{t('goal.create')}</div>
+          <div className="text-sm font-semibold text-text-primary">
+            {goal ? t('goal.current') : t('goal.create')}
+          </div>
           <div data-testid="goal-explainer" className="mt-1 text-xs leading-relaxed text-text-tertiary">
             {nativeAvailable ? t('goal.nativeHint') : t('goal.unavailable')}
           </div>
+          {goal && (
+            <div data-testid="goal-current" className="mt-3 rounded-lg border border-border-subtle bg-bg-secondary p-3">
+              <div className="flex items-center justify-between gap-3 text-[10px]">
+                <span className="text-text-tertiary">{t('goal.statusLabel')}</span>
+                <span className={running ? 'text-accent' : achieved ? 'text-emerald-400' : 'text-text-tertiary'}>
+                  {goalStatusLabel}
+                </span>
+              </div>
+              <div className="mt-2 max-h-28 overflow-y-auto whitespace-pre-wrap text-[11px] leading-relaxed text-text-primary">
+                {goal.condition}
+              </div>
+              {(goal.iterations !== undefined || goal.tokens !== undefined) && (
+                <div className="mt-2 flex gap-3 text-[10px] text-text-tertiary">
+                  {goal.iterations !== undefined && <span>{t('goal.turns')} {goal.iterations}</span>}
+                  {goal.tokens !== undefined && <span>{t('goal.tokens')} {goal.tokens.toLocaleString()}</span>}
+                </div>
+              )}
+            </div>
+          )}
           <button
             type="button"
             data-testid="goal-create-option"

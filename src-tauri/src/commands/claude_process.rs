@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::{oneshot, watch, Mutex};
@@ -43,6 +44,174 @@ pub struct ManagedProcess {
     /// Persistent, multi-subscriber exit signal. The stdout reader publishes
     /// `true` only after draining output and completing authoritative cleanup.
     pub exit_tx: watch::Sender<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct ManagedProcessLedgerEntry {
+    owner_pid: u32,
+    pid: u32,
+    stdin_id: String,
+    cli_session_id: String,
+    generation: String,
+}
+
+static PROCESS_LEDGER_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+fn process_ledger_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".blackbox")
+        .join("managed-cli-processes.json")
+}
+
+fn read_process_ledger(path: &Path) -> Result<Vec<ManagedProcessLedgerEntry>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("Failed to read managed process ledger: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid managed process ledger: {error}"))
+}
+
+fn write_process_ledger(path: &Path, entries: &[ManagedProcessLedgerEntry]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Managed process ledger has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create managed process ledger directory: {error}"))?;
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let encoded = serde_json::to_vec_pretty(entries)
+        .map_err(|error| format!("Failed to encode managed process ledger: {error}"))?;
+    std::fs::write(&temporary, encoded)
+        .map_err(|error| format!("Failed to stage managed process ledger: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Failed to secure managed process ledger: {error}"))?;
+    }
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("Failed to publish managed process ledger: {error}"))
+}
+
+fn update_process_ledger(
+    mutate: impl FnOnce(&mut Vec<ManagedProcessLedgerEntry>),
+) -> Result<(), String> {
+    let _guard = PROCESS_LEDGER_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = process_ledger_path();
+    let mut entries = read_process_ledger(&path)?;
+    mutate(&mut entries);
+    write_process_ledger(&path, &entries)
+}
+
+pub fn register_managed_cli_process(
+    pid: u32,
+    stdin_id: &str,
+    cli_session_id: &str,
+    generation: &str,
+) -> Result<(), String> {
+    update_process_ledger(|entries| {
+        entries.retain(|entry| {
+            entry.pid != pid && entry.stdin_id != stdin_id && entry.cli_session_id != cli_session_id
+        });
+        entries.push(ManagedProcessLedgerEntry {
+            owner_pid: std::process::id(),
+            pid,
+            stdin_id: stdin_id.to_string(),
+            cli_session_id: cli_session_id.to_string(),
+            generation: generation.to_string(),
+        });
+    })
+}
+
+pub fn unregister_managed_cli_process(pid: u32, generation: &str) -> Result<(), String> {
+    update_process_ledger(|entries| {
+        entries.retain(|entry| entry.pid != pid || entry.generation != generation);
+    })
+}
+
+#[cfg(unix)]
+fn process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(unix)]
+fn is_managed_cli_command(command: &str, cli_session_id: &str) -> bool {
+    command.contains("claude")
+        && command.contains("--print")
+        && command.contains("--input-format stream-json")
+        && command.contains("--output-format stream-json")
+        && (command.contains(&format!("--resume {cli_session_id}"))
+            || command.contains(&format!("--session-id {cli_session_id}")))
+}
+
+#[cfg(unix)]
+fn is_live_blackbox_owner(pid: u32) -> bool {
+    process_command(pid).is_some_and(|command| {
+        command.contains("Black Box.app/Contents/MacOS/blackbox") || command.ends_with("/blackbox")
+    })
+}
+
+/// Reap only children recorded by a previous Black Box process whose owner is
+/// gone. This covers macOS termination paths that can bypass the async Tauri
+/// ExitRequested handler without touching unrelated Claude CLI processes.
+pub fn reap_stale_managed_cli_processes() -> Result<Vec<u32>, String> {
+    #[cfg(not(unix))]
+    {
+        return Ok(Vec::new());
+    }
+    #[cfg(unix)]
+    {
+        let _guard = PROCESS_LEDGER_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = process_ledger_path();
+        let entries = read_process_ledger(&path)?;
+        let mut keep = Vec::new();
+        let mut reaped = Vec::new();
+        for entry in entries {
+            if entry.owner_pid == std::process::id() || is_live_blackbox_owner(entry.owner_pid) {
+                keep.push(entry);
+                continue;
+            }
+            let Some(command) = process_command(entry.pid) else {
+                continue;
+            };
+            if !is_managed_cli_command(&command, &entry.cli_session_id) {
+                continue;
+            }
+            unsafe {
+                libc::kill(entry.pid as i32, libc::SIGTERM);
+            }
+            for _ in 0..40 {
+                if process_command(entry.pid).is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if process_command(entry.pid).is_some() {
+                unsafe {
+                    libc::kill(entry.pid as i32, libc::SIGKILL);
+                }
+            }
+            reaped.push(entry.pid);
+        }
+        write_process_ledger(&path, &keep)?;
+        Ok(reaped)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,6 +667,25 @@ mod process_manager_tests {
             },
             kill_rx,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_cli_identity_requires_stream_transport_and_exact_session() {
+        let session = "550e8400-e29b-41d4-a716-446655440000";
+        let managed = format!(
+            "/Users/test/.local/bin/claude --print --input-format stream-json \
+             --output-format stream-json --resume {session} --model claude-opus-5"
+        );
+        assert!(is_managed_cli_command(&managed, session));
+        assert!(!is_managed_cli_command(
+            &managed,
+            "550e8400-e29b-41d4-a716-446655440001"
+        ));
+        assert!(!is_managed_cli_command(
+            &format!("/Users/test/.local/bin/claude --resume {session}"),
+            session
+        ));
     }
 
     #[tokio::test]
