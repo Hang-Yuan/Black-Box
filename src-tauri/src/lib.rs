@@ -1,6 +1,8 @@
 mod app_update;
 mod automations;
 mod auxiliary_model_hook;
+#[cfg(target_os = "macos")]
+mod cli_resumable_update;
 mod client_runtime;
 mod commands;
 mod conversation_handoff;
@@ -1926,7 +1928,9 @@ async fn discover_provider_models(
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
         if provider_error_indicates_auth_failure(status, &text) {
-            return Err(format!("Model discovery authentication failed (HTTP {status})"));
+            return Err(format!(
+                "Model discovery authentication failed (HTTP {status})"
+            ));
         }
         if !(200..300).contains(&status) {
             failures.push(format!("{}: HTTP {}", url, status));
@@ -2521,11 +2525,11 @@ mod provider_capability_tests {
     use super::{
         apply_provider_connection_auth, configured_context_window_env,
         effective_model_context_window, enforce_provider_loopback_child_env,
-        merge_provider_extra_env, model_mapping_context_window, normalize_cli_model_id,
-        official_claude_context_window, parse_bool_override, provider_connection_probe_body,
-        extract_provider_model_ids, provider_connection_probe_url,
-        provider_error_indicates_auth_failure, provider_model_list_urls,
-        provider_inherited_env_removals, redacted_env_for_log, resolve_provider_auth_scheme,
+        extract_provider_model_ids, merge_provider_extra_env, model_mapping_context_window,
+        normalize_cli_model_id, official_claude_context_window, parse_bool_override,
+        provider_connection_probe_body, provider_connection_probe_url,
+        provider_error_indicates_auth_failure, provider_inherited_env_removals,
+        provider_model_list_urls, redacted_env_for_log, resolve_provider_auth_scheme,
         resolve_provider_auth_scheme_parts, resolve_provider_capabilities,
         should_inject_login_shell_provider_env, ApiProvider, ModelMapping, ProviderAuthScheme,
         ProviderProtocol, MAIN_CLI_NESTED_GUARDS, PARTIAL_MESSAGES_OVERRIDE_ENV,
@@ -11391,7 +11395,19 @@ async fn update_claude_cli(
 
     match lifecycle.install_method {
         CliInstallMethod::Native => {
-            run_native_cli_owner_update(&app, &path, expected_version.as_deref()).await?
+            #[cfg(target_os = "macos")]
+            let handled = cli_resumable_update::update(
+                &app,
+                &path,
+                expected_version.as_deref(),
+                lifecycle.release_channel.as_deref().unwrap_or("latest"),
+            )
+            .await?;
+            #[cfg(not(target_os = "macos"))]
+            let handled = false;
+            if !handled {
+                run_native_cli_owner_update(&app, &path, expected_version.as_deref()).await?;
+            }
         }
         CliInstallMethod::HomebrewStable => {
             run_cli_owner_update("brew", &["upgrade", "--cask", "claude-code"]).await?
@@ -11494,12 +11510,24 @@ async fn reinstall_claude_cli(
 
     match lifecycle.install_method {
         CliInstallMethod::Native => {
-            let channel = lifecycle
-                .release_channel
-                .as_deref()
-                .filter(|value| matches!(*value, "stable" | "latest"))
-                .unwrap_or("latest");
-            run_cli_owner_update(&path, &["install", "--force", channel]).await?;
+            #[cfg(target_os = "macos")]
+            let handled = cli_resumable_update::update(
+                &app,
+                &path,
+                None,
+                lifecycle.release_channel.as_deref().unwrap_or("latest"),
+            )
+            .await?;
+            #[cfg(not(target_os = "macos"))]
+            let handled = false;
+            if !handled {
+                let channel = lifecycle
+                    .release_channel
+                    .as_deref()
+                    .filter(|value| matches!(*value, "stable" | "latest"))
+                    .unwrap_or("latest");
+                run_cli_owner_update(&path, &["install", "--force", channel]).await?;
+            }
         }
         CliInstallMethod::HomebrewStable => {
             run_cli_owner_update("brew", &["reinstall", "--cask", "claude-code"]).await?

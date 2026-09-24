@@ -19,6 +19,19 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.14.83', date: '2026-09-23',
+    highlights: {
+      zh: [
+        '官方原生 Claude CLI 升级支持分段续传；网络中断后重试会复用已完成的下载分段',
+        '下载完成后校验发布清单与可执行文件，再切换现有 CLI；失败时保留当前可用版本',
+      ],
+      en: [
+        'Official native Claude CLI updates resume completed download chunks after a network interruption',
+        'The release and executable are verified before activation, while failed attempts leave the current CLI in place',
+      ],
+    },
+  },
+  {
     version: '0.14.82', date: '2026-09-23',
     highlights: {
       zh: [

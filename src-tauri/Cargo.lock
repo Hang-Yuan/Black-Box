@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "blackbox"
-version = "0.14.82"
+version = "0.14.83"
 dependencies = [
  "async-stream",
  "axum",
@@ -404,6 +404,7 @@ dependencies = [
  "trash",
  "uuid",
  "zip 2.4.2",
+ "zstd",
 ]
 
 [[package]]

@@ -25,10 +25,25 @@ preserve_existing_dmgs() {
 }
 
 command -v node >/dev/null || { echo "ERROR: node not found"; exit 1; }
-command -v pnpm >/dev/null || { echo "ERROR: pnpm not found"; exit 1; }
 command -v cargo >/dev/null || { echo "ERROR: cargo not found"; exit 1; }
 command -v codesign >/dev/null || { echo "ERROR: codesign not found"; exit 1; }
 command -v hdiutil >/dev/null || { echo "ERROR: hdiutil not found"; exit 1; }
+
+# The desktop runtime may put a newer pnpm on PATH. Use the version pinned by
+# package.json so frozen installs do not purge node_modules and then reject the
+# lockfile's override format.
+required_pnpm="$(node -p "require('./package.json').packageManager.split('@')[1]")"
+if command -v corepack >/dev/null; then
+  pnpm_cmd=(corepack pnpm)
+else
+  command -v pnpm >/dev/null || { echo "ERROR: pnpm or corepack not found"; exit 1; }
+  pnpm_cmd=(pnpm)
+fi
+actual_pnpm="$("${pnpm_cmd[@]}" --version)"
+[[ "$actual_pnpm" == "$required_pnpm" ]] || {
+  echo "ERROR: pnpm $required_pnpm required; found $actual_pnpm"
+  exit 1
+}
 
 package_version="$(node -p "require('./package.json').version")"
 tauri_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -47,10 +62,10 @@ echo "Immutable local archive: $archive_root"
 # every existing version before that cleanup starts.
 preserve_existing_dmgs
 
-pnpm install --frozen-lockfile
+"${pnpm_cmd[@]}" install --frozen-lockfile
 
 if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
-  pnpm exec vitest run
+  "${pnpm_cmd[@]}" exec vitest run
   cargo test --manifest-path src-tauri/Cargo.toml --lib
 fi
 
@@ -86,8 +101,10 @@ fi
 # The checked-in config enables signed updater artifacts for public releases.
 # Local builds intentionally have no updater private key, so disable only that
 # artifact in this build flavor while keeping the app and DMG bundles enabled.
-pnpm tauri build --bundles app,dmg --ci \
-  --config '{"bundle":{"createUpdaterArtifacts":false}}'
+build_command="${pnpm_cmd[*]} build"
+build_config="$(node -e 'process.stdout.write(JSON.stringify({build:{beforeBuildCommand:process.argv[1]},bundle:{createUpdaterArtifacts:false}}))' "$build_command")"
+"${pnpm_cmd[@]}" tauri build --bundles app,dmg --ci \
+  --config "$build_config"
 
 app_path="src-tauri/target/release/bundle/macos/Black Box.app"
 dmg_dir="src-tauri/target/release/bundle/dmg"

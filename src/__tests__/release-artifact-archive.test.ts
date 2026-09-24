@@ -41,7 +41,7 @@ describe("immutable release artifact archive", () => {
   it("preserves old DMGs before Tauri build and archives the verified result", () => {
     const source = readFileSync(buildScript, "utf8");
     const preserveIndex = source.indexOf("preserve_existing_dmgs");
-    const buildIndex = source.indexOf("pnpm tauri build");
+    const buildIndex = source.indexOf('"${pnpm_cmd[@]}" tauri build');
     const verifyIndex = source.indexOf('hdiutil verify "$dmg_path"');
     const archiveIndex = source.indexOf(
       'bash "$archive_helper" "$dmg_path" "$archive_root" "$package_version"',

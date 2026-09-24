@@ -1,6 +1,6 @@
 [package]
 name = "blackbox"
-version = "0.14.82"
+version = "0.14.83"
 description = "Black Box - A beautiful GUI for Claude Code"
 authors = ["TinyZ"]
 license = "Apache-2.0"
@@ -56,3 +56,4 @@ tauri-plugin-autostart = "2.5.1"
 block = "0.1"
 cocoa = "0.26"
 objc = "0.2"
+zstd = "0.13"
